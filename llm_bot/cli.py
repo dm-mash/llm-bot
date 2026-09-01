@@ -65,12 +65,37 @@ def _resolve_prompt(args: argparse.Namespace) -> str:
     if args.prompt:
         return " ".join(args.prompt).strip()
 
-    # Read from stdin (supports piped input and interactive pasting).
-    data = sys.stdin.read()
-    prompt = data.strip()
+    # In a real terminal, read interactively until an empty line (or EOF).
+    # This lets users type/paste a prompt and finish it with a blank line,
+    # instead of hanging on sys.stdin.read() while waiting for EOF.
+    if sys.stdin.isatty():
+        prompt = _read_interactive()
+    else:
+        # Piped / redirected input: consume the whole stream.
+        data = sys.stdin.read()
+        prompt = data.strip()
+
     if not prompt:
         raise ValueError("No prompt provided. Pass it as an argument or pipe it via stdin.")
     return prompt
+
+
+def _read_interactive() -> str:
+    """Read a prompt from an interactive terminal, one line at a time.
+
+    An empty line (just Enter) signals the end of input, so a single plain
+    Enter without any text is treated as "no prompt".
+    """
+    lines: list[str] = []
+    for raw in sys.stdin:
+        line = raw.rstrip("\n")
+        if line.strip() == "" and lines:
+            # A blank line after some content ends the prompt.
+            break
+        if line.strip() == "":
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def main(argv: list[str] | None = None) -> int:
