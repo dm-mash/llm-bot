@@ -13,6 +13,12 @@ from llm_bot.client import (
     LLMRetryExhaustedError,
     TokenProvider,
 )
+from llm_bot.diagnostics import (
+    DetailListener,
+    RequestDetails,
+    ResponseDetails,
+    extract_usage,
+)
 from llm_bot.gigachat import GigaChatTokenProvider, build_gigachat_client
 
 __all__ = [
@@ -22,6 +28,10 @@ __all__ = [
     "LLMRequestError",
     "LLMRetryExhaustedError",
     "TokenProvider",
+    "DetailListener",
+    "RequestDetails",
+    "ResponseDetails",
+    "extract_usage",
     "GigaChatTokenProvider",
     "build_gigachat_client",
 ]

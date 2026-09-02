@@ -19,6 +19,12 @@ from typing import Any, Protocol, runtime_checkable
 import httpx
 
 from llm_bot.config import LLMConfig
+from llm_bot.diagnostics import (
+    DetailListener,
+    RequestDetails,
+    ResponseDetails,
+    extract_usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +82,7 @@ class LLMClient:
         *,
         transport: httpx.BaseTransport | None = None,
         token_provider: TokenProvider | None = None,
+        detail_listener: DetailListener | None = None,
     ) -> None:
         """Initialize the client.
 
@@ -85,12 +92,16 @@ class LLMClient:
                 ``httpx.MockTransport``).
             token_provider: Optional source of the bearer access token. When given,
                 it takes precedence over ``config.api_key``.
+            detail_listener: Optional consumer of structured request/response
+                details (URL, model, payload, token usage). Kept interface-agnostic
+                so a CLI formatter and a future web handler can both use it.
         """
         self.config = config or LLMConfig.from_env()
         # A timeout is required even when a custom transport is supplied.
         self._transport = transport
         self._timeout = httpx.Timeout(self.config.timeout)
         self._token_provider = token_provider
+        self._detail_listener = detail_listener
 
     def _resolve_token(self) -> str:
         """Return the bearer token to use, or ``""`` if none is configured."""
@@ -115,31 +126,74 @@ class LLMClient:
             "messages": messages,
         }
 
-    def _request(self, client: httpx.Client, prompt: str) -> dict[str, Any]:
-        response = client.post(
-            self.config.base_url.rstrip("/") + _CHAT_ENDPOINT,
-            headers=self._build_headers(),
-            json=self._build_payload(prompt),
+    def _build_url(self) -> str:
+        """Return the full chat-completions URL for the configured base URL."""
+        return self.config.base_url.rstrip("/") + _CHAT_ENDPOINT
+
+    def _emit_request(self, url: str, payload: dict[str, Any]) -> None:
+        """Notify the detail listener (if any) that a request is about to be sent."""
+        if self._detail_listener is None:
+            return
+        details = RequestDetails(
+            method="POST",
+            url=url,
+            model=self.config.model,
+            payload=payload,
         )
+        self._detail_listener.on_request(details)
+
+    def _emit_response(self, status_code: int, attempt: int, elapsed_ms: float, data: dict[str, Any]) -> None:
+        """Notify the detail listener (if any) of one HTTP response attempt."""
+        if self._detail_listener is None:
+            return
+        details = ResponseDetails(
+            status_code=status_code,
+            usage=extract_usage(data),
+            elapsed_ms=round(elapsed_ms, 1),
+            attempt=attempt,
+        )
+        self._detail_listener.on_response(details)
+
+    def _request(
+        self,
+        client: httpx.Client,
+        url: str,
+        payload: dict[str, Any],
+        attempt: int,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        response = client.post(
+            url,
+            headers=self._build_headers(),
+            json=payload,
+        )
+        elapsed_ms = (time.monotonic() - started) * 1000.0
         if response.status_code == 429 or response.status_code >= 500:
             # Transient server/rate-limit error; caller decides whether to retry.
+            self._emit_response(response.status_code, attempt, elapsed_ms, {})
             raise _TransientHTTPError(response.status_code, response.text)
         if response.status_code >= 400:
             # Permanent client error (e.g. bad key, invalid model) — do not retry.
+            self._emit_response(response.status_code, attempt, elapsed_ms, {})
             raise LLMRequestError(
                 f"LLM API returned HTTP {response.status_code}: {response.text}"
             )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        self._emit_response(response.status_code, attempt, elapsed_ms, data)
+        return data
 
     def _execute_with_retry(self, prompt: str) -> dict[str, Any]:
         last_error: Exception | None = None
+        url = self._build_url()
+        payload = self._build_payload(prompt)
+        self._emit_request(url, payload)
         for attempt in range(self.config.max_retries + 1):
             try:
                 with httpx.Client(
                     transport=self._transport, timeout=self._timeout
                 ) as client:
-                    return self._request(client, prompt)
+                    return self._request(client, url, payload, attempt + 1)
             except _TransientHTTPError as exc:
                 last_error = exc
                 logger.warning("Transient HTTP error %s (attempt %d)", exc, attempt + 1)

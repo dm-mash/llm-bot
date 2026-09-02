@@ -18,6 +18,8 @@ interface** later without touching the request logic (see
   (timeouts, network errors, HTTP 429 / 5xx).
 - Clear error handling via custom exception types.
 - Console entry point accepting a prompt as an argument or via stdin.
+- `--details` flag to print request/response diagnostics (URL, model, formed
+  request body, token usage, per-attempt timing) to stderr.
 - Built-in GigaChat support (`--provider gigachat`) with automatic OAuth2 token
   acquisition and refresh.
 - Pytest suite using `httpx.MockTransport` (no network needed).
@@ -29,7 +31,8 @@ llm-bot/
 ├── llm_bot/
 │   ├── __init__.py      # package exports
 │   ├── config.py        # LLMConfig — settings from env vars
-│   ├── client.py        # LLMClient — request logic + retries + errors
+│   ├── diagnostics.py   # RequestDetails/ResponseDetails + DetailListener protocol
+│   ├── client.py        # LLMClient — request logic + retries + errors + detail events
 │   ├── gigachat.py      # GigaChat OAuth2 token provider + factory
 │   ├── cli.py           # console entry point
 │   └── __main__.py      # enables `python -m llm_bot`
@@ -131,6 +134,37 @@ python -m llm_bot --base-url http://localhost:11434/v1 --model llama3.2 "Hello"
 python -m llm_bot --model gpt-4o-mini --verbose "Tell me a joke"
 ```
 
+### Inspecting request/response details
+
+Pass `--details` to see exactly what is sent and how the API responds. Details go
+to **stderr**, so the reply on stdout stays clean:
+
+```bash
+python -m llm_bot --details "Hello"
+```
+
+```
+[details] POST https://api.openai.com/v1/chat/completions
+[details] model: gpt-4o-mini
+[details] request body:
+           {
+             "model": "gpt-4o-mini",
+             "messages": [
+               {"role": "user", "content": "Hello"}
+             ]
+           }
+[details] attempt 1: HTTP 200 in 320ms
+[details] usage: prompt_tokens=8 completion_tokens=5 total_tokens=13
+```
+
+- The printed URL is where the request goes; the model and the fully formed
+  request body are shown verbatim (the `Authorization` header is never printed,
+  so API keys stay safe).
+- On retries, each attempt is reported (`attempt 1`, `attempt 2`, ...) with its
+  HTTP status and round-trip time.
+- Token usage appears only when the provider reports it (OpenAI does; some local
+  servers omit it).
+
 ### Enforcing a specific JSON response format
 
 Use a system prompt to tell the model exactly how to format its reply. It can be
@@ -160,7 +194,8 @@ python -m pytest tests/ -v
 
 Coverage includes: successful request, retry-then-success, rate limiting,
 network errors, exhausted retries, permanent HTTP errors, unexpected response
-shapes, and config overrides.
+shapes, config overrides, and the detail-listener events (request url/model/payload,
+token usage, per-attempt reporting).
 
 ## Programmatic use
 
@@ -189,6 +224,25 @@ client = build_gigachat_client(config)  # auto obtains + refreshes the token
 print(client.send_prompt("Привет!"))
 ```
 
+To capture request/response details programmatically, pass a `detail_listener`
+that implements the `DetailListener` protocol (URL, model, payload on
+`on_request`; status, token usage, timing, attempt on `on_response`):
+
+```python
+from llm_bot.client import LLMClient
+from llm_bot.config import LLMConfig
+from llm_bot.diagnostics import RequestDetails, ResponseDetails
+
+class Printer:
+    def on_request(self, d: RequestDetails) -> None:
+        print(d.method, d.url, d.model, d.payload)
+    def on_response(self, d: ResponseDetails) -> None:
+        print(d.status_code, d.usage, d.elapsed_ms, d.attempt)
+
+client = LLMClient(LLMConfig.from_env(), detail_listener=Printer())
+print(client.send_prompt("Hello"))
+```
+
 ## Adding a web interface
 
 Because the request logic is isolated in `LLMClient`, adding a web UI is mostly
@@ -202,6 +256,7 @@ from pydantic import BaseModel
 
 from llm_bot.client import LLMClient, LLMError
 from llm_bot.config import LLMConfig
+from llm_bot.diagnostics import RequestDetails, ResponseDetails
 
 app = FastAPI()
 client = LLMClient(LLMConfig.from_env())
@@ -211,10 +266,26 @@ class PromptRequest(BaseModel):
     prompt: str
 
 
+class RequestLog:
+    """Reuse the same detail events the CLI uses — here we collect them."""
+
+    def __init__(self) -> None:
+        self.details: list[dict] = []
+
+    def on_request(self, d: RequestDetails) -> None:
+        self.details.append({"request": {"url": d.url, "model": d.model, "payload": d.payload}})
+
+    def on_response(self, d: ResponseDetails) -> None:
+        self.details.append({"response": {"status": d.status_code, "usage": d.usage}})
+
+
 @app.post("/chat")
 def chat(req: PromptRequest):
+    log = RequestLog()
+    client = LLMClient(LLMConfig.from_env(), detail_listener=log)
     try:
-        return {"reply": client.send_prompt(req.prompt)}
+        reply = client.send_prompt(req.prompt)
+        return {"reply": reply, "details": log.details}
     except LLMError as exc:
         return {"error": str(exc)}
 ```

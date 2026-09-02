@@ -11,6 +11,7 @@ from llm_bot.client import (
     LLMRetryExhaustedError,
 )
 from llm_bot.config import LLMConfig
+from llm_bot.diagnostics import DetailListener, RequestDetails, ResponseDetails
 
 
 def _ok_response() -> httpx.Response:
@@ -24,7 +25,21 @@ def _ok_response() -> httpx.Response:
     )
 
 
-def _make_client(handler) -> LLMClient:
+class _RecordingListener:
+    """DetailListener that collects emitted events for assertions."""
+
+    def __init__(self) -> None:
+        self.requests: list[RequestDetails] = []
+        self.responses: list[ResponseDetails] = []
+
+    def on_request(self, details: RequestDetails) -> None:
+        self.requests.append(details)
+
+    def on_response(self, details: ResponseDetails) -> None:
+        self.responses.append(details)
+
+
+def _make_client(handler, listener: _RecordingListener | None = None) -> LLMClient:
     config = LLMConfig(
         base_url="https://example.test/v1",
         api_key="test-key",
@@ -33,7 +48,7 @@ def _make_client(handler) -> LLMClient:
         retry_backoff=0.0,  # no real sleeping in tests
     )
     transport = httpx.MockTransport(handler)
-    return LLMClient(config, transport=transport)
+    return LLMClient(config, transport=transport, detail_listener=listener)
 
 
 def test_send_prompt_returns_text():
@@ -182,3 +197,68 @@ def test_config_overrides():
     assert overridden.api_key == "k"
     # original untouched
     assert base.model == "m"
+
+
+def test_detail_listener_receives_request_and_usage():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": "Hello"}}
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 7,
+                    "total_tokens": 12,
+                },
+            },
+        )
+
+    listener = _RecordingListener()
+    client = _make_client(handler, listener)
+    assert client.send_prompt("Hi there") == "Hello"
+
+    assert len(listener.requests) == 1
+    req = listener.requests[0]
+    assert req.method == "POST"
+    assert req.url == "https://example.test/v1/chat/completions"
+    assert req.model == "test-model"
+    assert req.payload["model"] == "test-model"
+    assert req.payload["messages"] == [{"role": "user", "content": "Hi there"}]
+
+    assert len(listener.responses) == 1
+    resp = listener.responses[0]
+    assert resp.status_code == 200
+    assert resp.attempt == 1
+    assert resp.usage == {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+    assert resp.elapsed_ms is not None and resp.elapsed_ms >= 0
+
+
+def test_detail_listener_reports_each_attempt():
+    state = {"attempts": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["attempts"] += 1
+        if state["attempts"] == 1:
+            return httpx.Response(503, text="Service Unavailable")
+        return _ok_response()
+
+    listener = _RecordingListener()
+    client = _make_client(handler, listener)
+    assert client.send_prompt("ping") == "Hello from the LLM!"
+
+    # 503 attempt then a successful 200 attempt.
+    assert [r.status_code for r in listener.responses] == [503, 200]
+    assert [r.attempt for r in listener.responses] == [1, 2]
+    # Only one request detail is emitted per send_prompt.
+    assert len(listener.requests) == 1
+
+
+def test_detail_listener_usage_is_none_when_absent():
+    listener = _RecordingListener()
+    client = _make_client(lambda request: _ok_response(), listener)
+    client.send_prompt("ping")
+
+    assert len(listener.responses) == 1
+    assert listener.responses[0].usage is None

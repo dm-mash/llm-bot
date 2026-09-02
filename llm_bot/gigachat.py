@@ -26,6 +26,7 @@ import httpx
 
 from llm_bot.client import LLMClient, LLMRequestError
 from llm_bot.config import LLMConfig
+from llm_bot.diagnostics import DetailListener
 
 logger = logging.getLogger(__name__)
 
@@ -145,13 +146,19 @@ class GigaChatTokenProvider:
         return token, expires_at
 
 
-def build_gigachat_client(config: LLMConfig | None = None) -> LLMClient:
+def build_gigachat_client(
+    config: LLMConfig | None = None,
+    *,
+    detail_listener: DetailListener | None = None,
+) -> LLMClient:
     """Build an :class:`~llm_bot.client.LLMClient` configured for GigaChat.
 
     Args:
         config: Configuration; defaults to ``LLMConfig.from_env()``. The
             ``base_url`` should point at GigaChat's OpenAI-compatible endpoint
             (default ``https://gigachat.devices.sberbank.ru/api/v1``).
+        detail_listener: Optional consumer of structured request/response details
+            (URL, model, payload, token usage); forwarded to the client.
 
     Returns:
         A fully wired :class:`~llm_bot.client.LLMClient` that obtains and
@@ -159,4 +166,4 @@ def build_gigachat_client(config: LLMConfig | None = None) -> LLMClient:
     """
     config = config or LLMConfig.from_env()
     token_provider = GigaChatTokenProvider(config)
-    return LLMClient(config, token_provider=token_provider)
+    return LLMClient(config, token_provider=token_provider, detail_listener=detail_listener)

@@ -10,11 +10,17 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 
 from llm_bot.client import LLMClient, LLMError
 from llm_bot.config import LLMConfig
+from llm_bot.diagnostics import (
+    DetailListener,
+    RequestDetails,
+    ResponseDetails,
+)
 from llm_bot.gigachat import build_gigachat_client
 
 
@@ -63,6 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable debug logging.",
     )
+    parser.add_argument(
+        "--details",
+        action="store_true",
+        help="Print request/response details (URL, model, payload, token usage) "
+        "to stderr.",
+    )
     return parser
 
 
@@ -104,6 +116,34 @@ def _read_interactive() -> str:
     return "\n".join(lines).strip()
 
 
+class _DetailPrinter:
+    """Print request/response details to stderr, keeping stdout clean.
+
+    Implements the :class:`~llm_bot.diagnostics.DetailListener` protocol so it
+    plugs straight into :class:`~llm_bot.client.LLMClient`.
+    """
+
+    def on_request(self, details: RequestDetails) -> None:
+        print(f"[details] {details.method} {details.url}", file=sys.stderr)
+        print(f"[details] model: {details.model}", file=sys.stderr)
+        body = json.dumps(details.payload, ensure_ascii=False, indent=2)
+        print("[details] request body:", file=sys.stderr)
+        for line in body.splitlines():
+            print(f"           {line}", file=sys.stderr)
+
+    def on_response(self, details: ResponseDetails) -> None:
+        elapsed = (
+            f" in {details.elapsed_ms:.0f}ms" if details.elapsed_ms is not None else ""
+        )
+        print(
+            f"[details] attempt {details.attempt}: HTTP {details.status_code}{elapsed}",
+            file=sys.stderr,
+        )
+        if details.usage:
+            parts = " ".join(f"{k}={v}" for k, v in details.usage.items())
+            print(f"[details] usage: {parts}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Returns a process exit code."""
     parser = build_parser()
@@ -127,10 +167,12 @@ def main(argv: list[str] | None = None) -> int:
         system_prompt=args.system_prompt,
     )
 
+    detail_listener = _DetailPrinter() if args.details else None
+
     if args.provider == "gigachat":
-        client = build_gigachat_client(config)
+        client = build_gigachat_client(config, detail_listener=detail_listener)
     else:
-        client = LLMClient(config)
+        client = LLMClient(config, detail_listener=detail_listener)
 
     try:
         response = client.send_prompt(prompt)
