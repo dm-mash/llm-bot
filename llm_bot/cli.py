@@ -45,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the model identifier (else LLM_MODEL).",
     )
     parser.add_argument(
+        "--system-prompt",
+        default=None,
+        help="Optional system prompt sent before the user prompt (e.g. to request "
+        "a specific JSON response schema). Overrides LLM_SYSTEM_PROMPT.",
+    )
+    parser.add_argument(
         "--provider",
         choices=("openai", "gigachat"),
         default="openai",
@@ -118,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         base_url=args.base_url,
         api_key=args.api_key,
         model=args.model,
+        system_prompt=args.system_prompt,
     )
 
     if args.provider == "gigachat":

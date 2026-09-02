@@ -46,6 +46,8 @@ def test_send_prompt_returns_text():
         payload = request.read().decode()
         assert '"model":"test-model"' in payload
         assert '"content":"Hi there"' in payload
+        # No system prompt configured by default.
+        assert '"role":"system"' not in payload
         return _ok_response()
 
     client = _make_client(handler)
@@ -53,6 +55,35 @@ def test_send_prompt_returns_text():
 
     assert result == "Hello from the LLM!"
     assert calls["count"] == 1
+
+
+def test_system_prompt_is_prepended_when_configured():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        system_prompt="Respond with strict JSON: {\"answer\": string}",
+    )
+    transport = httpx.MockTransport(handler)
+    client = LLMClient(config, transport=transport)
+
+    client.send_prompt("Hi there")
+
+    payload = captured["payload"]
+    assert '"role":"system"' in payload
+    assert '"role":"user"' in payload
+    # The system message must precede the user message.
+    assert payload.index('"role":"system"') < payload.index('"role":"user"')
+    assert "Respond with strict JSON" in payload
+    assert '"content":"Hi there"' in payload
 
 
 def test_retry_then_success():

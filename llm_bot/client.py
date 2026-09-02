@@ -106,11 +106,13 @@ class LLMClient:
         return headers
 
     def _build_payload(self, prompt: str) -> dict[str, Any]:
+        messages: list[dict[str, str]] = []
+        if self.config.system_prompt:
+            messages.append({"role": "system", "content": self.config.system_prompt})
+        messages.append({"role": "user", "content": prompt})
         return {
             "model": self.config.model,
-            "messages": [
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
         }
 
     def _request(self, client: httpx.Client, prompt: str) -> dict[str, Any]:

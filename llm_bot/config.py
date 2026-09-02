@@ -23,6 +23,7 @@ _ENV_MODEL = "LLM_MODEL"
 _ENV_MAX_RETRIES = "LLM_MAX_RETRIES"
 _ENV_RETRY_BACKOFF = "LLM_RETRY_BACKOFF"
 _ENV_TIMEOUT = "LLM_TIMEOUT"
+_ENV_SYSTEM_PROMPT = "LLM_SYSTEM_PROMPT"
 
 # GigaChat (Sber) OAuth2 client_credentials settings.
 _ENV_GIGACHAT_OAUTH_URL = "GIGACHAT_OAUTH_URL"
@@ -65,6 +66,8 @@ class LLMConfig:
         max_retries: How many times to retry transient failures.
         retry_backoff: Base delay (seconds) for exponential backoff between retries.
         timeout: Request timeout in seconds.
+        system_prompt: Optional system prompt sent as a ``system`` message before
+            the user prompt (e.g. to request a specific JSON response schema).
     """
 
     base_url: str = field(default_factory=lambda: os.getenv(_ENV_BASE_URL, "https://api.openai.com/v1"))
@@ -73,6 +76,7 @@ class LLMConfig:
     max_retries: int = field(default_factory=lambda: _get_int(_ENV_MAX_RETRIES, 3))
     retry_backoff: float = field(default_factory=lambda: _get_float(_ENV_RETRY_BACKOFF, 1.0))
     timeout: float = field(default_factory=lambda: _get_float(_ENV_TIMEOUT, 30.0))
+    system_prompt: str = field(default_factory=lambda: os.getenv(_ENV_SYSTEM_PROMPT, ""))
 
     # --- GigaChat (Sber) OAuth2 client_credentials settings ---
     gigachat_oauth_url: str = field(
@@ -102,6 +106,7 @@ class LLMConfig:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> "LLMConfig":
         """Return a copy of this config with any provided fields overridden.
 
@@ -115,6 +120,7 @@ class LLMConfig:
             max_retries=self.max_retries,
             retry_backoff=self.retry_backoff,
             timeout=self.timeout,
+            system_prompt=self.system_prompt if system_prompt is None else system_prompt,
             gigachat_oauth_url=self.gigachat_oauth_url,
             gigachat_client_id=self.gigachat_client_id,
             gigachat_client_secret=self.gigachat_client_secret,

@@ -72,6 +72,7 @@ cp .env.example .env   # Windows: copy .env.example .env
 | `LLM_MAX_RETRIES`    | `3`                     | Retries for transient failures                           |
 | `LLM_RETRY_BACKOFF`  | `1.0`                   | Base backoff seconds (exponential: `backoff * 2^n`)      |
 | `LLM_TIMEOUT`        | `30`                    | Request timeout in seconds                               |
+| `LLM_SYSTEM_PROMPT`  | *(empty)*               | Optional system prompt sent before the user prompt (e.g. to request a JSON response format) |
 
 ### Example: use a local Ollama server
 
@@ -129,6 +130,19 @@ Override settings per-invocation:
 python -m llm_bot --base-url http://localhost:11434/v1 --model llama3.2 "Hello"
 python -m llm_bot --model gpt-4o-mini --verbose "Tell me a joke"
 ```
+
+### Enforcing a specific JSON response format
+
+Use a system prompt to tell the model exactly how to format its reply. It can be
+set per-invocation with `--system-prompt` or globally via `LLM_SYSTEM_PROMPT`:
+
+```bash
+python -m llm_bot \
+  --system-prompt 'Отвечай строго в формате JSON со схемой {"answer": string, "summary": string}' \
+  "Summarize the provided text"
+```
+
+When no system prompt is set, no `system` message is included in the request.
 
 Exit codes:
 
