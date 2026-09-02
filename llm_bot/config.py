@@ -24,6 +24,7 @@ _ENV_MAX_RETRIES = "LLM_MAX_RETRIES"
 _ENV_RETRY_BACKOFF = "LLM_RETRY_BACKOFF"
 _ENV_TIMEOUT = "LLM_TIMEOUT"
 _ENV_SYSTEM_PROMPT = "LLM_SYSTEM_PROMPT"
+_ENV_MAX_RESPONSE_WORDS = "LLM_MAX_RESPONSE_WORDS"
 
 # GigaChat (Sber) OAuth2 client_credentials settings.
 _ENV_GIGACHAT_OAUTH_URL = "GIGACHAT_OAUTH_URL"
@@ -42,6 +43,17 @@ def _get_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _get_optional_int(name: str) -> int | None:
+    """Read an optional integer env var, returning ``None`` on absence/invalid value."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _get_float(name: str, default: float) -> float:
@@ -68,6 +80,10 @@ class LLMConfig:
         timeout: Request timeout in seconds.
         system_prompt: Optional system prompt sent as a ``system`` message before
             the user prompt (e.g. to request a specific JSON response schema).
+        max_response_words: Optional target limit on the length of the reply,
+            expressed as an approximate maximum number of words. When set, a
+            corresponding instruction is added to the system prompt so the model
+            keeps its answer brief. ``None`` means no limit.
     """
 
     base_url: str = field(default_factory=lambda: os.getenv(_ENV_BASE_URL, "https://api.openai.com/v1"))
@@ -77,6 +93,9 @@ class LLMConfig:
     retry_backoff: float = field(default_factory=lambda: _get_float(_ENV_RETRY_BACKOFF, 1.0))
     timeout: float = field(default_factory=lambda: _get_float(_ENV_TIMEOUT, 30.0))
     system_prompt: str = field(default_factory=lambda: os.getenv(_ENV_SYSTEM_PROMPT, ""))
+    max_response_words: int | None = field(
+        default_factory=lambda: _get_optional_int(_ENV_MAX_RESPONSE_WORDS)
+    )
 
     # --- GigaChat (Sber) OAuth2 client_credentials settings ---
     gigachat_oauth_url: str = field(
@@ -107,6 +126,7 @@ class LLMConfig:
         api_key: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        max_response_words: int | None = None,
     ) -> "LLMConfig":
         """Return a copy of this config with any provided fields overridden.
 
@@ -121,6 +141,11 @@ class LLMConfig:
             retry_backoff=self.retry_backoff,
             timeout=self.timeout,
             system_prompt=self.system_prompt if system_prompt is None else system_prompt,
+            max_response_words=(
+                self.max_response_words
+                if max_response_words is None
+                else max_response_words
+            ),
             gigachat_oauth_url=self.gigachat_oauth_url,
             gigachat_client_id=self.gigachat_client_id,
             gigachat_client_secret=self.gigachat_client_secret,

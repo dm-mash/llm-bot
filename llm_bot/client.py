@@ -116,10 +116,31 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
+    def _build_system_prompt(self) -> str:
+        """Return the effective system prompt for this request.
+
+        If ``max_response_words`` is configured, a natural-language instruction is
+        appended so the model keeps its reply within the requested length. This is
+        intentionally expressed as a prompt hint rather than an API-level token cap
+        (``max_tokens``), because providers handle ``max_tokens`` inconsistently
+        (some truncate, others return an empty response).
+        """
+        base = self.config.system_prompt.strip()
+        if self.config.max_response_words is None:
+            return base
+        instruction = (
+            f"Важно: отвечай кратко — не более примерно "
+            f"{self.config.max_response_words} слов."
+        )
+        if not base:
+            return instruction
+        return f"{base}\n\n{instruction}"
+
     def _build_payload(self, prompt: str) -> dict[str, Any]:
         messages: list[dict[str, str]] = []
-        if self.config.system_prompt:
-            messages.append({"role": "system", "content": self.config.system_prompt})
+        system_prompt = self._build_system_prompt()
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         return {
             "model": self.config.model,

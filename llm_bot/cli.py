@@ -57,6 +57,14 @@ def build_parser() -> argparse.ArgumentParser:
         "a specific JSON response schema). Overrides LLM_SYSTEM_PROMPT.",
     )
     parser.add_argument(
+        "--max-response-words",
+        type=int,
+        default=None,
+        help="Target maximum length of the reply, in words. Added to the system "
+        "prompt as a briefness instruction (else LLM_MAX_RESPONSE_WORDS). "
+        "Leave unset for no limit.",
+    )
+    parser.add_argument(
         "--provider",
         choices=("openai", "gigachat"),
         default="openai",
@@ -165,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         api_key=args.api_key,
         model=args.model,
         system_prompt=args.system_prompt,
+        max_response_words=args.max_response_words,
     )
 
     detail_listener = _DetailPrinter() if args.details else None

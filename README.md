@@ -76,6 +76,7 @@ cp .env.example .env   # Windows: copy .env.example .env
 | `LLM_RETRY_BACKOFF`  | `1.0`                   | Base backoff seconds (exponential: `backoff * 2^n`)      |
 | `LLM_TIMEOUT`        | `30`                    | Request timeout in seconds                               |
 | `LLM_SYSTEM_PROMPT`  | *(empty)*               | Optional system prompt sent before the user prompt (e.g. to request a JSON response format) |
+| `LLM_MAX_RESPONSE_WORDS` | *(empty)*           | Target maximum reply length in words; adds a briefness instruction to the system prompt (empty = no limit). Per-invocation via `--max-response-words`. |
 
 ### Example: use a local Ollama server
 

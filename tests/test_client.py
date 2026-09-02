@@ -101,6 +101,81 @@ def test_system_prompt_is_prepended_when_configured():
     assert '"content":"Hi there"' in payload
 
 
+def test_max_response_words_adds_briefness_instruction():
+    """Setting max_response_words must inject a briefness hint into the system prompt."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        max_response_words=50,
+    )
+    transport = httpx.MockTransport(handler)
+    client = LLMClient(config, transport=transport)
+
+    client.send_prompt("Hi there")
+
+    assert '"role":"system"' in captured["payload"]
+    assert "не более примерно 50 слов" in captured["payload"]
+
+
+def test_max_response_words_combines_with_existing_system_prompt():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        system_prompt="Respond as a helpful assistant.",
+        max_response_words=20,
+    )
+    transport = httpx.MockTransport(handler)
+    client = LLMClient(config, transport=transport)
+
+    client.send_prompt("Hi there")
+
+    payload = captured["payload"]
+    assert "Respond as a helpful assistant." in payload
+    assert "не более примерно 20 слов" in payload
+
+
+def test_max_tokens_is_never_sent():
+    """The client must not rely on the unreliable API-level max_tokens parameter."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        max_response_words=50,
+    )
+    transport = httpx.MockTransport(handler)
+    client = LLMClient(config, transport=transport)
+
+    client.send_prompt("Hi there")
+
+    assert "max_tokens" not in captured["payload"]
+
+
 def test_retry_then_success():
     """A transient 503 followed by a 200 should succeed after one retry."""
     state = {"attempts": 0}
