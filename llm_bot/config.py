@@ -24,6 +24,7 @@ _ENV_MAX_RETRIES = "LLM_MAX_RETRIES"
 _ENV_RETRY_BACKOFF = "LLM_RETRY_BACKOFF"
 _ENV_TIMEOUT = "LLM_TIMEOUT"
 _ENV_SYSTEM_PROMPT = "LLM_SYSTEM_PROMPT"
+_ENV_DEFAULT_SYSTEM_PROMPT = "LLM_DEFAULT_SYSTEM_PROMPT"
 _ENV_MAX_RESPONSE_WORDS = "LLM_MAX_RESPONSE_WORDS"
 
 # GigaChat (Sber) OAuth2 client_credentials settings.
@@ -80,6 +81,10 @@ class LLMConfig:
         timeout: Request timeout in seconds.
         system_prompt: Optional system prompt sent as a ``system`` message before
             the user prompt (e.g. to request a specific JSON response schema).
+        default_system_prompt: Optional base system prompt that is always
+            prepended to any other system prompt (and to ``max_response_words``
+            instructions). Use it for global behavior, e.g. "always reply in the
+            user's language". Read from ``LLM_DEFAULT_SYSTEM_PROMPT``.
         max_response_words: Optional target limit on the length of the reply,
             expressed as an approximate maximum number of words. When set, a
             corresponding instruction is added to the system prompt so the model
@@ -93,6 +98,9 @@ class LLMConfig:
     retry_backoff: float = field(default_factory=lambda: _get_float(_ENV_RETRY_BACKOFF, 1.0))
     timeout: float = field(default_factory=lambda: _get_float(_ENV_TIMEOUT, 30.0))
     system_prompt: str = field(default_factory=lambda: os.getenv(_ENV_SYSTEM_PROMPT, ""))
+    default_system_prompt: str = field(
+        default_factory=lambda: os.getenv(_ENV_DEFAULT_SYSTEM_PROMPT, "")
+    )
     max_response_words: int | None = field(
         default_factory=lambda: _get_optional_int(_ENV_MAX_RESPONSE_WORDS)
     )
@@ -126,6 +134,7 @@ class LLMConfig:
         api_key: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        default_system_prompt: str | None = None,
         max_response_words: int | None = None,
     ) -> "LLMConfig":
         """Return a copy of this config with any provided fields overridden.
@@ -141,6 +150,11 @@ class LLMConfig:
             retry_backoff=self.retry_backoff,
             timeout=self.timeout,
             system_prompt=self.system_prompt if system_prompt is None else system_prompt,
+            default_system_prompt=(
+                self.default_system_prompt
+                if default_system_prompt is None
+                else default_system_prompt
+            ),
             max_response_words=(
                 self.max_response_words
                 if max_response_words is None

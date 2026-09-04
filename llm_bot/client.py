@@ -119,22 +119,30 @@ class LLMClient:
     def _build_system_prompt(self) -> str:
         """Return the effective system prompt for this request.
 
-        If ``max_response_words`` is configured, a natural-language instruction is
-        appended so the model keeps its reply within the requested length. This is
-        intentionally expressed as a prompt hint rather than an API-level token cap
-        (``max_tokens``), because providers handle ``max_tokens`` inconsistently
-        (some truncate, others return an empty response).
+        The effective prompt is assembled from three optional parts, joined with a
+        blank line when more than one is present:
+
+            1. ``default_system_prompt``  — always prepended when set (global
+               behavior such as "reply in the user's language").
+            2. ``system_prompt``          — the request-specific instruction.
+            3. max_response_words hint    — an instruction to keep the reply brief.
+
+        The brevity hint is expressed as a prompt instruction rather than an
+        API-level token cap (``max_tokens``), because providers handle
+        ``max_tokens`` inconsistently (some truncate, others return an empty
+        response).
         """
-        base = self.config.system_prompt.strip()
-        if self.config.max_response_words is None:
-            return base
-        instruction = (
-            f"Важно: отвечай кратко — не более примерно "
-            f"{self.config.max_response_words} слов."
-        )
-        if not base:
-            return instruction
-        return f"{base}\n\n{instruction}"
+        parts = [
+            self.config.default_system_prompt.strip(),
+            self.config.system_prompt.strip(),
+        ]
+        if self.config.max_response_words is not None:
+            parts.append(
+                f"Важно: отвечай кратко — не более примерно "
+                f"{self.config.max_response_words} слов."
+            )
+        non_empty = [p for p in parts if p]
+        return "\n\n".join(non_empty)
 
     def _build_payload(self, prompt: str) -> dict[str, Any]:
         messages: list[dict[str, str]] = []

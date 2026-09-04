@@ -152,6 +152,66 @@ def test_max_response_words_combines_with_existing_system_prompt():
     assert "не более примерно 20 слов" in payload
 
 
+def test_default_system_prompt_is_prepended_to_specific_prompt():
+    """default_system_prompt must be prepended to any other system prompt."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        default_system_prompt="Отвечай на языке запроса.",
+        system_prompt="Respond as a helpful assistant.",
+    )
+    transport = httpx.MockTransport(handler)
+    client = LLMClient(config, transport=transport)
+
+    client.send_prompt("Hi there")
+
+    payload = captured["payload"]
+    assert '"role":"system"' in payload
+    assert "Отвечай на языке запроса." in payload
+    assert "Respond as a helpful assistant." in payload
+    # The default prompt must come before the specific one.
+    assert payload.index("Отвечай на языке запроса.") < payload.index("Respond as a helpful assistant.")
+
+
+def test_default_system_prompt_combines_with_specific_and_briefness():
+    """default_system_prompt, system_prompt and the briefness hint are all joined."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        default_system_prompt="Отвечай на языке запроса.",
+        system_prompt="Respond as a helpful assistant.",
+        max_response_words=15,
+    )
+    transport = httpx.MockTransport(handler)
+    client = LLMClient(config, transport=transport)
+
+    client.send_prompt("Hi there")
+
+    payload = captured["payload"]
+    assert "Отвечай на языке запроса." in payload
+    assert "Respond as a helpful assistant." in payload
+    assert "не более примерно 15 слов" in payload
+    assert payload.index("Отвечай на языке запроса.") < payload.index("Respond as a helpful assistant.")
+
+
 def test_max_tokens_is_never_sent():
     """The client must not rely on the unreliable API-level max_tokens parameter."""
     captured: dict[str, str] = {}

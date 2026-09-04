@@ -75,7 +75,8 @@ cp .env.example .env   # Windows: copy .env.example .env
 | `LLM_MAX_RETRIES`    | `3`                     | Retries for transient failures                           |
 | `LLM_RETRY_BACKOFF`  | `1.0`                   | Base backoff seconds (exponential: `backoff * 2^n`)      |
 | `LLM_TIMEOUT`        | `30`                    | Request timeout in seconds                               |
-| `LLM_SYSTEM_PROMPT`  | *(empty)*               | Optional system prompt sent before the user prompt (e.g. to request a JSON response format) |
+| `LLM_SYSTEM_PROMPT`  | *(empty)*           | Optional system prompt sent before the user prompt (e.g. to request a JSON response format) |
+| `LLM_DEFAULT_SYSTEM_PROMPT` | *(empty)*   | Optional **base** system prompt that is always prepended to any other system prompt (`LLM_SYSTEM_PROMPT`, expert roles, etc.). Set it to keep replies in the user's language by default. Leave empty to disable. |
 | `LLM_MAX_RESPONSE_WORDS` | *(empty)*           | Target maximum reply length in words; adds a briefness instruction to the system prompt (empty = no limit). Per-invocation via `--max-response-words`. |
 
 ### Example: use a local Ollama server
@@ -243,6 +244,61 @@ class Printer:
 client = LLMClient(LLMConfig.from_env(), detail_listener=Printer())
 print(client.send_prompt("Hello"))
 ```
+
+## Comparing prompt strategies
+
+[`scripts/compare_methods.py`](scripts/compare_methods.py) runs one task through
+**four prompting strategies** and prints a comparison table, so you can see how
+much the approach affects the answer:
+
+1. **Прямой ответ** — the raw task, no extra instructions.
+2. **Решай пошагово** — the task plus a "solve step by step" instruction.
+3. **Сначала промпт → потом решение** — first ask the model to draft a good
+   prompt, then solve using that drafted prompt (two calls).
+4. **Группа экспертов** — a panel of roles (analyst, engineer, critic); each
+   expert solves the task **independently** with its role description sent as the
+   system prompt and the task text as the user prompt (one call per role).
+
+The script builds on `LLMClient`, so **provider and model come from your `.env`**
+(`LLMConfig`), exactly like the rest of the project. No extra config needed.
+
+```bash
+# Run both built-in tasks with all 4 methods
+.venv/bin/python scripts/compare_methods.py
+
+# A single built-in task
+.venv/bin/python scripts/compare_methods.py --task-index chickens
+.venv/bin/python scripts/compare_methods.py --task-index fizzbuzz
+
+# Your own task (+ expected answer to enable automatic scoring)
+.venv/bin/python scripts/compare_methods.py \
+  --task "What is 7*6+9?" --expected 51
+
+# Use GigaChat (auth comes from GIGACHAT_* env vars)
+.venv/bin/python scripts/compare_methods.py --provider gigachat
+
+# Save the report as markdown or JSON
+.venv/bin/python scripts/compare_methods.py --out results/comparison.md
+
+# Run only some methods
+.venv/bin/python scripts/compare_methods.py --methods direct,experts
+
+# Keep each reply brief (soft word limit, same as the CLI's --max-response-words)
+.venv/bin/python scripts/compare_methods.py --max-response-words 50
+
+# Print per-request details (URL, model, payload, token usage) to stderr,
+# same as the CLI's --details
+.venv/bin/python scripts/compare_methods.py --details
+```
+
+The built-in logical tasks have a known **canonical answer**, so the script can
+flag which methods got it right. Scoring is **language-agnostic**: when the
+expected answer contains numbers, the script checks that the same numbers appear
+in the reply (e.g. the English `"Chickens: 16, Cows: 6"` correctly matches the
+Russian canonical answer `"6 коров, 16 кур"`). For expected answers without
+numbers it falls back to a word-overlap check. The report shows every prompt and
+response, a verdict column, and — for the multi-step methods — the intermediate
+outputs.
 
 ## Adding a web interface
 
