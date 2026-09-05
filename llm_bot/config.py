@@ -26,6 +26,7 @@ _ENV_TIMEOUT = "LLM_TIMEOUT"
 _ENV_SYSTEM_PROMPT = "LLM_SYSTEM_PROMPT"
 _ENV_DEFAULT_SYSTEM_PROMPT = "LLM_DEFAULT_SYSTEM_PROMPT"
 _ENV_MAX_RESPONSE_WORDS = "LLM_MAX_RESPONSE_WORDS"
+_ENV_TEMPERATURE = "LLM_TEMPERATURE"
 
 # GigaChat (Sber) OAuth2 client_credentials settings.
 _ENV_GIGACHAT_OAUTH_URL = "GIGACHAT_OAUTH_URL"
@@ -53,6 +54,17 @@ def _get_optional_int(name: str) -> int | None:
         return None
     try:
         return int(raw)
+    except ValueError:
+        return None
+
+
+def _get_optional_float(name: str) -> float | None:
+    """Read an optional float env var, returning ``None`` on absence/invalid value."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
     except ValueError:
         return None
 
@@ -89,6 +101,10 @@ class LLMConfig:
             expressed as an approximate maximum number of words. When set, a
             corresponding instruction is added to the system prompt so the model
             keeps its answer brief. ``None`` means no limit.
+        temperature: Sampling temperature in the range [0, 2] (provider-dependent).
+            Lower values make output more deterministic/focused; higher values
+            increase randomness and variety. ``None`` means the provider's default
+            (the parameter is omitted from the request).
     """
 
     base_url: str = field(default_factory=lambda: os.getenv(_ENV_BASE_URL, "https://api.openai.com/v1"))
@@ -103,6 +119,9 @@ class LLMConfig:
     )
     max_response_words: int | None = field(
         default_factory=lambda: _get_optional_int(_ENV_MAX_RESPONSE_WORDS)
+    )
+    temperature: float | None = field(
+        default_factory=lambda: _get_optional_float(_ENV_TEMPERATURE)
     )
 
     # --- GigaChat (Sber) OAuth2 client_credentials settings ---
@@ -136,6 +155,7 @@ class LLMConfig:
         system_prompt: str | None = None,
         default_system_prompt: str | None = None,
         max_response_words: int | None = None,
+        temperature: float | None = None,
     ) -> "LLMConfig":
         """Return a copy of this config with any provided fields overridden.
 
@@ -160,6 +180,7 @@ class LLMConfig:
                 if max_response_words is None
                 else max_response_words
             ),
+            temperature=self.temperature if temperature is None else temperature,
             gigachat_oauth_url=self.gigachat_oauth_url,
             gigachat_client_id=self.gigachat_client_id,
             gigachat_client_secret=self.gigachat_client_secret,

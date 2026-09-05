@@ -150,10 +150,13 @@ class LLMClient:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
-        return {
+        payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
         }
+        if self.config.temperature is not None:
+            payload["temperature"] = self.config.temperature
+        return payload
 
     def _build_url(self) -> str:
         """Return the full chat-completions URL for the configured base URL."""

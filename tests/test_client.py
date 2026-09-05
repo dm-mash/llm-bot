@@ -236,6 +236,51 @@ def test_max_tokens_is_never_sent():
     assert "max_tokens" not in captured["payload"]
 
 
+def test_temperature_is_omitted_when_not_set():
+    """When no temperature is configured, the payload must not contain it."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+    )
+    client = LLMClient(config, transport=httpx.MockTransport(handler))
+
+    client.send_prompt("Hi there")
+
+    assert "temperature" not in captured["payload"]
+
+
+def test_temperature_is_sent_when_configured():
+    """Setting temperature must add it to the chat-completions payload."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        temperature=0.7,
+    )
+    client = LLMClient(config, transport=httpx.MockTransport(handler))
+
+    client.send_prompt("Hi there")
+
+    assert '"temperature":0.7' in captured["payload"]
+
+
 def test_retry_then_success():
     """A transient 503 followed by a 200 should succeed after one retry."""
     state = {"attempts": 0}
