@@ -150,6 +150,11 @@ class _DetailPrinter:
         if details.usage:
             parts = " ".join(f"{k}={v}" for k, v in details.usage.items())
             print(f"[details] usage: {parts}", file=sys.stderr)
+        if details.body:
+            print("[details] response body:", file=sys.stderr)
+            body = json.dumps(details.body, ensure_ascii=False, indent=2)
+            for line in body.splitlines():
+                print(f"           {line}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -9,6 +9,7 @@ from llm_bot.client import (
     LLMClient,
     LLMRequestError,
     LLMRetryExhaustedError,
+    LLMTruncatedError,
 )
 from llm_bot.config import LLMConfig
 from llm_bot.diagnostics import DetailListener, RequestDetails, ResponseDetails
@@ -369,6 +370,155 @@ def test_unexpected_response_shape_raises():
         client.send_prompt("ping")
 
 
+def test_reasoning_model_empty_content_falls_back_to_reasoning():
+    """A reasoning model (e.g. gpt-oss-120b on Groq) may return content == \"\"
+    while placing its chain-of-thought in a separate reasoning field. The client
+    must fall back to that field instead of silently returning a blank reply.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": (
+                                "Думаю над задачей... Кто чей сын? Пусть Леня..."
+                            ),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 301,
+                    "completion_tokens": 3072,
+                    "total_tokens": 3373,
+                },
+            },
+        )
+
+    client = _make_client(handler)
+
+    # The client must fall back to reasoning_content when content is empty,
+    # instead of returning a blank reply for a successful HTTP 200 response.
+    assert client.send_prompt("Кто чей сын?") == (
+        "Думаю над задачей... Кто чей сын? Пусть Леня..."
+    )
+
+
+def test_length_truncation_with_empty_content_raises():
+    """When content is empty and finish_reason == 'length', generation was cut off
+    by the token limit; a LLMTruncatedError with the reasoning size must be raised.
+    """
+    reasoning = "Очень длинное рассуждение, которое не влезло в лимит..."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": reasoning,
+                        },
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 301,
+                    "completion_tokens": 8000,
+                    "total_tokens": 8301,
+                },
+            },
+        )
+
+    client = _make_client(handler)
+
+    with pytest.raises(LLMTruncatedError) as excinfo:
+        client.send_prompt("Кто чей сын?")
+
+    msg = str(excinfo.value)
+    assert "прервана" in msg
+    assert "лимита токенов" in msg
+    assert f"reasoning {len(reasoning)} chars" in msg
+
+
+def test_length_truncation_without_reasoning_still_raises():
+    """Empty content + finish_reason='length' with no reasoning must still raise
+    LLMTruncatedError (no reasoning-size suffix when there is no reasoning).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "length",
+                    }
+                ],
+            },
+        )
+
+    client = _make_client(handler)
+
+    with pytest.raises(LLMTruncatedError) as excinfo:
+        client.send_prompt("ping")
+
+    assert "reasoning" not in str(excinfo.value)
+
+
+def test_length_truncation_with_partial_content_raises():
+    """finish_reason='length' without reasoning can still leave a partial answer in
+    content. That is a truncation too and must raise LLMTruncatedError, flagging the
+    incomplete text in content instead of silently returning it.
+    """
+    partial = "Неполный ответ, обрезанный на полуслове..."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": partial},
+                        "finish_reason": "length",
+                    }
+                ],
+            },
+        )
+
+    client = _make_client(handler)
+
+    with pytest.raises(LLMTruncatedError) as excinfo:
+        client.send_prompt("ping")
+
+    msg = str(excinfo.value)
+    assert "прервана" in msg
+    assert "лимита токенов" in msg
+    assert f"content ({len(partial)} chars)" in msg
+
+
+def test_empty_content_without_reasoning_still_raises():
+    """Empty content with no reasoning fallback must still raise, not return ''."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": ""}}],
+            },
+        )
+
+    client = _make_client(handler)
+
+    with pytest.raises(LLMRequestError, match="empty content"):
+        client.send_prompt("ping")
+
+
 def test_config_overrides():
     base = LLMConfig(base_url="https://a", api_key="k", model="m")
     overridden = base.with_overrides(model="new-model")
@@ -413,6 +563,9 @@ def test_detail_listener_receives_request_and_usage():
     assert resp.attempt == 1
     assert resp.usage == {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
     assert resp.elapsed_ms is not None and resp.elapsed_ms >= 0
+    # The full raw response body must be surfaced for --details output.
+    assert resp.body is not None
+    assert resp.body["choices"][0]["message"]["content"] == "Hello"
 
 
 def test_detail_listener_reports_each_attempt():

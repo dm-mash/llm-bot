@@ -47,6 +47,15 @@ class LLMRetryExhaustedError(LLMRequestError):
     """Raised when all retries are exhausted for a transient failure."""
 
 
+class LLMTruncatedError(LLMRequestError):
+    """Raised when the model stopped because it hit the token limit.
+
+    A reasoning model may fill its entire completion budget with chain-of-thought
+    and be cut off (``finish_reason="length"``) before any visible ``content`` is
+    produced. We surface this explicitly instead of returning a blank reply.
+    """
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """Return True if *exc* represents a transient, retryable failure."""
     return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
@@ -183,6 +192,7 @@ class LLMClient:
             usage=extract_usage(data),
             elapsed_ms=round(elapsed_ms, 1),
             attempt=attempt,
+            body=data,
         )
         self._detail_listener.on_response(details)
 
@@ -267,15 +277,65 @@ class LLMClient:
 
     @staticmethod
     def _extract_text(data: dict[str, Any]) -> str:
-        """Extract the assistant message text from a chat-completions response."""
+        """Extract the assistant message text from a chat-completions response.
+
+        Some reasoning models (e.g. gpt-oss-120b on Groq) put their chain-of-thought
+        in a separate field (``reasoning_content`` / ``reasoning``) and leave
+        ``content`` empty or ``None``.
+
+        A ``finish_reason="length"`` always means the model hit its token limit and
+        the output was cut off — regardless of whether there is partial text in
+        ``content`` or only chain-of-thought in a ``reasoning*`` field. We raise
+        :class:`LLMTruncatedError` so the caller knows generation was interrupted,
+        reporting the partial-content size (if any) and the reasoning size (if any).
+
+        Otherwise we fall back to a ``reasoning*`` field when ``content`` is empty,
+        so a blank reply is not silently returned.
+        """
         try:
             choices = data["choices"]
-            content = choices[0]["message"]["content"]
+            choice = choices[0]
+            message = choice["message"]
+            finish_reason = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMRequestError(f"Unexpected response shape from LLM API: {data!r}") from exc
-        if content is None:
-            raise LLMRequestError(f"LLM API returned empty content: {data!r}")
-        return content
+
+        content = message.get("content")
+        reasoning = next(
+            (
+                candidate
+                for key, candidate in message.items()
+                if "reason" in key.lower()
+                and isinstance(candidate, str)
+                and candidate.strip()
+            ),
+            None,
+        )
+
+        # finish_reason='length' => generation cut off by the token limit.
+        if finish_reason == "length":
+            details = []
+            if isinstance(content, str) and content.strip():
+                details.append(f"неполный ответ в content ({len(content)} chars)")
+            if reasoning:
+                details.append(f"reasoning {len(reasoning)} chars")
+            suffix = (": " + "; ".join(details)) if details else ""
+            raise LLMTruncatedError(
+                "Генерация прервана из-за превышения лимита токенов"
+                f" (finish_reason='length'){suffix}"
+            )
+
+        if isinstance(content, str) and content.strip():
+            return content
+
+        # Fallback: prefer the first reasoning-style field that has visible text.
+        for key in sorted(message):
+            if "reason" in key.lower():
+                candidate = message.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate
+
+        raise LLMRequestError(f"LLM API returned empty content: {data!r}")
 
 
 class _TransientHTTPError(Exception):

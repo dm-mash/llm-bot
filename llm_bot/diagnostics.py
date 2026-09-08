@@ -63,12 +63,15 @@ class ResponseDetails:
         elapsed_ms: Round-trip time of the attempt in milliseconds.
         attempt: 1-based index of this attempt (1 on the first try, 2 on the
             first retry, and so on).
+        body: The raw parsed JSON body of the response, or ``None`` when no body
+            was available (e.g. transient/error attempts emitted with an empty dict).
     """
 
     status_code: int
     usage: dict[str, int] | None = None
     elapsed_ms: float | None = None
     attempt: int = 1
+    body: dict[str, Any] | None = None
 
 
 @runtime_checkable
