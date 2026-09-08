@@ -1,27 +1,40 @@
 # llm-bot
 
-A provider-agnostic Python client for OpenAI-compatible LLM APIs. It sends a
-prompt to the API, receives the model's response, and prints it to the console.
+A provider-agnostic Python client for OpenAI-compatible LLM APIs, extended with
+an **agent layer**. Beyond single prompts, it supports multiple LLM providers,
+named agents (roles), and persistent multi-turn chat sessions that keep their
+own message history.
 
-The core request logic lives in a reusable service layer
-([`LLMClient`](llm_bot/client.py)) that is deliberately kept separate from the
-console UI ([`cli.py`](llm_bot/cli.py)). This makes it trivial to add a **web
-interface** later without touching the request logic (see
-[Adding a web interface](#adding-a-web-interface)).
+Architecture layers:
+
+- [`LLMClient`](llm_bot/client.py) — transport: HTTP, retries, auth, payload.
+- [`Agent`](llm_bot/agent.py) — a role: system prompt, temperature, max tokens,
+  and a reference to a model profile.
+- [`Session`](llm_bot/agent.py) — a conversation with an agent; owns its message
+  history and persists it to disk.
+- Storage backends ([`stores.py`](llm_bot/stores.py)) — pluggable repositories
+  for models, agents and sessions (YAML/JSON today, a database later).
+
+This design keeps the console UI ([`cli.py`](llm_bot/cli.py)) thin and makes it
+trivial to add a **web interface** later without touching the logic.
 
 ## Features
 
-- Provider-agnostic — works with OpenAI, Ollama, LM Studio, LocalAI, and any
-  other server exposing the `/v1/chat/completions` endpoint.
-- Configuration via environment variables / `.env` (no hard-coded keys).
+- Provider-agnostic — works with OpenAI, Ollama, LM Studio, LocalAI, GigaChat,
+  and any other server exposing the `/v1/chat/completions` endpoint.
+- **Multiple providers** — model credentials live in `data/models.yaml`, so you
+  can define any number of LLM profiles.
+- **Named agents** — roles defined in `data/agents.yaml` (system prompt,
+  temperature, max tokens) that reference a model profile.
+- **Persistent chat sessions** — each conversation keeps its own history in
+  `data/sessions/*.json` and survives process restarts.
 - Automatic retries with exponential backoff for transient failures
   (timeouts, network errors, HTTP 429 / 5xx).
 - Clear error handling via custom exception types.
-- Console entry point accepting a prompt as an argument or via stdin.
+- Console entry point: interactive chat (`--agent`) or a single prompt.
 - `--details` flag to print request/response diagnostics (URL, model, formed
   request body, token usage, per-attempt timing) to stderr.
-- Built-in GigaChat support (`--provider gigachat`) with automatic OAuth2 token
-  acquisition and refresh.
+- Built-in GigaChat support with automatic OAuth2 token acquisition and refresh.
 - Pytest suite using `httpx.MockTransport` (no network needed).
 
 ## Project structure
@@ -29,19 +42,33 @@ interface** later without touching the request logic (see
 ```
 llm-bot/
 ├── llm_bot/
-│   ├── __init__.py      # package exports
-│   ├── config.py        # LLMConfig — settings from env vars
-│   ├── diagnostics.py   # RequestDetails/ResponseDetails + DetailListener protocol
-│   ├── client.py        # LLMClient — request logic + retries + errors + detail events
-│   ├── gigachat.py      # GigaChat OAuth2 token provider + factory
-│   ├── cli.py           # console entry point
-│   └── __main__.py      # enables `python -m llm_bot`
+│   ├── __init__.py            # package exports
+│   ├── config.py              # LLMConfig — settings from env vars
+│   ├── diagnostics.py         # RequestDetails/ResponseDetails + listener protocol
+│   ├── client.py              # LLMClient — transport + retries + errors + detail events
+│   ├── stores.py              # Repository interfaces (ModelStore/AgentStore/SessionStore)
+│   ├── yaml_stores.py         # YamlModelStore / YamlAgentStore (data/*.yaml)
+│   ├── json_session_store.py  # JsonSessionStore (data/sessions/*.json)
+│   ├── agent.py               # Agent (role) + Session (conversation with history)
+│   ├── factory.py             # Wiring: assemble client/agent/session from stores
+│   ├── gigachat.py            # GigaChat OAuth2 token provider + factory
+│   ├── cli.py                 # console entry point (interactive chat / single prompt)
+│   └── __main__.py            # enables `python -m llm_bot`
 ├── tests/
-│   ├── test_client.py   # pytest tests (mocked transport)
-│   └── test_gigachat.py # GigaChat token provider tests
+│   ├── test_client.py         # LLMClient tests (mocked transport)
+│   ├── test_agent.py          # Agent + Session tests
+│   ├── test_stores.py         # YAML/JSON store tests
+│   └── test_gigachat.py       # GigaChat token provider tests
+├── models.example.yaml        # template -> copy to data/models.yaml
+├── agents.example.yaml        # template -> copy to data/agents.yaml
 ├── requirements.txt
 ├── .env.example
 └── README.md
+
+data/                          # runtime data — DO NOT COMMIT (see .gitignore)
+├── models.yaml                # real provider credentials
+├── agents.yaml                # real agent definitions
+└── sessions/                  # per-session chat histories (*.json)
 ```
 
 ## Installation
@@ -78,6 +105,7 @@ cp .env.example .env   # Windows: copy .env.example .env
 | `LLM_SYSTEM_PROMPT`  | *(empty)*           | Optional system prompt sent before the user prompt (e.g. to request a JSON response format) |
 | `LLM_DEFAULT_SYSTEM_PROMPT` | *(empty)*   | Optional **base** system prompt that is always prepended to any other system prompt (`LLM_SYSTEM_PROMPT`, expert roles, etc.). Set it to keep replies in the user's language by default. Leave empty to disable. |
 | `LLM_MAX_RESPONSE_WORDS` | *(empty)*           | Target maximum reply length in words; adds a briefness instruction to the system prompt (empty = no limit). Per-invocation via `--max-response-words`. |
+| `LLM_MAX_TOKENS`         | *(empty)*           | Hard cap on generated tokens per reply, enforced by the API (`max_tokens` in the payload). Empty = provider default. |
 
 ### Example: use a local Ollama server
 
@@ -115,7 +143,87 @@ python -m llm_bot --provider gigachat "Привет! Расскажи о себ�
 > or provide a pre-encoded `GIGACHAT_BASIC_AUTH="Basic ..."` if your variant
 > differs from `base64(client_id:client_secret)`.
 
+## Models, agents and sessions
+
+The agent layer uses three separate definitions:
+
+1. **Models** (`data/models.yaml`, key `models`) — provider credentials only
+   (`base_url`, `api_key`, `model`, optional GigaChat OAuth fields). No behaviour.
+2. **Agents** (`data/agents.yaml`, key `agents`) — a role: which model to use,
+   the system prompt, temperature and `max_tokens`. Many agents can share one
+   model profile while differing in behaviour.
+3. **Sessions** (`data/sessions/*.json`) — a conversation with an agent, owning
+   its own message history. Sessions are created at runtime, not defined in YAML.
+
+Create the real files from the templates (they are **not** committed):
+
+```bash
+mkdir -p data/sessions
+cp models.example.yaml data/models.yaml
+cp agents.example.yaml data/agents.yaml
+cp .env.example .env
+```
+
+Secrets in `data/models.yaml` are referenced as `${ENV_VAR}` and resolved from
+the environment / `.env`, so real keys never need to be committed. Keep `data/`
+out of version control (it is listed in `.gitignore`).
+
+Example `data/models.yaml`:
+
+```yaml
+models:
+  openai-gpt4o:
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-4o-mini
+  ollama-local:
+    provider: openai
+    base_url: http://localhost:11434/v1
+    api_key: ""
+    model: llama3.2
+```
+
+Example `data/agents.yaml` (two agents sharing the same model profile):
+
+```yaml
+agents:
+  translator:
+    model: openai-gpt4o
+    system_prompt: "Переводи с русского на английский и обратно."
+    temperature: 0.2
+    max_tokens: 512
+  critic:
+    model: openai-gpt4o
+    system_prompt: "Давай строгий критический разбор текста."
+    temperature: 0.9
+```
+
+List available agents:
+
+```bash
+python -m llm_bot --list-agents
+```
+
 ## Usage
+
+### Interactive chat with an agent
+
+Start an interactive chat with the `assistant` agent (history is saved to
+`data/sessions/` and resumes with the same `--session` id):
+
+```bash
+python -m llm_bot --agent assistant
+python -m llm_bot --agent assistant --session my-conversation   # resume
+```
+
+A single one-shot turn via an agent:
+
+```bash
+python -m llm_bot --agent translator "Good morning"
+```
+
+### Legacy: single direct call
 
 Prompt as an argument:
 
@@ -201,6 +309,36 @@ token usage, per-attempt reporting).
 
 ## Programmatic use
 
+### Via an agent session
+
+Assemble an agent from the stores and chat with it. The session keeps its own
+history (persisted to `data/sessions/`), so multi-turn context is automatic:
+
+```python
+from llm_bot.factory import make_session
+from llm_bot.json_session_store import JsonSessionStore
+from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
+
+session = make_session(
+    "my-session",                     # session id (resume with the same id)
+    "translator",                     # agent name from data/agents.yaml
+    model_store=YamlModelStore(),
+    agent_store=YamlAgentStore(),
+    session_store=JsonSessionStore(),
+)
+
+reply = session.chat("Good morning")  # returns only the text
+print(reply)
+print(session.history)                # [user, assistant, ...] full transcript
+```
+
+An `Agent` is a stateless role; many sessions can share it. History lives on the
+session, so different topics or users get independent conversations.
+
+### Direct low-level call (`LLMClient`)
+
+For a single prompt without any agent/session state:
+
 ```python
 from llm_bot.client import LLMClient, LLMError
 from llm_bot.config import LLMConfig
@@ -214,6 +352,10 @@ try:
 except LLMError as exc:
     print("Failed:", exc)
 ```
+
+To send a pre-built message stack (e.g. a conversation history assembled by the
+caller), use [`LLMClient.chat(messages)`](llm_bot/client.py) instead of
+`send_prompt`.
 
 For GigaChat, use the factory which wires up the OAuth2 token provider for you:
 

@@ -1,0 +1,30 @@
+# Copy this file to data/agents.yaml and fill in your values.
+#
+# This file defines AGENTS — the roles/behaviour. Each agent references a model
+# from data/models.yaml (by the `model:` key) and carries its own generation
+# settings and system prompt. Many agents can share one model profile while
+# differing in behaviour.
+#
+# Agents do NOT store conversation history; sessions (created at runtime) do.
+agents:
+  assistant:
+    model: openai-gpt4o          # must match a key in data/models.yaml
+    default_system_prompt: "Отвечай на том же языке, на котором написан запрос."
+    system_prompt: "Ты полезный помощник."
+    temperature: 0.7
+    max_tokens: 1024
+
+  translator:
+    model: openai-gpt4o
+    system_prompt: "Переводи с русского на английский и обратно. Отвечай только переводом."
+    temperature: 0.2
+    max_tokens: 512
+
+  critic:
+    model: openai-gpt4o
+    system_prompt: "Давай строгий критический разбор текста, указывай слабые места."
+    temperature: 0.9
+
+  local-chat:
+    model: ollama-local
+    system_prompt: "Ты дружелюбный ассистент."

@@ -1,10 +1,14 @@
-"""Console entry point for the LLM client.
+"""Console entry point for the LLM client and agent-based chat.
 
 Usage examples:
+    python -m llm_bot --agent assistant                 # interactive chat
+    python -m llm_bot --agent assistant --session my1   # resume session
+    python -m llm_bot --agent translator "Hello"        # one-shot via agent
+    python -m llm_bot --list-agents                     # show available agents
+
+Legacy (single direct call, no agent):
     python -m llm_bot "Hello, who are you?"
-    echo "Summarize this" | python -m llm_bot
     python -m llm_bot --model llama3.2 "Tell me a joke"
-    python -m llm_bot --base-url http://localhost:11434/v1 "Hi"
 """
 
 from __future__ import annotations
@@ -13,7 +17,9 @@ import argparse
 import json
 import logging
 import sys
+import time
 
+from llm_bot.agent import Session
 from llm_bot.client import LLMClient, LLMError
 from llm_bot.config import LLMConfig
 from llm_bot.diagnostics import (
@@ -21,56 +27,81 @@ from llm_bot.diagnostics import (
     RequestDetails,
     ResponseDetails,
 )
+from llm_bot.factory import make_session
 from llm_bot.gigachat import build_gigachat_client
+from llm_bot.json_session_store import JsonSessionStore
+from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser for the CLI."""
     parser = argparse.ArgumentParser(
         prog="llm-bot",
-        description="Send a prompt to an OpenAI-compatible LLM API and print the response.",
+        description="Chat with an LLM agent or send a single prompt to an "
+        "OpenAI-compatible API.",
     )
     parser.add_argument(
         "prompt",
         nargs="*",
-        help="The prompt text. If omitted, the prompt is read from stdin.",
+        help="The prompt text. If omitted and --agent is set, starts an "
+        "interactive chat.",
     )
+
+    # Agent / session options.
     parser.add_argument(
-        "--base-url",
+        "--agent",
         default=None,
-        help="Override the LLM API base URL (else LLM_BASE_URL or default).",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Override the API key (else LLM_API_KEY).",
+        metavar="NAME",
+        help="Name of an agent defined in data/agents.yaml (references a model "
+        "from data/models.yaml).",
     )
     parser.add_argument(
         "--model",
         default=None,
-        help="Override the model identifier (else LLM_MODEL).",
+        help="[legacy] Override the model identifier when NOT using --agent.",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        metavar="ID",
+        help="Session id for persisting/continuing a conversation history "
+        "(stored in data/sessions/). A new one is generated if omitted.",
+    )
+    parser.add_argument(
+        "--list-agents",
+        action="store_true",
+        help="List the names of all defined agents and exit.",
+    )
+
+    # Legacy direct-call options (used only without --agent).
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="[legacy] Override the LLM API base URL (else LLM_BASE_URL or default).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="[legacy] Override the API key (else LLM_API_KEY).",
     )
     parser.add_argument(
         "--system-prompt",
         default=None,
-        help="Optional system prompt sent before the user prompt (e.g. to request "
-        "a specific JSON response schema). Overrides LLM_SYSTEM_PROMPT.",
+        help="[legacy] Optional system prompt sent before the user prompt.",
     )
     parser.add_argument(
         "--max-response-words",
         type=int,
         default=None,
-        help="Target maximum length of the reply, in words. Added to the system "
-        "prompt as a briefness instruction (else LLM_MAX_RESPONSE_WORDS). "
-        "Leave unset for no limit.",
+        help="[legacy] Target maximum length of the reply, in words.",
     )
     parser.add_argument(
         "--provider",
         choices=("openai", "gigachat"),
         default="openai",
-        help="Provider auth mode. 'gigachat' exchanges GIGACHAT_CLIENT_SECRET "
-        "for an OAuth2 token before calling the API.",
+        help="[legacy] Provider auth mode for the direct-call path.",
     )
+
     parser.add_argument(
         "-v",
         "--verbose",
@@ -84,44 +115,6 @@ def build_parser() -> argparse.ArgumentParser:
         "to stderr.",
     )
     return parser
-
-
-def _resolve_prompt(args: argparse.Namespace) -> str:
-    """Get the prompt from CLI arguments or, if empty, from stdin."""
-    if args.prompt:
-        return " ".join(args.prompt).strip()
-
-    # In a real terminal, read interactively until an empty line (or EOF).
-    # This lets users type/paste a prompt and finish it with a blank line,
-    # instead of hanging on sys.stdin.read() while waiting for EOF.
-    if sys.stdin.isatty():
-        prompt = _read_interactive()
-    else:
-        # Piped / redirected input: consume the whole stream.
-        data = sys.stdin.read()
-        prompt = data.strip()
-
-    if not prompt:
-        raise ValueError("No prompt provided. Pass it as an argument or pipe it via stdin.")
-    return prompt
-
-
-def _read_interactive() -> str:
-    """Read a prompt from an interactive terminal, one line at a time.
-
-    An empty line (just Enter) signals the end of input, so a single plain
-    Enter without any text is treated as "no prompt".
-    """
-    lines: list[str] = []
-    for raw in sys.stdin:
-        line = raw.rstrip("\n")
-        if line.strip() == "" and lines:
-            # A blank line after some content ends the prompt.
-            break
-        if line.strip() == "":
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
 
 
 class _DetailPrinter:
@@ -157,21 +150,72 @@ class _DetailPrinter:
                 print(f"           {line}", file=sys.stderr)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """CLI entry point. Returns a process exit code."""
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def _new_session_id(agent_name: str) -> str:
+    """Generate a fresh, filesystem-safe session id for an agent."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"{agent_name}-{stamp}"
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+
+def _run_agent_chat(
+    agent_name: str,
+    *,
+    session_id: str | None,
+    prompt: str | None,
+    detail_listener: DetailListener | None,
+) -> int:
+    """Run an agent-based session; either one shot or an interactive loop."""
+    agent_store = YamlAgentStore()
+    model_store = YamlModelStore()
+    session_store = JsonSessionStore()
+    session_id = session_id or _new_session_id(agent_name)
+
+    session = make_session(
+        session_id,
+        agent_name,
+        model_store=model_store,
+        agent_store=agent_store,
+        session_store=session_store,
+        detail_listener=detail_listener,
     )
 
+    if prompt is not None:
+        try:
+            print(session.chat(prompt))
+        except LLMError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    return _interactive_loop(session)
+
+
+def _interactive_loop(session: Session) -> int:
+    """Run an interactive REPL-style chat against a session."""
+    print(f"Starting chat with agent '{session.agent.name}' "
+          f"(session {session.session_id}). Type 'exit' or Ctrl-D to quit.",
+          file=sys.stderr)
     try:
-        prompt = _resolve_prompt(args)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        while True:
+            try:
+                user = input("> ").strip()
+            except EOFError:
+                break
+            if not user:
+                continue
+            if user.lower() in {"exit", "quit"}:
+                break
+            try:
+                print(session.chat(user))
+            except LLMError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _run_legacy(args: argparse.Namespace) -> int:
+    """Original single-prompt behaviour, kept for backward compatibility."""
+    prompt = args.prompt_text
 
     config = LLMConfig.from_env().with_overrides(
         base_url=args.base_url,
@@ -196,6 +240,120 @@ def main(argv: list[str] | None = None) -> int:
 
     print(response)
     return 0
+
+
+def _resolve_prompt(args: argparse.Namespace, *, interactive_allowed: bool) -> str | None:
+    """Get the prompt from arguments or, for interactive use, return ``None``."""
+    if args.prompt:
+        return " ".join(args.prompt).strip()
+
+    # Agent path: no argument means interactive chat.
+    if interactive_allowed and args.agent:
+        return None
+
+    # Legacy path: read from stdin.
+    if sys.stdin.isatty():
+        prompt = _read_interactive()
+    else:
+        data = sys.stdin.read()
+        prompt = data.strip()
+
+    if not prompt:
+        raise ValueError("No prompt provided. Pass it as an argument, pipe it via "
+                         "stdin, or use --agent for an interactive chat.")
+    return prompt
+
+
+def _read_interactive() -> str:
+    """Read a prompt from an interactive terminal, one line at a time.
+
+    An empty line (just Enter) signals the end of input, so a single plain
+    Enter without any text is treated as "no prompt".
+    """
+    lines: list[str] = []
+    for raw in sys.stdin:
+        line = raw.rstrip("\n")
+        if line.strip() == "" and lines:
+            break
+        if line.strip() == "":
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _print_agents() -> int:
+    """Print detailed information about every defined agent."""
+    agent_store = YamlAgentStore()
+    model_store = YamlModelStore()
+    names = agent_store.list()
+    if not names:
+        print("No agents defined.", file=sys.stderr)
+        return 0
+
+    for name in names:
+        agent = agent_store.get(name)
+        print(f"[{name}]")
+        print(f"  model profile : {agent.model}")
+        try:
+            model = model_store.get(agent.model)
+            print(f"  provider      : {model.provider}")
+            print(f"  api model     : {model.model or '(default)'}")
+            print(f"  base url      : {model.base_url or '(default)'}")
+        except (KeyError, FileNotFoundError):
+            print(f"  provider      : <unknown model '{agent.model}'>")
+        if agent.system_prompt:
+            print(f"  system prompt : {agent.system_prompt!r}")
+        if agent.default_system_prompt:
+            print(f"  default sys   : {agent.default_system_prompt!r}")
+        parts = []
+        if agent.temperature is not None:
+            parts.append(f"temperature={agent.temperature}")
+        if agent.max_tokens is not None:
+            parts.append(f"max_tokens={agent.max_tokens}")
+        if agent.max_response_words is not None:
+            parts.append(f"max_response_words={agent.max_response_words}")
+        if parts:
+            print(f"  generation    : {', '.join(parts)}")
+        print()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Returns a process exit code."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if args.list_agents:
+        return _print_agents()
+
+    detail_listener = _DetailPrinter() if args.details else None
+
+    if args.agent:
+        try:
+            prompt = _resolve_prompt(args, interactive_allowed=True)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        return _run_agent_chat(
+            args.agent,
+            session_id=args.session,
+            prompt=prompt,
+            detail_listener=detail_listener,
+        )
+
+    # Legacy path.
+    args.prompt_text = " ".join(args.prompt).strip()
+    try:
+        args.prompt_text = _resolve_prompt(args, interactive_allowed=False)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return _run_legacy(args)
 
 
 if __name__ == "__main__":

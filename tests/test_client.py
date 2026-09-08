@@ -213,8 +213,8 @@ def test_default_system_prompt_combines_with_specific_and_briefness():
     assert payload.index("Отвечай на языке запроса.") < payload.index("Respond as a helpful assistant.")
 
 
-def test_max_tokens_is_never_sent():
-    """The client must not rely on the unreliable API-level max_tokens parameter."""
+def test_max_tokens_omitted_when_not_set():
+    """When no max_tokens is configured, the payload must not contain it."""
     captured: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -235,6 +235,63 @@ def test_max_tokens_is_never_sent():
     client.send_prompt("Hi there")
 
     assert "max_tokens" not in captured["payload"]
+
+
+def test_max_tokens_is_sent_when_configured():
+    """Setting max_tokens must add a hard token cap to the payload."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+        max_tokens=512,
+    )
+    client = LLMClient(config, transport=httpx.MockTransport(handler))
+
+    client.send_prompt("Hi there")
+
+    assert '"max_tokens":512' in captured["payload"]
+
+
+def test_chat_accepts_prebuilt_message_stack():
+    """chat() sends the given messages verbatim and returns the reply text."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    config = LLMConfig(
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        max_retries=2,
+        retry_backoff=0.0,
+    )
+    client = LLMClient(config, transport=httpx.MockTransport(handler))
+
+    messages = [
+        {"role": "system", "content": "Be terse."},
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    result = client.chat(messages)
+
+    assert result == "Hello from the LLM!"
+    payload = captured["payload"]
+    # No system prompt is injected by chat(); the stack is sent as-is.
+    assert '"role":"system"' in payload
+    assert '"content":"one"' in payload
+    assert '"content":"three"' in payload
+    assert '"model":"test-model"' in payload
 
 
 def test_temperature_is_omitted_when_not_set():

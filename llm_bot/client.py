@@ -153,18 +153,29 @@ class LLMClient:
         non_empty = [p for p in parts if p]
         return "\n\n".join(non_empty)
 
-    def _build_payload(self, prompt: str) -> dict[str, Any]:
+    def _build_messages(self, prompt: str) -> list[dict[str, str]]:
+        """Assemble the message stack for a single-prompt request.
+
+        Kept for backward compatibility with :meth:`send_prompt`. The system
+        prompt is prepended here so callers who pass a raw prompt still get the
+        configured system behavior.
+        """
         messages: list[dict[str, str]] = []
         system_prompt = self._build_system_prompt()
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def _build_payload(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
         }
         if self.config.temperature is not None:
             payload["temperature"] = self.config.temperature
+        if self.config.max_tokens is not None:
+            payload["max_tokens"] = self.config.max_tokens
         return payload
 
     def _build_url(self) -> str:
@@ -225,10 +236,10 @@ class LLMClient:
         self._emit_response(response.status_code, attempt, elapsed_ms, data)
         return data
 
-    def _execute_with_retry(self, prompt: str) -> dict[str, Any]:
+    def _execute_with_retry(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         last_error: Exception | None = None
         url = self._build_url()
-        payload = self._build_payload(prompt)
+        payload = self._build_payload(messages)
         self._emit_request(url, payload)
         for attempt in range(self.config.max_retries + 1):
             try:
@@ -272,7 +283,29 @@ class LLMClient:
             LLMRequestError: On permanent (non-retryable) failures.
             LLMRetryExhaustedError: When transient failures persist past max_retries.
         """
-        data = self._execute_with_retry(prompt)
+        data = self._execute_with_retry(self._build_messages(prompt))
+        return self._extract_text(data)
+
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        """Send a pre-built message stack and return the text of the model's reply.
+
+        Unlike :meth:`send_prompt`, this accepts a fully formed ``messages`` list
+        (e.g. an agent-managed conversation history) and does not inject any
+        system prompt itself. Callers that need a system prompt must include it
+        as the first message.
+
+        Args:
+            messages: The complete list of ``{"role", "content"}`` messages to
+                send, in order.
+
+        Returns:
+            The assistant's response text.
+
+        Raises:
+            LLMRequestError: On permanent (non-retryable) failures.
+            LLMRetryExhaustedError: When transient failures persist past max_retries.
+        """
+        data = self._execute_with_retry(messages)
         return self._extract_text(data)
 
     @staticmethod

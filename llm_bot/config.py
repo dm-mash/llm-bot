@@ -27,6 +27,7 @@ _ENV_SYSTEM_PROMPT = "LLM_SYSTEM_PROMPT"
 _ENV_DEFAULT_SYSTEM_PROMPT = "LLM_DEFAULT_SYSTEM_PROMPT"
 _ENV_MAX_RESPONSE_WORDS = "LLM_MAX_RESPONSE_WORDS"
 _ENV_TEMPERATURE = "LLM_TEMPERATURE"
+_ENV_MAX_TOKENS = "LLM_MAX_TOKENS"
 
 # GigaChat (Sber) OAuth2 client_credentials settings.
 _ENV_GIGACHAT_OAUTH_URL = "GIGACHAT_OAUTH_URL"
@@ -105,6 +106,10 @@ class LLMConfig:
             Lower values make output more deterministic/focused; higher values
             increase randomness and variety. ``None`` means the provider's default
             (the parameter is omitted from the request).
+        max_tokens: Maximum number of tokens the model may generate in a single
+            reply. ``None`` means the provider's default (the parameter is omitted
+            from the request). Unlike ``max_response_words`` (a soft, prompt-based
+            hint), this is a hard token cap enforced by the API.
     """
 
     base_url: str = field(default_factory=lambda: os.getenv(_ENV_BASE_URL, "https://api.openai.com/v1"))
@@ -122,6 +127,9 @@ class LLMConfig:
     )
     temperature: float | None = field(
         default_factory=lambda: _get_optional_float(_ENV_TEMPERATURE)
+    )
+    max_tokens: int | None = field(
+        default_factory=lambda: _get_optional_int(_ENV_MAX_TOKENS)
     )
 
     # --- GigaChat (Sber) OAuth2 client_credentials settings ---
@@ -156,6 +164,7 @@ class LLMConfig:
         default_system_prompt: str | None = None,
         max_response_words: int | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> "LLMConfig":
         """Return a copy of this config with any provided fields overridden.
 
@@ -181,6 +190,7 @@ class LLMConfig:
                 else max_response_words
             ),
             temperature=self.temperature if temperature is None else temperature,
+            max_tokens=self.max_tokens if max_tokens is None else max_tokens,
             gigachat_oauth_url=self.gigachat_oauth_url,
             gigachat_client_id=self.gigachat_client_id,
             gigachat_client_secret=self.gigachat_client_secret,

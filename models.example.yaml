@@ -1,0 +1,31 @@
+# Copy this file to data/models.yaml and fill in your values.
+#
+# This file holds only the CONNECTION CREDENTIALS for LLM providers
+# (base_url, api_key, model). It says HOW to reach the API, not what the model
+# should do. Behaviour (system prompts, temperature) lives in data/agents.yaml.
+#
+# Secrets are referenced as ${ENV_VAR} and resolved from the environment / .env,
+# so real keys never have to be committed.
+#
+#   provider: openai   -> plain OpenAI-compatible /v1/chat/completions endpoint
+#   provider: gigachat -> Sber GigaChat (OAuth2 client_credentials exchange)
+models:
+  openai-gpt4o:
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-4o-mini
+
+  ollama-local:
+    provider: openai
+    base_url: http://localhost:11434/v1
+    api_key: ""                       # local providers need no auth
+    model: llama3.2
+
+  gigachat-max:
+    provider: gigachat
+    base_url: https://gigachat.devices.sberbank.ru/api/v1
+    model: GigaChat-2-Max
+    client_id: ${GIGACHAT_CLIENT_ID}
+    client_secret: ${GIGACHAT_CLIENT_SECRET}
+    scope: GIGACHAT_API_PERS
