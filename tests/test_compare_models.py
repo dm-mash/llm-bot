@@ -44,6 +44,38 @@ def test_score_no_expected_is_manual():
     assert "вручную" in summary
 
 
+def test_score_strict_exact_match_trims_whitespace():
+    expected = "1,2,Fizz,4,Buzz"
+    ok, summary = cm._score("  1,2,Fizz,4,Buzz\n", expected, strict=True)
+    assert ok is True
+    assert "точно совпадает" in summary
+
+
+def test_score_strict_rejects_different_order_of_same_numbers():
+    # Same number set, different order/wording -> strict must reject.
+    ok, summary = cm._score("16 кур и 6 коров", "6 коров, 16 кур", strict=True)
+    assert ok is False
+    assert "дословно" in summary
+
+
+def test_score_strict_rejects_when_one_token_off():
+    expected = "1,2,Fizz,4,Buzz,6"
+    ok, summary = cm._score("1,2,Fizz,4,Buzz,5", expected, strict=True)
+    assert ok is False
+    assert "дословно" in summary
+
+
+def test_score_strict_is_case_sensitive():
+    ok, _ = cm._score("fizzbuzz", "FizzBuzz", strict=True)
+    assert ok is False
+
+
+def test_score_strict_without_expected_is_manual():
+    ok, summary = cm._score("anything", None, strict=True)
+    assert ok is True
+    assert "вручную" in summary
+
+
 def test_price_lookup_builtin_and_override():
     assert cm._price_for("gpt-4o-mini", {}) == (0.15, 0.60)
     overrides = {"my-model": (1.0, 2.0)}

@@ -68,6 +68,7 @@ class Task:
     title: str
     text: str
     expected_answer: str | None = None  # used for objective scoring when known
+    strict_comparison: bool = False  # if True, compare the reply to expected_answer as-is
 
 
 BUILTIN_TASKS: list[Task] = [
@@ -86,9 +87,11 @@ BUILTIN_TASKS: list[Task] = [
         text=(
             "Выведи результат классической задачи FizzBuzz для чисел от 1 до 30 "
             "включительно: если число делится на 3 — 'Fizz', на 5 — 'Buzz', "
-            "на 15 — 'FizzBuzz', иначе само число."
+            "на 15 — 'FizzBuzz', иначе само число. Вывод строго через запятую, без пробелов."
         ),
-        expected_answer="FizzBuzz",
+        expected_answer="1,2,Fizz,4,Buzz,Fizz,7,8,Fizz,Buzz,11,Fizz,13,14,FizzBuzz,16,17,Fizz,19,Buzz,Fizz,22,23,Fizz,Buzz,26,Fizz,28,29,FizzBuzz",
+        # Полная эталонная последовательность — сверяем ответ дословно (после трима).
+        strict_comparison=True,
     ),
     Task(
         id="story",
@@ -120,7 +123,8 @@ BUILTIN_TASKS: list[Task] = [
             "Плотник работает рядом с красным складом."
             "Вопрос - Кто ест пиццу? Выведи только Профессию, без рассуждений."
         ),
-        expected_answer=None, # "Плотник" не подойдёт, т.к. сравнение не строгое
+        expected_answer="Плотник",
+        strict_comparison=True,
     ),
 ]
 
@@ -225,6 +229,7 @@ def _run_model(
     model: str,
     task_text: str,
     expected: str | None,
+    strict: bool = False,
 ) -> "ModelResult":
     """Run one task through one model; returns the measured result.
 
@@ -242,7 +247,7 @@ def _run_model(
     finally:
         elapsed_ms = (time.monotonic() - started) * 1000.0
 
-    correct, summary = _score(answer, expected)
+    correct, summary = _score(answer, expected, strict=strict)
     return ModelResult(
         model=model,
         response=answer,
@@ -275,10 +280,20 @@ def _extract_numbers(text: str) -> set[str]:
     return nums
 
 
-def _score(actual: str, expected: str | None) -> tuple[bool, str]:
-    """Return (correct, summary) based on the expected answer when provided."""
+def _score(actual: str, expected: str | None, *, strict: bool = False) -> tuple[bool, str]:
+    """Return (correct, summary) based on the expected answer when provided.
+
+    When *strict* is ``True`` the reply is compared to ``expected`` verbatim
+    (only surrounding whitespace is trimmed) — no number extraction or fuzzy
+    word overlap. Use it when the expected answer must match exactly, e.g. a
+    full generated sequence.
+    """
     if not expected:
         return True, "нет эталона — оцени вручную"
+    if strict:
+        if actual.strip() == expected.strip():
+            return True, f"точно совпадает с эталоном ({expected})"
+        return False, f"не совпадает дословно с эталоном ({expected})"
     expected_nums = _extract_numbers(expected)
     if expected_nums:
         actual_nums = _extract_numbers(actual)
@@ -521,6 +536,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expected answer for --task, to enable automatic quality scoring.",
     )
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="When comparing against --expected, require an exact (verbatim, "
+        "whitespace-trimmed) match instead of fuzzy number/word overlap.",
+    )
+    parser.add_argument(
         "--models",
         default=",".join(DEFAULT_MODELS),
         help=f"Comma-separated model ids to compare. Default: {', '.join(DEFAULT_MODELS)}",
@@ -581,7 +602,15 @@ def _parse_prices(overrides: list[str] | None) -> dict[str, tuple[float, float]]
 
 def _resolve_tasks(args: argparse.Namespace) -> list[Task]:
     if args.task:
-        return [Task(id="custom", title="Своя задача", text=args.task, expected_answer=args.expected)]
+        return [
+            Task(
+                id="custom",
+                title="Своя задача",
+                text=args.task,
+                expected_answer=args.expected,
+                strict_comparison=args.strict,
+            )
+        ]
     if args.task_index:
         return [t for t in BUILTIN_TASKS if t.id == args.task_index]
     return BUILTIN_TASKS
@@ -633,7 +662,10 @@ def main(argv: list[str] | None = None) -> int:
         for i, model in enumerate(models):
             print(f"\n▶ {_tier_label(i)}: {model} ...")
             try:
-                result = _run_model(make_client, model, task.text, task.expected_answer)
+                result = _run_model(
+                    make_client, model, task.text, task.expected_answer,
+                    strict=task.strict_comparison,
+                )
             except LLMError as exc:
                 print(f"  ! ошибка: {exc}")
                 continue
