@@ -18,6 +18,31 @@ from llm_bot.client import LLMClient
 from llm_bot.stores import AgentConfig, SessionStore
 
 
+def _sanitize_text(text: str) -> str:
+    """Replace lone surrogates so the text is safely UTF-8 encodable.
+
+    Text read from an interactive terminal or piped stdin can contain lone
+    surrogate code points (U+DC80-U+DCFF). This happens because CPython decodes
+    stdin bytes with the ``surrogateescape`` error handler: a byte that is not
+    valid UTF-8 (e.g. a UTF-8 continuation byte left over after a Backspace split
+    a multi-byte character) is mapped to a surrogate. Those surrogates are valid
+    in memory but cannot be encoded back to UTF-8, which crashes httpx's JSON
+    serialization with ``UnicodeEncodeError``. Here we map each lone surrogate to
+    the Unicode replacement character ``U+FFFD`` so the message can be sent.
+    """
+    return text.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _sanitize_messages(messages: list[dict[str, str]]) -> None:
+    """Mutate *messages* in place, replacing lone surrogates in every content."""
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str) and any(
+            0xD800 <= ord(ch) <= 0xDFFF for ch in content
+        ):
+            msg["content"] = _sanitize_text(content)
+
+
 class Agent:
     """An immutable role bound to a specific model/client.
 
@@ -91,12 +116,15 @@ class Session:
         The message is appended to the history, the whole stack is sent to the
         LLM, and the assistant's reply is stored before being returned.
         """
-        user_message = user_message.strip()
+        user_message = _sanitize_text(user_message.strip())
         if not user_message:
             raise ValueError("Message must not be empty.")
 
         self._history.append({"role": "user", "content": user_message})
         messages = self.agent.build_messages(self._history)
+        # Defensive guard: history may also carry surrogates from earlier loads,
+        # so sanitize the whole stack before handing it to the HTTP client.
+        _sanitize_messages(messages)
         reply = self.agent.client.chat(messages)
         self._history.append({"role": "assistant", "content": reply})
         self._store.save(self.session_id, self._history)

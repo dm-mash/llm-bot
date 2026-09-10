@@ -18,6 +18,7 @@ import json
 import logging
 import sys
 import time
+from typing import Any
 
 from llm_bot.agent import Session
 from llm_bot.client import LLMClient, LLMError
@@ -31,6 +32,19 @@ from llm_bot.factory import make_session
 from llm_bot.gigachat import build_gigachat_client
 from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
+
+
+def _sanitize_text(text: str) -> str:
+    """Replace lone surrogates so text read from stdin is safely UTF-8 encodable.
+
+    CPython decodes stdin with the ``surrogateescape`` error handler: any byte
+    that is not valid UTF-8 (e.g. a continuation byte left over when Backspace
+    splits a multi-byte character while editing) becomes a lone surrogate code
+    point. Surrogates live fine in memory but crash httpx's JSON serialization
+    with ``UnicodeEncodeError``. Mapping them to ``U+FFFD`` keeps the message
+    sendable.
+    """
+    return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -191,6 +205,21 @@ def _run_agent_chat(
 
 _HISTORY_COMMANDS = {"/history", "/история"}
 
+# Words offered by tab-completion in the interactive prompt.
+_COMMAND_WORDS = ["/history", "/история", "exit", "quit"]
+
+
+def _command_completer():
+    """Build (lazily) a prompt_toolkit completer for slash commands.
+
+    Built on first use so that importing this module never requires
+    prompt_toolkit to be importable — it is only needed when actually editing
+    on an interactive terminal.
+    """
+    from prompt_toolkit.completion import WordCompleter
+
+    return WordCompleter(_COMMAND_WORDS, ignore_case=True)
+
 
 def _print_history(session: Session) -> None:
     """Print the session's stored message history, if any."""
@@ -207,16 +236,65 @@ def _print_history(session: Session) -> None:
     print()
 
 
+def _read_input(
+    prompt: str = "> ",
+    history: Any | None = None,
+) -> str:
+    """Read one line of user input.
+
+    Uses prompt_toolkit when stdin is an interactive terminal so that editing
+    works on whole Unicode characters rather than raw bytes. This avoids the
+    classic problem where Backspace splits a multi-byte UTF-8 character and
+    leaves a lone continuation byte (decoded to a surrogate by CPython's
+    ``surrogateescape``), which would otherwise crash JSON serialization.
+
+    When *history* is provided it is used for Up/Down recall within the current
+    session (in-memory only, never written to disk). The completer suggests
+    slash commands (``/history``, ``/история``) and ``exit``/``quit``.
+
+    Falls back to the built-in ``input()`` when stdin is piped/redirected (e.g.
+    in tests or when a prompt is fed via a pipe) or prompt_toolkit is missing.
+    In that fallback, *history* and completion are ignored.
+
+    Raises:
+        EOFError: On end-of-input (Ctrl-D).
+        KeyboardInterrupt: On Ctrl-C.
+    """
+    if sys.stdin.isatty():
+        try:
+            from prompt_toolkit import prompt as pt_prompt
+        except ImportError:  # pragma: no cover - prompt_toolkit is a dependency
+            pass
+        else:
+            kwargs: dict[str, Any] = {"completer": _command_completer()}
+            if history is not None:
+                kwargs["history"] = history
+            try:
+                return pt_prompt(prompt, **kwargs)
+            except EOFError:
+                raise
+            except KeyboardInterrupt:
+                raise
+    return input(prompt)
+
+
 def _interactive_loop(session: Session) -> int:
     """Run an interactive REPL-style chat against a session."""
     print(f"Starting chat with agent '{session.agent.name}' "
           f"(session {session.session_id}). Type 'exit' or Ctrl-D to quit. "
           "Use /history to see past messages.",
           file=sys.stderr)
+    # In-memory input history scoped to this run/session so Up/Down recall only
+    # what was typed here; nothing is persisted to disk.
+    history = None
+    if sys.stdin.isatty():
+        from prompt_toolkit.history import InMemoryHistory
+
+        history = InMemoryHistory()
     try:
         while True:
             try:
-                raw = input("> ").strip()
+                raw = _sanitize_text(_read_input("> ", history=history)).strip()
             except EOFError:
                 break
             if not raw:
@@ -279,7 +357,7 @@ def _resolve_prompt(args: argparse.Namespace, *, interactive_allowed: bool) -> s
         prompt = _read_interactive()
     else:
         data = sys.stdin.read()
-        prompt = data.strip()
+        prompt = _sanitize_text(data).strip()
 
     if not prompt:
         raise ValueError("No prompt provided. Pass it as an argument, pipe it via "
@@ -295,7 +373,7 @@ def _read_interactive() -> str:
     """
     lines: list[str] = []
     for raw in sys.stdin:
-        line = raw.rstrip("\n")
+        line = _sanitize_text(raw).rstrip("\n")
         if line.strip() == "" and lines:
             break
         if line.strip() == "":
