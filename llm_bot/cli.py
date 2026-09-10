@@ -189,23 +189,46 @@ def _run_agent_chat(
     return _interactive_loop(session)
 
 
+_HISTORY_COMMANDS = {"/history", "/история"}
+
+
+def _print_history(session: Session) -> None:
+    """Print the session's stored message history, if any."""
+    history = session.history
+    if not history:
+        print("(history is empty for this session)", file=sys.stderr)
+        return
+    print(f"History of session '{session.session_id}':")
+    for i, msg in enumerate(history, start=1):
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        label = "you" if role == "user" else role
+        print(f"  {i}. [{label}] {content}")
+    print()
+
+
 def _interactive_loop(session: Session) -> int:
     """Run an interactive REPL-style chat against a session."""
     print(f"Starting chat with agent '{session.agent.name}' "
-          f"(session {session.session_id}). Type 'exit' or Ctrl-D to quit.",
+          f"(session {session.session_id}). Type 'exit' or Ctrl-D to quit. "
+          "Use /history to see past messages.",
           file=sys.stderr)
     try:
         while True:
             try:
-                user = input("> ").strip()
+                raw = input("> ").strip()
             except EOFError:
                 break
-            if not user:
+            if not raw:
                 continue
-            if user.lower() in {"exit", "quit"}:
+            user = raw.lower()
+            if user in {"exit", "quit"}:
                 break
+            if user in _HISTORY_COMMANDS:
+                _print_history(session)
+                continue
             try:
-                print(session.chat(user))
+                print(session.chat(raw))
             except LLMError as exc:
                 print(f"error: {exc}", file=sys.stderr)
     except KeyboardInterrupt:

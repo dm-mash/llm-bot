@@ -217,6 +217,9 @@ python -m llm_bot --agent assistant
 python -m llm_bot --agent assistant --session my-conversation   # resume
 ```
 
+Inside the interactive chat, type `/history` (or `/история`) to print all
+previous messages of the current session; `exit`/`quit`/Ctrl-D leave the chat.
+
 A single one-shot turn via an agent:
 
 ```bash
