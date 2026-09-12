@@ -390,6 +390,55 @@ client = LLMClient(LLMConfig.from_env(), detail_listener=Printer())
 print(client.send_prompt("Hello"))
 ```
 
+## Token accounting and context limits
+
+The agent counts tokens on every turn and can refuse to send a request that would
+overflow the model's context window. For each user message it tracks:
+
+* **request** — tokens for the current user message alone;
+* **history** — tokens for the whole prior dialog (system prompt + all past turns);
+* **context** — the full stack actually sent to the model (history + request);
+* **reply** — tokens the model spent on its answer.
+
+When the provider reports token `usage` (OpenAI does; some local servers do not)
+the authoritative numbers replace the local estimates; otherwise a deterministic
+`chars/4` estimate plus a per-message overhead is used, so counting always works
+offline and for any provider.
+
+* `Session.chat_with_details()` returns a `ChatResult` with a `TokenUsage`
+  snapshot; `Session.last_usage` holds the most recent turn's numbers.
+* The interactive CLI and one-shot agent calls print `[tokens ...]` to stderr
+  after each reply.
+* If the assembled context exceeds the model's `context_window`, a
+  `ContextOverflowError` is raised **before** anything is sent — the caller must
+  trim history or start a new session.
+* Some providers impose a **hard per-request token ceiling** from the account
+  tier (e.g. Groq's `on_demand` tier refuses any single request above its TPM
+  cap even with a full rate-limit bucket — retrying can never help). Set
+  `max_request_tokens:` per model (or `LLM_MAX_REQUEST_TOKENS` globally) and the
+  agent blocks such requests up front with a `ContextTooLargeError`. A provider
+  HTTP 413 whose body reports `Requested > Limit` is also mapped to this error.
+
+Two independent budgets apply — the effective ceiling is the smaller of the
+model's `context_window` and the account `max_request_tokens`:
+
+* model window → `context_window` (`ContextOverflowError`);
+* account per-request size cap → `max_request_tokens` (`ContextTooLargeError`).
+
+Set both per model in `data/models.yaml` (`context_window:`,
+`max_request_tokens:`) or globally via `LLM_CONTEXT_WINDOW` /
+`LLM_MAX_REQUEST_TOKENS` (see `.env.example`).
+
+```bash
+# Interactive chat; token stats appear on stderr after each reply
+.venv/bin/python -m llm_bot --agent assistant
+
+# Offline demo: short vs long vs account-limit vs overflowing dialogs, token
+# growth and the failures, using a fake transport (no API key needed)
+.venv/bin/python scripts/token_demo.py
+.venv/bin/python scripts/token_demo.py --context-window 400 --max-request-tokens 200
+```
+
 ## Comparing prompt strategies
 
 [`scripts/compare_methods.py`](scripts/compare_methods.py) runs one task through

@@ -56,9 +56,123 @@ class LLMTruncatedError(LLMRequestError):
     """
 
 
+class ContextOverflowError(LLMError):
+    """Raised before a request is sent when the dialog exceeds the context window.
+
+    The agent counts the assembled history and refuses to talk to the model if it
+    would overflow the configured ``context_window``. This prevents the provider
+    from rejecting (or silently truncating) an oversized request, and is the
+    point at which the caller should trim the history or start a new session.
+
+    Attributes:
+        context_tokens: The estimated token count of the request that was blocked.
+        context_window: The model's configured context window in tokens.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        context_tokens: int,
+        context_window: int,
+    ) -> None:
+        super().__init__(message)
+        self.context_tokens = context_tokens
+        self.context_window = context_window
+
+
+class ContextTooLargeError(LLMRequestError):
+    """Raised when the provider refuses a request that exceeds a size ceiling.
+
+    Distinct from :class:`ContextOverflowError` in one important way:
+    ``ContextOverflowError`` is raised *before* a request is sent, from our own
+    token estimate. ``ContextTooLargeError`` is raised when the provider itself
+    rejects the request (e.g. an HTTP 413 "request too large") because it exceeds
+    a hard per-request token ceiling — such as a TPM *size* cap on Groq's
+    ``on_demand`` tier, which refuses any single request larger than the limit
+    regardless of how full the rate-limit bucket is.
+
+    This is a **permanent** condition for the given request: retrying with the
+    same payload can never succeed. The only remedies are to shrink the request
+    (trim history, shorten the prompt) or raise the account tier.
+
+    Attributes:
+        status_code: The HTTP status returned by the provider (e.g. 413).
+        requested_tokens: The size of the rejected request in tokens, if known.
+        limit_tokens: The provider's per-request ceiling in tokens, if known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        requested_tokens: int | None = None,
+        limit_tokens: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.requested_tokens = requested_tokens
+        self.limit_tokens = limit_tokens
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """Return True if *exc* represents a transient, retryable failure."""
     return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+def _classify_request_too_large(
+    status_code: int,
+    text: str,
+) -> ContextTooLargeError | None:
+    """Classify a client error as a hard per-request size ceiling, or None.
+
+    Some providers (e.g. Groq on the ``on_demand`` tier) reject any single
+    request larger than their token-per-minute cap even with a full rate-limit
+    bucket. The response is an HTTP 413 whose body reports the requested size
+    against the limit, e.g.::
+
+        Request too large ... Limit 8000, Requested 8104 ...
+
+    Such a request can **never** succeed on retry, because the payload itself is
+    above the ceiling — shrinking it is the only remedy. This helper recognises
+    that shape and returns a :class:`ContextTooLargeError`; otherwise it returns
+    ``None`` so the caller falls back to the generic error path.
+    """
+    if status_code != 413:
+        return None
+
+    requested = _extract_size(text, "Requested")
+    limit = _extract_size(text, "Limit")
+    if requested is None or limit is None or requested <= limit:
+        # Either the sizes aren't reported, or the request fits the ceiling and
+        # the 413 was caused by something else (e.g. a genuinely oversized body).
+        return None
+
+    message = (
+        f"Запрос превышает жёсткий лимит размера: {requested} токенов при "
+        f"лимите {limit}. Сократите сообщение или начните новый сеанс — "
+        f"повторная отправка того же запроса не поможет."
+    )
+    return ContextTooLargeError(
+        message,
+        status_code=status_code,
+        requested_tokens=requested,
+        limit_tokens=limit,
+    )
+
+
+def _extract_size(text: str, label: str) -> int | None:
+    """Return the integer following *label* in *text* (e.g. ``Requested 8104``)."""
+    marker = f"{label} "
+    idx = text.find(marker)
+    if idx == -1:
+        return None
+    token = text[idx + len(marker):].split(",")[0].strip()
+    try:
+        return int(token)
+    except ValueError:
+        return None
 
 
 @runtime_checkable
@@ -111,6 +225,9 @@ class LLMClient:
         self._timeout = httpx.Timeout(self.config.timeout)
         self._token_provider = token_provider
         self._detail_listener = detail_listener
+        # Token usage reported by the provider for the most recent successful call,
+        # or None if the provider does not report usage. Updated by chat/send_prompt.
+        self.last_usage: dict[str, int] | None = None
 
     def _resolve_token(self) -> str:
         """Return the bearer token to use, or ``""`` if none is configured."""
@@ -228,6 +345,11 @@ class LLMClient:
         if response.status_code >= 400:
             # Permanent client error (e.g. bad key, invalid model) — do not retry.
             self._emit_response(response.status_code, attempt, elapsed_ms, {})
+            too_large = _classify_request_too_large(
+                response.status_code, response.text
+            )
+            if too_large is not None:
+                raise too_large
             raise LLMRequestError(
                 f"LLM API returned HTTP {response.status_code}: {response.text}"
             )
@@ -284,6 +406,7 @@ class LLMClient:
             LLMRetryExhaustedError: When transient failures persist past max_retries.
         """
         data = self._execute_with_retry(self._build_messages(prompt))
+        self.last_usage = extract_usage(data)
         return self._extract_text(data)
 
     def chat(self, messages: list[dict[str, str]]) -> str:
@@ -306,6 +429,7 @@ class LLMClient:
             LLMRetryExhaustedError: When transient failures persist past max_retries.
         """
         data = self._execute_with_retry(messages)
+        self.last_usage = extract_usage(data)
         return self._extract_text(data)
 
     @staticmethod

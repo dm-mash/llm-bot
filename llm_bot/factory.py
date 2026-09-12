@@ -30,6 +30,8 @@ def llm_config_for(
         base_url=model.base_url,
         api_key=model.api_key,
         model=model.model,
+        context_window=model.context_window,
+        max_request_tokens=model.max_request_tokens,
         temperature=agent.temperature if agent else None,
         max_tokens=agent.max_tokens if agent else None,
         system_prompt=agent.system_prompt if agent else "",

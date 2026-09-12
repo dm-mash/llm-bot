@@ -14,8 +14,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from llm_bot.client import LLMClient
+from llm_bot.client import ContextOverflowError, ContextTooLargeError, LLMClient
 from llm_bot.stores import AgentConfig, SessionStore
+from llm_bot.tokens import (
+    DEFAULT_CONTEXT_WINDOW,
+    ChatResult,
+    TokenUsage,
+    count_message_tokens,
+    count_messages_tokens,
+    merge_provider_usage,
+)
 
 
 def _sanitize_text(text: str) -> str:
@@ -76,6 +84,20 @@ class Agent:
         messages.extend(history)
         return messages
 
+    @property
+    def context_window(self) -> int | None:
+        """The model's input context window in tokens, or ``None`` if unknown."""
+        return self.client.config.context_window
+
+    @property
+    def max_request_tokens(self) -> int | None:
+        """Hard per-request token ceiling, or ``None`` if no such extra limit.
+
+        This reflects the account-tier size cap (e.g. Groq's TPM ceiling), which
+        is typically smaller than :attr:`context_window`.
+        """
+        return self.client.config.max_request_tokens
+
 
 class Session:
     """A single conversation with an :class:`Agent`, owning its own history.
@@ -104,6 +126,8 @@ class Session:
         self._history = (
             list(history) if history is not None else store.load(session_id)
         )
+        # Token usage of the most recent turn (see ``chat`` / ``chat_with_details``).
+        self.last_usage: TokenUsage | None = None
 
     @property
     def history(self) -> list[dict[str, str]]:
@@ -113,19 +137,96 @@ class Session:
     def chat(self, user_message: str) -> str:
         """Send a user message and return only the assistant's reply text.
 
+        Equivalent to :meth:`chat_with_details`, but returns just the reply
+        string for callers that do not care about token accounting. Token stats
+        remain available on :attr:`last_usage`.
+        """
+        return self.chat_with_details(user_message).reply
+
+    def chat_with_details(self, user_message: str) -> ChatResult:
+        """Send a user message and return a :class:`ChatResult` with token usage.
+
         The message is appended to the history, the whole stack is sent to the
-        LLM, and the assistant's reply is stored before being returned.
+        LLM, and the assistant's reply is stored. Before the request goes out we
+        count the tokens for:
+
+            * the current request (``request_tokens``);
+            * the entire dialog history (``history_tokens``);
+            * the context actually sent to the model (``context_tokens``,
+              history + current request);
+            * the model's reply (``reply_tokens``).
+
+        If the assembled context would exceed the model's ``context_window``, a
+        :class:`~llm_bot.client.ContextOverflowError` is raised and nothing is
+        sent — this is where the caller should trim history or start a new
+        session.
         """
         user_message = _sanitize_text(user_message.strip())
         if not user_message:
             raise ValueError("Message must not be empty.")
 
-        self._history.append({"role": "user", "content": user_message})
-        messages = self.agent.build_messages(self._history)
+        user_msg = {"role": "user", "content": user_message}
+        request_tokens = count_message_tokens(user_msg)
+
+        # Build the exact stack that would go to the model (system + all history).
+        messages = self.agent.build_messages([*self._history, user_msg])
         # Defensive guard: history may also carry surrogates from earlier loads,
         # so sanitize the whole stack before handing it to the HTTP client.
         _sanitize_messages(messages)
+
+        context_tokens = count_messages_tokens(messages)
+        context_window = (
+            self.agent.context_window
+            if self.agent.context_window is not None
+            else DEFAULT_CONTEXT_WINDOW
+        )
+        max_request_tokens = self.agent.max_request_tokens
+
+        # Pre-flight budget checks: refuse to send a request the provider would
+        # reject. Two independent ceilings apply:
+        #   * the model's context window;
+        #   * the account-tier per-request size cap, which is often smaller
+        #     (e.g. Groq's TPM ceiling) and cannot be retried away.
+        if (
+            max_request_tokens is not None
+            and context_tokens > max_request_tokens
+        ):
+            raise ContextTooLargeError(
+                f"Запрос превышает лимит размера аккаунта: {context_tokens} "
+                f"токенов > {max_request_tokens}. Сократите сообщение или "
+                f"начните новый сеанс.",
+                status_code=413,
+                requested_tokens=context_tokens,
+                limit_tokens=max_request_tokens,
+            )
+        if context_tokens > context_window:
+            raise ContextOverflowError(
+                f"Диалог превышает контекст модели: {context_tokens} токенов > "
+                f"лимит {context_window}. Завершите тему или начните новый сеанс.",
+                context_tokens=context_tokens,
+                context_window=context_window,
+            )
+
+        self._history.append(user_msg)
         reply = self.agent.client.chat(messages)
+
+        provider_usage = self.agent.client.last_usage
+        reply_tokens = count_message_tokens({"role": "assistant", "content": reply})
+
+        usage = merge_provider_usage(
+            TokenUsage(
+                request_tokens=request_tokens,
+                history_tokens=context_tokens - request_tokens,
+                context_tokens=context_tokens,
+                reply_tokens=reply_tokens,
+                total_tokens=context_tokens + reply_tokens,
+                context_window=context_window,
+                estimated=provider_usage is None,
+            ),
+            provider_usage,
+        )
+        self.last_usage = usage
+
         self._history.append({"role": "assistant", "content": reply})
         self._store.save(self.session_id, self._history)
-        return reply
+        return ChatResult(reply=reply, usage=usage)

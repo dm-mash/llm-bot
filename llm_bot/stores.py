@@ -49,6 +49,14 @@ class ModelConfig:
     base_url: str = ""
     api_key: str = ""
     model: str = ""
+    # Maximum input context size (tokens) this model supports. Used by the agent
+    # to detect when a dialog overflows the budget before sending a request.
+    context_window: int | None = None
+    # Hard per-request token ceiling enforced by the account tier (often smaller
+    # than the model's context window, e.g. Groq's TPM size cap). Requests above
+    # this are refused even with a full rate-limit bucket, so the agent treats it
+    # as an extra budget.
+    max_request_tokens: int | None = None
     # GigaChat OAuth2 credentials (only used when provider == "gigachat").
     client_id: str = ""
     client_secret: str = ""
@@ -64,6 +72,8 @@ class ModelConfig:
             base_url=_resolve_env(str(data.get("base_url", ""))),
             api_key=_resolve_env(str(data.get("api_key", ""))),
             model=str(data.get("model", "")),
+            context_window=_opt_int(data.get("context_window")),
+            max_request_tokens=_opt_int(data.get("max_request_tokens")),
             client_id=_resolve_env(str(data.get("client_id", ""))),
             client_secret=_resolve_env(str(data.get("client_secret", ""))),
             scope=str(data.get("scope", "GIGACHAT_API_PERS")),

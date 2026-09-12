@@ -28,6 +28,8 @@ _ENV_DEFAULT_SYSTEM_PROMPT = "LLM_DEFAULT_SYSTEM_PROMPT"
 _ENV_MAX_RESPONSE_WORDS = "LLM_MAX_RESPONSE_WORDS"
 _ENV_TEMPERATURE = "LLM_TEMPERATURE"
 _ENV_MAX_TOKENS = "LLM_MAX_TOKENS"
+_ENV_CONTEXT_WINDOW = "LLM_CONTEXT_WINDOW"
+_ENV_MAX_REQUEST_TOKENS = "LLM_MAX_REQUEST_TOKENS"
 
 # GigaChat (Sber) OAuth2 client_credentials settings.
 _ENV_GIGACHAT_OAUTH_URL = "GIGACHAT_OAUTH_URL"
@@ -110,6 +112,17 @@ class LLMConfig:
             reply. ``None`` means the provider's default (the parameter is omitted
             from the request). Unlike ``max_response_words`` (a soft, prompt-based
             hint), this is a hard token cap enforced by the API.
+        context_window: The model's maximum input context size in tokens. Used by
+            the agent to detect when the dialog history overflows the budget
+            before sending a request. ``None`` means unknown (falls back to a
+            default in :mod:`llm_bot.tokens`). Read from ``LLM_CONTEXT_WINDOW``.
+        max_request_tokens: Hard per-request token ceiling enforced by the account
+            tier (not the model's context window). On some providers (e.g. Groq's
+            ``on_demand`` tier) any single request larger than this is refused
+            even with a full rate-limit bucket, so retrying cannot help. The agent
+            treats it as an additional budget that is usually smaller than
+            ``context_window``. ``None`` means no such extra limit. Read from
+            ``LLM_MAX_REQUEST_TOKENS``.
     """
 
     base_url: str = field(default_factory=lambda: os.getenv(_ENV_BASE_URL, "https://api.openai.com/v1"))
@@ -130,6 +143,12 @@ class LLMConfig:
     )
     max_tokens: int | None = field(
         default_factory=lambda: _get_optional_int(_ENV_MAX_TOKENS)
+    )
+    context_window: int | None = field(
+        default_factory=lambda: _get_optional_int(_ENV_CONTEXT_WINDOW)
+    )
+    max_request_tokens: int | None = field(
+        default_factory=lambda: _get_optional_int(_ENV_MAX_REQUEST_TOKENS)
     )
 
     # --- GigaChat (Sber) OAuth2 client_credentials settings ---
@@ -165,6 +184,8 @@ class LLMConfig:
         max_response_words: int | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        context_window: int | None = None,
+        max_request_tokens: int | None = None,
     ) -> "LLMConfig":
         """Return a copy of this config with any provided fields overridden.
 
@@ -191,6 +212,16 @@ class LLMConfig:
             ),
             temperature=self.temperature if temperature is None else temperature,
             max_tokens=self.max_tokens if max_tokens is None else max_tokens,
+            context_window=(
+                self.context_window
+                if context_window is None
+                else context_window
+            ),
+            max_request_tokens=(
+                self.max_request_tokens
+                if max_request_tokens is None
+                else max_request_tokens
+            ),
             gigachat_oauth_url=self.gigachat_oauth_url,
             gigachat_client_id=self.gigachat_client_id,
             gigachat_client_secret=self.gigachat_client_secret,

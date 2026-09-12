@@ -170,6 +170,32 @@ def _new_session_id(agent_name: str) -> str:
     return f"{agent_name}-{stamp}"
 
 
+def _print_usage(session: Session) -> None:
+    """Print token accounting for the session's most recent turn to stderr.
+
+    Uses ``getattr`` so lightweight fakes/tests that only implement ``chat`` do
+    not need to also expose ``last_usage``.
+    """
+    usage = getattr(session, "last_usage", None)
+    if usage is None:
+        return
+    parts = [
+        f"request={usage.request_tokens}",
+        f"history={usage.history_tokens}",
+        f"context={usage.context_tokens}",
+        f"reply={usage.reply_tokens}",
+        f"total={usage.total_tokens}",
+    ]
+    if usage.context_window:
+        parts.append(f"limit={usage.context_window}")
+        if usage.fill_percent is not None:
+            parts.append(f"fill={usage.fill_percent:.0f}%")
+    source = "estimated" if usage.estimated else "provider"
+    if usage.overflow:
+        parts.append("OVERFLOW")
+    print(f"[tokens ({source})] " + " ".join(parts), file=sys.stderr)
+
+
 def _run_agent_chat(
     agent_name: str,
     *,
@@ -194,10 +220,12 @@ def _run_agent_chat(
 
     if prompt is not None:
         try:
-            print(session.chat(prompt))
+            result = session.chat_with_details(prompt)
         except LLMError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        print(result.reply)
+        _print_usage(session)
         return 0
 
     return _interactive_loop(session)
@@ -309,6 +337,8 @@ def _interactive_loop(session: Session) -> int:
                 print(session.chat(raw))
             except LLMError as exc:
                 print(f"error: {exc}", file=sys.stderr)
+                continue
+            _print_usage(session)
     except KeyboardInterrupt:
         pass
     return 0
