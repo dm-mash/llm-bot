@@ -81,6 +81,54 @@ def test_yaml_agent_store(tmp_path):
     assert agent.max_tokens == 1024
 
 
+def test_yaml_agent_store_parses_compression_fields(tmp_path):
+    content = """\
+agents:
+  compressed:
+    model: openai
+    system_prompt: "Ты помощник."
+    keep_last_messages: 10
+    summarize_messages_threshold: 20
+  plain:
+    model: openai
+    system_prompt: "Ты помощник."
+"""
+    path = _write(tmp_path, "agents.yaml", content)
+    store = YamlAgentStore(path)
+
+    compressed = store.get("compressed")
+    assert compressed.keep_last_messages == 10
+    assert compressed.summarize_messages_threshold == 20
+    settings = compressed.compression_settings
+    assert settings is not None
+    assert settings.keep_last == 10
+    assert settings.block_size == 20
+
+    plain = store.get("plain")
+    assert plain.compression_settings is None
+
+
+def test_json_session_store_summary_roundtrip_and_legacy(tmp_path):
+    store = JsonSessionStore(str(tmp_path / "sessions"))
+
+    # Legacy flat list -> load gives empty summary.
+    store.save("legacy", [{"role": "user", "content": "hi"}])
+    assert store.load_summary("legacy") == ""
+
+    # Compound save/load preserves both history and summary.
+    store.save_full(
+        "cmp",
+        [{"role": "user", "content": "newest"}],
+        summary="резюме",
+    )
+    assert store.load("cmp") == [{"role": "user", "content": "newest"}]
+    assert store.load_summary("cmp") == "резюме"
+
+    # save() preserves an existing summary.
+    store.save("cmp", [{"role": "assistant", "content": "reply"}])
+    assert store.load_summary("cmp") == "резюме"
+
+
 def test_yaml_store_unknown_key_raises(tmp_path):
     path = _write(tmp_path, "agents.yaml", AGENTS_YAML)
     store = YamlAgentStore(path)

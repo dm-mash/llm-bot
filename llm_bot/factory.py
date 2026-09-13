@@ -11,10 +11,13 @@ instances; the wiring here does not change.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import httpx
 
 from llm_bot.agent import Agent, Session
 from llm_bot.client import LLMClient
+from llm_bot.compress import CompressionEvent, CompressionSettings
 from llm_bot.config import LLMConfig
 from llm_bot.diagnostics import DetailListener
 from llm_bot.gigachat import GigaChatTokenProvider
@@ -96,8 +99,20 @@ def make_session(
     transport: httpx.BaseTransport | None = None,
     detail_listener: DetailListener | None = None,
     history: list[dict[str, str]] | None = None,
+    compression: CompressionSettings | None = None,
+    on_compress: Callable[[CompressionEvent], None] | None = None,
 ) -> Session:
-    """Build a :class:`Session` for the given agent, ready to chat."""
+    """Build a :class:`Session` for the given agent, ready to chat.
+
+    Context compression is enabled automatically when the agent config declares
+    ``keep_last_messages`` / ``summarize_messages_threshold`` (see
+    :attr:`~llm_bot.stores.AgentConfig.compression_settings`). Pass *compression*
+    explicitly to override or force-enable it for agents that do not configure it.
+
+    When compression triggers, *on_compress* (if given) is called with a
+    :class:`~llm_bot.compress.CompressionEvent` so callers (e.g. a CLI) can print
+    a service message about the fold and its token impact.
+    """
     agent = make_agent(
         agent_name,
         model_store=model_store,
@@ -105,9 +120,14 @@ def make_session(
         transport=transport,
         detail_listener=detail_listener,
     )
+    effective = (
+        compression if compression is not None else agent.config.compression_settings
+    )
     return Session(
         session_id,
         agent,
         store=session_store,
         history=history,
+        compression=effective,
+        on_compress=on_compress,
     )

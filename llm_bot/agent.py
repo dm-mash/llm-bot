@@ -12,9 +12,15 @@ reply text.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from llm_bot.client import ContextOverflowError, ContextTooLargeError, LLMClient
+from llm_bot.compress import (
+    CompressionEvent,
+    CompressionSettings,
+    ContextCompressor,
+    summarize_prompt,
+)
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.tokens import (
     DEFAULT_CONTEXT_WINDOW,
@@ -51,6 +57,31 @@ def _sanitize_messages(messages: list[dict[str, str]]) -> None:
             msg["content"] = _sanitize_text(content)
 
 
+def summary_budget_chars(
+    settings: CompressionSettings,
+    context_window: int | None,
+) -> int | None:
+    """Return the maximum summary length in chars, or ``None`` for no cap.
+
+    The budget is the smaller of the explicit ``max_summary_tokens`` cap and the
+    model's context window times ``max_summary_ratio`` (a fraction of the window
+    kept for the summary so it never crowds out the system prompt and live
+    history). When neither is known, returns ``None`` (no cap).
+    """
+    budget_tokens = settings.max_summary_tokens
+    if context_window is not None:
+        by_window = int(context_window * settings.max_summary_ratio)
+        budget_tokens = (
+            by_window
+            if budget_tokens is None
+            else min(budget_tokens, by_window)
+        )
+    if budget_tokens is None or budget_tokens <= 0:
+        return None
+    # The local token estimator approximates ~4 chars per token.
+    return budget_tokens * 4
+
+
 class Agent:
     """An immutable role bound to a specific model/client.
 
@@ -72,12 +103,22 @@ class Agent:
     def name(self) -> str:
         return self.config.name
 
-    def build_messages(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
+    def build_messages(
+        self,
+        history: list[dict[str, str]],
+        *,
+        summary: str = "",
+    ) -> list[dict[str, str]]:
         """Return the full ``messages`` stack for a request.
 
         Prepends the assembled system prompt (if any) to the given *history*.
+        When a non-empty *summary* is provided it is injected as the very first
+        system message, so the model sees the compressed old dialog as durable
+        context before the agent's role prompt.
         """
         messages: list[dict[str, str]] = []
+        if summary:
+            messages.append({"role": "system", "content": summary})
         system_prompt = self.config.effective_system_prompt()
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -97,6 +138,16 @@ class Agent:
         is typically smaller than :attr:`context_window`.
         """
         return self.client.config.max_request_tokens
+
+    @property
+    def compression_settings(self) -> CompressionSettings | None:
+        """Compression settings for sessions of this agent, or ``None``.
+
+        Delegates to :attr:`~llm_bot.stores.AgentConfig.compression_settings`;
+        a session created from this agent will auto-enable compression when this
+        is not ``None``.
+        """
+        return self.config.compression_settings
 
 
 class Session:
@@ -119,6 +170,8 @@ class Session:
         *,
         store: SessionStore,
         history: list[dict[str, str]] | None = None,
+        compression: CompressionSettings | None = None,
+        on_compress: Callable[[CompressionEvent], None] | None = None,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -128,11 +181,71 @@ class Session:
         )
         # Token usage of the most recent turn (see ``chat`` / ``chat_with_details``).
         self.last_usage: TokenUsage | None = None
+        # Context compression. When enabled, the older part of the history is
+        # folded into a running summary that is injected at the front of each
+        # request instead of resending the full old dialog.
+        self._compression = compression
+        self._summary: str = ""
+        self._on_compress = on_compress
+        self._compression_events: list[CompressionEvent] = []
+        if compression is not None:
+            self._summary = store.load_summary(session_id)
+            self._compressor = ContextCompressor(
+                compression,
+                summarize=self._summarize_block,
+                max_chars=summary_budget_chars(
+                    compression, agent.context_window
+                ),
+            )
+        else:
+            self._compressor = None
 
     @property
     def history(self) -> list[dict[str, str]]:
         """Read-only view of the conversation history."""
         return list(self._history)
+
+    @property
+    def summary(self) -> str:
+        """The running context-compression summary (``""`` when none/disabled)."""
+        return self._summary
+
+    @property
+    def compression_enabled(self) -> bool:
+        """True when context compression is active for this session."""
+        return self._compression is not None
+
+    @property
+    def compression_events(self) -> list[CompressionEvent]:
+        """Every compression round recorded so far in this session."""
+        return list(self._compression_events)
+
+    @property
+    def last_compression_event(self) -> CompressionEvent | None:
+        """The most recent compression round, or ``None`` if none happened."""
+        return self._compression_events[-1] if self._compression_events else None
+
+    @property
+    def total_compressions(self) -> int:
+        """How many times the history has been folded into the summary."""
+        return len(self._compression_events)
+
+    @property
+    def total_messages_folded(self) -> int:
+        """Total messages moved into the summary across all compressions."""
+        return sum(e.messages_folded for e in self._compression_events)
+
+    def _summarize_block(self, existing: str, block: str, max_chars: int | None) -> str:
+        """Summarise *existing* + *block* via the session's own LLM client.
+
+        Used as the compressor's ``summarize`` callback so summary generation
+        needs no extra credentials or transport — it reuses the same client the
+        session already talks through. *max_chars* is passed into the prompt as a
+        soft size limit; the hard cap is applied by the compressor afterwards.
+        """
+        prompt = summarize_prompt(existing, block, max_chars)
+        reply = self.agent.client.chat([{"role": "user", "content": prompt}])
+        return _sanitize_text(reply.strip())
 
     def chat(self, user_message: str) -> str:
         """Send a user message and return only the assistant's reply text.
@@ -168,8 +281,25 @@ class Session:
         user_msg = {"role": "user", "content": user_message}
         request_tokens = count_message_tokens(user_msg)
 
-        # Build the exact stack that would go to the model (system + all history).
-        messages = self.agent.build_messages([*self._history, user_msg])
+        # Project the history that will actually be sent: the current live history
+        # plus the new user turn. When compression is enabled and the projected
+        # history exceeds the block size, the oldest messages are folded into the
+        # running summary *in memory* here; the result is only committed to the
+        # session below, after the budget checks pass (so an overflow leaves the
+        # session and the persisted store untouched).
+        projected_history = [*self._history, user_msg]
+        projected_summary = self._summary
+        folded_messages: list[dict[str, str]] = []
+        if self._compressor is not None:
+            projected_history, projected_summary, folded_messages = (
+                self._compressor.compress(projected_history, projected_summary)
+            )
+
+        # Build the exact stack that would go to the model (summary + system +
+        # (possibly compressed) history).
+        messages = self.agent.build_messages(
+            projected_history, summary=projected_summary
+        )
         # Defensive guard: history may also carry surrogates from earlier loads,
         # so sanitize the whole stack before handing it to the HTTP client.
         _sanitize_messages(messages)
@@ -207,7 +337,23 @@ class Session:
                 context_window=context_window,
             )
 
-        self._history.append(user_msg)
+        # Commit the projected history and summary now that the budget checks
+        # passed and the request is about to be sent.
+        self._history = projected_history
+        self._summary = projected_summary
+
+        if folded_messages:
+            event = CompressionEvent(
+                messages_folded=len(folded_messages),
+                folded_tokens=count_messages_tokens(folded_messages),
+                summary_chars=len(projected_summary),
+                history_before=len(folded_messages) + len(projected_history),
+                history_after=len(projected_history),
+            )
+            self._compression_events.append(event)
+            if self._on_compress is not None:
+                self._on_compress(event)
+
         reply = self.agent.client.chat(messages)
 
         provider_usage = self.agent.client.last_usage
@@ -228,5 +374,11 @@ class Session:
         self.last_usage = usage
 
         self._history.append({"role": "assistant", "content": reply})
-        self._store.save(self.session_id, self._history)
+        if self._compressor is not None:
+            # Persist both the compressed history and the running summary.
+            self._store.save_full(
+                self.session_id, self._history, summary=self._summary
+            )
+        else:
+            self._store.save(self.session_id, self._history)
         return ChatResult(reply=reply, usage=usage)

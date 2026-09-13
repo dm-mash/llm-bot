@@ -13,6 +13,26 @@ agents:
     system_prompt: "Ты полезный помощник."
     temperature: 0.7
     max_tokens: 1024
+    # --- Context compression (rolling summary) -------------------------------
+    # Optional. Enables automatic history compression for sessions of this agent.
+    #   keep_last_messages:        N — how many RECENT messages stay verbatim.
+    #   summarize_messages_threshold: M — when the live history exceeds this many
+    #                              messages, the oldest part is folded into a
+    #                              running summary injected instead of the full
+    #                              old dialog (updates every ~M-N turns).
+    #   max_summary_tokens:        hard cap on the running summary size in tokens.
+    #                              The summary is truncated to fit (never exceeds
+    #                              the budget). Prevents a growing summary from
+    #                              crowding out the context window.
+    #   max_summary_ratio:         fallback/ceiling: summary <= this fraction of the
+    #                              model's context window (default 0.3). Ignored
+    #                              when max_summary_tokens is set and smaller.
+    # Omit keep_last_messages / summarize_messages_threshold to keep sessions
+    # uncompressed (the default).
+    keep_last_messages: 10
+    summarize_messages_threshold: 20
+    max_summary_tokens: 500          # optional: cap summary size
+    # max_summary_ratio: 0.25        # optional: cap as a share of the context window
 
   translator:
     model: openai-gpt4o

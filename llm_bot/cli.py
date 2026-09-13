@@ -196,6 +196,29 @@ def _print_usage(session: Session) -> None:
     print(f"[tokens ({source})] " + " ".join(parts), file=sys.stderr)
 
 
+def _print_compression(session: Session) -> None:
+    """Print a service message to stderr when the history was just compressed.
+
+    Reports how many messages were folded into the summary, the estimated token
+    space they freed in the context, and the history length before -> after.
+    Uses ``getattr`` so lightweight fakes/tests that only implement ``chat`` do
+    not need to expose compression internals.
+    """
+    event = getattr(session, "last_compression_event", None)
+    if event is None or event.messages_folded <= 0:
+        return
+    parts = [
+        f"свёрнуто {event.messages_folded} сообщений",
+        f"-{event.folded_tokens} токенов контекста",
+        f"история {event.history_before}->{event.history_after}",
+        f"summary {event.summary_chars} симв.",
+    ]
+    total = getattr(session, "total_compressions", None)
+    if total:
+        parts.append(f"(всего сжатий: {total})")
+    print("[compression] " + ", ".join(parts), file=sys.stderr)
+
+
 def _run_agent_chat(
     agent_name: str,
     *,
@@ -226,6 +249,7 @@ def _run_agent_chat(
             return 1
         print(result.reply)
         _print_usage(session)
+        _print_compression(session)
         return 0
 
     return _interactive_loop(session)
@@ -339,6 +363,7 @@ def _interactive_loop(session: Session) -> int:
                 print(f"error: {exc}", file=sys.stderr)
                 continue
             _print_usage(session)
+            _print_compression(session)
     except KeyboardInterrupt:
         pass
     return 0

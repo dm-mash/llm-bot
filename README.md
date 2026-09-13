@@ -35,6 +35,11 @@ trivial to add a **web interface** later without touching the logic.
 - `--details` flag to print request/response diagnostics (URL, model, formed
   request body, token usage, per-attempt timing) to stderr.
 - Built-in GigaChat support with automatic OAuth2 token acquisition and refresh.
+- **Context compression** — rolling-summary keeps long dialogs inside the token
+  budget: recent turns stay verbatim, older ones fold into a running summary that
+  is injected at the front of each request (see "Context compression" below).
+- **Comparison scripts** — reproducible experiments (`scripts/compare_compression.py`)
+  comparing answer quality and token spend with vs without compression.
 - Pytest suite using `httpx.MockTransport` (no network needed).
 
 ## Project structure
@@ -46,6 +51,7 @@ llm-bot/
 │   ├── config.py              # LLMConfig — settings from env vars
 │   ├── diagnostics.py         # RequestDetails/ResponseDetails + listener protocol
 │   ├── client.py              # LLMClient — transport + retries + errors + detail events
+│   ├── compress.py            # ContextCompressor + CompressionSettings (rolling summary)
 │   ├── stores.py              # Repository interfaces (ModelStore/AgentStore/SessionStore)
 │   ├── yaml_stores.py         # YamlModelStore / YamlAgentStore (data/*.yaml)
 │   ├── json_session_store.py  # JsonSessionStore (data/sessions/*.json)
@@ -54,11 +60,17 @@ llm-bot/
 │   ├── gigachat.py            # GigaChat OAuth2 token provider + factory
 │   ├── cli.py                 # console entry point (interactive chat / single prompt)
 │   └── __main__.py            # enables `python -m llm_bot`
+├── scripts/
+│   ├── compare_compression.py # token/quality experiment: with vs without compression
+│   └── ...                    # other comparison/demo scripts
 ├── tests/
 │   ├── test_client.py         # LLMClient tests (mocked transport)
 │   ├── test_agent.py          # Agent + Session tests
+│   ├── test_compress.py       # context-compression tests
+│   ├── test_compare_compression.py
 │   ├── test_stores.py         # YAML/JSON store tests
 │   └── test_gigachat.py       # GigaChat token provider tests
+├── results/                   # experiment reports (markdown)
 ├── models.example.yaml        # template -> copy to data/models.yaml
 ├── agents.example.yaml        # template -> copy to data/agents.yaml
 ├── requirements.txt
@@ -438,6 +450,95 @@ Set both per model in `data/models.yaml` (`context_window:`,
 .venv/bin/python scripts/token_demo.py
 .venv/bin/python scripts/token_demo.py --context-window 400 --max-request-tokens 200
 ```
+
+### Context compression (rolling summary)
+
+For long conversations, resending the *whole* history every turn costs tokens and
+eventually overflows the context window. Enable **compression** on a session to
+fold older turns into a short running summary that is injected at the front of each
+request instead of the full old dialog:
+
+* **keep-last (N)** — the most recent N messages stay verbatim, so fresh context
+  is exact;
+* **block size (M)** — when the live history exceeds M messages, the oldest part
+  that falls outside the recent window is folded into the summary. The summary is
+  updated **incrementally** (existing summary + new block only), so compressing is
+  cheap.
+
+The summary is stored separately in the session file and survives restarts.
+Compression is **off by default** and can be enabled **per agent** in
+`data/agents.yaml`:
+
+```yaml
+agents:
+  assistant:
+    model: openai-gpt4o
+    system_prompt: "Ты помощник."
+    keep_last_messages: 10            # N — recent messages kept verbatim
+    summarize_messages_threshold: 20  # M — fold the oldest part once history exceeds this
+    max_summary_tokens: 500           # optional: hard cap on summary size (tokens)
+    # max_summary_ratio: 0.25         # optional: cap summary as a share of the context window
+```
+
+When both fields are set, every session created for that agent compresses its
+history automatically. Agents without them stay uncompressed. You can still
+override/force it programmatically via `make_session(..., compression=...)`:
+
+```python
+from llm_bot import CompressionSettings
+from llm_bot.factory import make_session
+
+session = make_session(
+    "s1", "assistant",
+    model_store=model_store, agent_store=agent_store, session_store=session_store,
+    transport=transport,
+    compression=CompressionSettings(keep_last=10, block_size=20),
+)
+```
+
+Session attributes: `session.summary` (the running summary),
+`session.compression_enabled`, and compression statistics:
+`session.compression_events` (list of `CompressionEvent`), `session.total_compressions`,
+`session.total_messages_folded`, `session.last_compression_event`.
+
+**Limiting the summary size.** A running summary can grow large over a long
+conversation. To keep it from crowding out the context window, cap its size with
+`max_summary_tokens` (hard cap, applied in code) and/or `max_summary_ratio`
+(soft cap as a fraction of the model's context window; default `0.3`). The
+effective budget is the smaller of the two, and the summary is **truncated in
+code** to guarantee it fits. The budget is also passed to the summarizer as a
+soft instruction ("keep it brief") so the model usually stays under the cap
+without truncation.
+
+**Service message.** The CLI prints a line to **stderr** whenever history is folded,
+with the token impact and history-size change:
+
+```
+[compression] свёрнуто 4 сообщений, -22 токенов контекста, история 8->4, summary 2 симв., (всего сжатий: 3)
+```
+
+Programmatic callers can pass an `on_compress` callback to `make_session(...)` to be
+notified of each fold:
+
+```python
+from llm_bot import CompressionEvent
+
+def on_compress(e: CompressionEvent) -> None:
+    print(f"folded {e.messages_folded} msgs, saved ~{e.folded_tokens} tokens")
+
+session = make_session(..., on_compress=on_compress)
+```
+
+> **Cost/quality tradeoff.** Compression saves prompt tokens (recent real runs:
+> ~39% on a 24-fact dialog even after charging the summarization calls), but a
+> lossy summarizer can drop some older facts. See
+> [`results/compression_analysis.md`](results/compression_analysis.md) and run the
+> reproducible experiment:
+>
+> ```bash
+> python scripts/compare_compression.py                   # lossless (retention 1.0)
+> python scripts/compare_compression.py --retention 0.6   # lossy summarizer
+> ```
 
 ## Comparing prompt strategies
 

@@ -13,6 +13,7 @@ from llm_bot.client import (
     LLMRetryExhaustedError,
     TokenProvider,
 )
+from llm_bot.compress import CompressionSettings, ContextCompressor
 from llm_bot.diagnostics import (
     DetailListener,
     RequestDetails,
@@ -28,6 +29,8 @@ __all__ = [
     "LLMRequestError",
     "LLMRetryExhaustedError",
     "TokenProvider",
+    "CompressionSettings",
+    "ContextCompressor",
     "DetailListener",
     "RequestDetails",
     "ResponseDetails",

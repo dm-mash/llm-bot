@@ -12,6 +12,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from llm_bot.compress import CompressionSettings
+
 
 def _resolve_env(value: str) -> str:
     """Resolve ``${VAR}`` placeholders in a config string from the environment.
@@ -88,6 +90,9 @@ class AgentConfig:
     An agent describes *what* to say (system prompt, generation settings) and
     *which* model to use (a reference to a :class:`ModelConfig` by name). It does
     NOT hold conversation history — history belongs to a :class:`Session`.
+
+    Context compression can be enabled per-agent via ``keep_last_messages`` and
+    ``summarize_messages_threshold`` (see :attr:`compression_settings`).
     """
 
     name: str
@@ -97,6 +102,17 @@ class AgentConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     max_response_words: int | None = None
+    # Context compression: N (how many recent messages stay verbatim) and M (the
+    # block size that triggers folding the oldest part into a summary). Both must
+    # be set (and M > N) for compression to be active.
+    keep_last_messages: int | None = None
+    summarize_messages_threshold: int | None = None
+    # Cap on the running summary size. max_summary_tokens is an explicit token
+    # limit; max_summary_ratio caps the summary as a fraction of the model's
+    # context window (fallback/ceiling when the token cap is absent). Both are
+    # optional; without either the summary is unbounded.
+    max_summary_tokens: int | None = None
+    max_summary_ratio: float | None = None
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "AgentConfig":
@@ -112,6 +128,36 @@ class AgentConfig:
             temperature=_opt_float(temperature),
             max_tokens=_opt_int(max_tokens),
             max_response_words=_opt_int(max_response_words),
+            keep_last_messages=_opt_int(data.get("keep_last_messages")),
+            summarize_messages_threshold=_opt_int(
+                data.get("summarize_messages_threshold")
+            ),
+            max_summary_tokens=_opt_int(data.get("max_summary_tokens")),
+            max_summary_ratio=_opt_float(data.get("max_summary_ratio")),
+        )
+
+    @property
+    def compression_settings(self) -> CompressionSettings | None:
+        """Compression settings when configured, or ``None`` when disabled.
+
+        Compression is active only when both ``keep_last_messages`` and
+        ``summarize_messages_threshold`` are set (and the threshold exceeds the
+        keep-last count, which :class:`CompressionSettings` normalises anyway).
+        """
+        if (
+            self.keep_last_messages is None
+            or self.summarize_messages_threshold is None
+        ):
+            return None
+        return CompressionSettings(
+            keep_last=self.keep_last_messages,
+            block_size=self.summarize_messages_threshold,
+            max_summary_tokens=self.max_summary_tokens,
+            max_summary_ratio=(
+                self.max_summary_ratio
+                if self.max_summary_ratio is not None
+                else CompressionSettings.max_summary_ratio
+            ),
         )
 
     def effective_system_prompt(self) -> str:
@@ -164,8 +210,37 @@ class AgentStore(Protocol):
 
 @runtime_checkable
 class SessionStore(Protocol):
-    """Persistent storage for session (conversation) histories."""
+    """Persistent storage for session (conversation) histories.
 
-    def load(self, session_id: str) -> list[dict[str, str]]: ...
-    def save(self, session_id: str, history: list[dict[str, str]]) -> None: ...
+    In addition to the live ``history`` (a list of messages), a store may persist
+    a context-compression ``summary`` string alongside it. The summary replaces
+    the older part of the dialog that has been folded away by the compressor (see
+    :mod:`llm_bot.compress`). Stores that do not support summaries can rely on
+    the default implementations below, which treat the summary as permanently
+    empty.
+    """
+
+    def load(self, session_id: str) -> list[dict[str, str]]:
+        """Return the live message history for *session_id* (without the summary)."""
+        ...
+
+    def save(self, session_id: str, history: list[dict[str, str]]) -> None:
+        """Persist *history*, preserving any previously stored summary."""
+        ...
+
+    def load_summary(self, session_id: str) -> str:
+        """Return the persisted compression summary (``""`` when there is none)."""
+        return ""
+
+    def save_full(
+        self,
+        session_id: str,
+        history: list[dict[str, str]],
+        *,
+        summary: str,
+    ) -> None:
+        """Persist both the live *history* and the compressed *summary* together."""
+        # Default: stores without summary support just keep the live history.
+        self.save(session_id, history)
+
     def list(self) -> list[str]: ...
