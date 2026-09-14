@@ -86,6 +86,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List the names of all defined agents and exit.",
     )
+    parser.add_argument(
+        "--strategy",
+        choices=("sliding", "facts", "branching"),
+        default=None,
+        help="Context-management strategy for this session: sliding window / "
+        "sticky facts / branching. Takes precedence over the agent's configured "
+        "context_strategy.",
+    )
+    parser.add_argument(
+        "--window-messages",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Sliding-window size in MESSAGES kept in each request for "
+        "--strategy sliding/facts (overrides the agent's context_window_messages).",
+    )
 
     # Legacy direct-call options (used only without --agent).
     parser.add_argument(
@@ -243,6 +259,8 @@ def _run_agent_chat(
     session_id: str | None,
     prompt: str | None,
     detail_listener: DetailListener | None,
+    strategy_override: str | None = None,
+    window_messages: int | None = None,
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
@@ -257,6 +275,8 @@ def _run_agent_chat(
         agent_store=agent_store,
         session_store=session_store,
         detail_listener=detail_listener,
+        strategy_override=strategy_override,
+        window_messages=window_messages,
     )
 
     # When resuming an existing conversation, surface how much context is loaded.
@@ -277,9 +297,18 @@ def _run_agent_chat(
 
 
 _HISTORY_COMMANDS = {"/history", "/история"}
+_BRANCH_COMMANDS = {"/branch", "/switch", "/branches"}
 
 # Words offered by tab-completion in the interactive prompt.
-_COMMAND_WORDS = ["/history", "/история", "exit", "quit"]
+_COMMAND_WORDS = [
+    "/history",
+    "/история",
+    "/branch",
+    "/switch",
+    "/branches",
+    "exit",
+    "quit",
+]
 
 
 def _command_completer():
@@ -351,6 +380,59 @@ def _read_input(
     return input(prompt)
 
 
+def _handle_branch_command(session: Session, raw: str) -> bool:
+    """Handle a branching slash-command; returns True when the input was a command.
+
+    Supports ``/branch <name>`` (fork the current position into a new branch),
+    ``/switch <name>`` (make a branch active) and ``/branches`` (list them). Only
+    meaningful when the session uses the ``branching`` strategy; otherwise prints
+    a hint and returns True so the text is not sent as a chat message.
+    """
+    cmd = raw.split(None, 1)
+    name = cmd[0].lower()
+    if name not in _BRANCH_COMMANDS:
+        return False
+    strategy = getattr(session, "strategy", None)
+    if strategy is None or getattr(strategy, "name", "") != "branching":
+        print("[branches] активна не стратегия branching; используйте "
+              "--strategy branching.", file=sys.stderr)
+        return True
+
+    if name == "/branches":
+        print(f"[branches] текущая ветка: {strategy.current_branch}", file=sys.stderr)
+        for b, hist in strategy.branches.items():
+            marker = " *" if b == strategy.current_branch else ""
+            print(f"[branches]   {b}{marker} ({len(hist)} сообщ.)", file=sys.stderr)
+        return True
+
+    arg = cmd[1].strip() if len(cmd) > 1 else ""
+    if name == "/branch":
+        if not arg:
+            print("[branch] укажите имя: /branch <name>", file=sys.stderr)
+            return True
+        try:
+            session.branch(arg)
+        except ValueError as exc:
+            print(f"[branch] {exc}", file=sys.stderr)
+            return True
+        print(f"[branch] создана ветка '{arg}' (checkpoint текущей позиции).",
+              file=sys.stderr)
+        return True
+
+    # /switch
+    if not arg:
+        print("[switch] укажите имя: /switch <name>", file=sys.stderr)
+        return True
+    try:
+        session.switch_branch(arg)
+    except KeyError:
+        print(f"[switch] ветка '{arg}' не найдена. /branches — список.",
+              file=sys.stderr)
+        return True
+    print(f"[switch] переключено на ветку '{arg}'.", file=sys.stderr)
+    return True
+
+
 def _interactive_loop(session: Session) -> int:
     """Run an interactive REPL-style chat against a session."""
     print(f"Starting chat with agent '{session.agent.name}' "
@@ -377,6 +459,8 @@ def _interactive_loop(session: Session) -> int:
                 break
             if user in _HISTORY_COMMANDS:
                 _print_history(session)
+                continue
+            if _handle_branch_command(session, raw):
                 continue
             try:
                 print(session.chat(raw))
@@ -521,6 +605,8 @@ def main(argv: list[str] | None = None) -> int:
             session_id=args.session,
             prompt=prompt,
             detail_listener=detail_listener,
+            strategy_override=args.strategy,
+            window_messages=args.window_messages,
         )
 
     # Legacy path.

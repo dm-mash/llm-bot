@@ -19,6 +19,12 @@ from llm_bot.agent import Agent, Session
 from llm_bot.client import LLMClient
 from llm_bot.compress import CompressionEvent, CompressionSettings
 from llm_bot.config import LLMConfig
+from llm_bot.context_strategies import (
+    Branching,
+    ContextStrategy,
+    SlidingWindow,
+    StickyFacts,
+)
 from llm_bot.diagnostics import DetailListener
 from llm_bot.gigachat import GigaChatTokenProvider
 from llm_bot.stores import AgentConfig, AgentStore, ModelConfig, ModelStore, SessionStore
@@ -89,6 +95,51 @@ def make_agent(
     return Agent(agent_config, client=client)
 
 
+def make_strategy(
+    config: AgentConfig,
+    *,
+    chat: Callable[[list[dict[str, str]]], str],
+    override: str | None = None,
+    window_messages: int | None = None,
+) -> ContextStrategy | None:
+    """Build a context-management strategy from an agent config (+ optional CLI override).
+
+    *override* (e.g. ``"sliding"`` / ``"facts"`` / ``"branching"``) takes
+    precedence over the agent's configured ``context_strategy``. *window_messages*
+    (the sliding-window size in MESSAGES) takes precedence over the config's
+    ``context_window_messages``. When neither selects a strategy, returns ``None``
+    (full-history behaviour).
+    """
+    kind = override or config.context_strategy
+    if kind is None:
+        return None
+    window = (
+        window_messages
+        if window_messages is not None
+        else config.context_window_messages
+    )
+    if kind == "sliding":
+        if not window:
+            raise ValueError(
+                "Стратегии 'sliding' нужен параметр context_window_messages "
+                "(размер окна в сообщениях)."
+            )
+        return SlidingWindow(window)
+    if kind == "facts":
+        if not window:
+            raise ValueError(
+                "Стратегии 'facts' нужен параметр context_window_messages "
+                "(размер окна в сообщениях)."
+            )
+        return StickyFacts(window, max_facts=config.context_max_facts or 20, chat=chat)
+    if kind == "branching":
+        return Branching(window_size=window)
+    raise ValueError(
+        f"Неизвестная стратегия контекста: {kind!r}. "
+        "Доступны: sliding, facts, branching."
+    )
+
+
 def make_session(
     session_id: str,
     agent_name: str,
@@ -101,13 +152,22 @@ def make_session(
     history: list[dict[str, str]] | None = None,
     compression: CompressionSettings | None = None,
     on_compress: Callable[[CompressionEvent], None] | None = None,
+    strategy: ContextStrategy | None = None,
+    strategy_override: str | None = None,
+    window_messages: int | None = None,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
 
-    Context compression is enabled automatically when the agent config declares
-    ``keep_last_messages`` / ``summarize_messages_threshold`` (see
-    :attr:`~llm_bot.stores.AgentConfig.compression_settings`). Pass *compression*
-    explicitly to override or force-enable it for agents that do not configure it.
+    Two complementary ways to manage context are supported:
+
+    * **Rolling-summary compression** is enabled automatically when the agent
+      config declares ``keep_last_messages`` / ``summarize_messages_threshold``
+      (see :attr:`~llm_bot.stores.AgentConfig.compression_settings`). Pass
+      *compression* explicitly to override or force-enable it.
+    * **Pluggable context strategies** (sliding window / sticky facts / branching)
+      are derived from the agent config's ``context_strategy`` (see
+      :func:`make_strategy`), or passed in directly via *strategy*. A strategy
+      takes precedence over compression when both are present.
 
     When compression triggers, *on_compress* (if given) is called with a
     :class:`~llm_bot.compress.CompressionEvent` so callers (e.g. a CLI) can print
@@ -123,6 +183,14 @@ def make_session(
     effective = (
         compression if compression is not None else agent.config.compression_settings
     )
+    effective_strategy = strategy
+    if effective_strategy is None:
+        effective_strategy = make_strategy(
+            agent.config,
+            chat=agent.client.chat,
+            override=strategy_override,
+            window_messages=window_messages,
+        )
     return Session(
         session_id,
         agent,
@@ -130,4 +198,5 @@ def make_session(
         history=history,
         compression=effective,
         on_compress=on_compress,
+        strategy=effective_strategy,
     )
