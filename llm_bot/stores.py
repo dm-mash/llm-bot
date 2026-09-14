@@ -113,6 +113,19 @@ class AgentConfig:
     # optional; without either the summary is unbounded.
     max_summary_tokens: int | None = None
     max_summary_ratio: float | None = None
+    # Pluggable context-management strategy (without summary). One of:
+    #   * "sliding"   — only the last ``context_window_messages`` messages are sent;
+    #   * "facts"     — a durable key/value facts block + the last
+    #                   ``context_window_messages`` messages;
+    #   * "branching" — fork the dialog into independent lines.
+    # When unset, the agent falls back to its compression settings (if any), else
+    # to the full-history behaviour.
+    context_strategy: str | None = None
+    # How many of the most recent MESSAGES the strategy keeps in the request
+    # (sliding window size N) for the "sliding"/"facts" strategies (and, when set,
+    # as a cap for "branching"). Measured in messages, not tokens.
+    context_window_messages: int | None = None
+    context_max_facts: int | None = None     # cap for the "facts" strategy
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "AgentConfig":
@@ -134,6 +147,9 @@ class AgentConfig:
             ),
             max_summary_tokens=_opt_int(data.get("max_summary_tokens")),
             max_summary_ratio=_opt_float(data.get("max_summary_ratio")),
+            context_strategy=_opt_str(data.get("context_strategy")),
+            context_window_messages=_opt_int(data.get("context_window_messages")),
+            context_max_facts=_opt_int(data.get("context_max_facts")),
         )
 
     @property
@@ -192,6 +208,14 @@ def _opt_int(value: Any) -> int | None:
         return None
 
 
+def _opt_str(value: Any) -> str | None:
+    """Return a non-empty stripped string, or ``None`` for missing/blank values."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 @runtime_checkable
 class ModelStore(Protocol):
     """Read access to LLM model/provider credentials by name."""
@@ -242,5 +266,37 @@ class SessionStore(Protocol):
         """Persist both the live *history* and the compressed *summary* together."""
         # Default: stores without summary support just keep the live history.
         self.save(session_id, history)
+
+    # --- Pluggable context strategies (sticky facts / branches) ----------- #
+    # These are used by the context strategies in :mod:`llm_bot.context_strategies`.
+    # Stores that do not support them can rely on the defaults below (permanently
+    # empty facts / a single default branch), so a plain store keeps working even
+    # when a session uses a strategy.
+
+    def load_facts(self, session_id: str) -> dict[str, str]:
+        """Return the persisted sticky-facts block (``{}`` when there is none)."""
+        return {}
+
+    def save_facts(self, session_id: str, facts: dict[str, str]) -> None:
+        """Persist the sticky-facts block for a session (no-op by default)."""
+        # Keep any existing state; the default store does not persist facts.
+        del facts
+
+    def load_branches(
+        self, session_id: str, *, default_branch: str
+    ) -> tuple[dict[str, list[dict[str, str]]], str]:
+        """Return ``(branches, current)``; defaults to a single ``default_branch``."""
+        return {default_branch: self.load(session_id)}, default_branch
+
+    def save_branches(
+        self,
+        session_id: str,
+        branches: dict[str, list[dict[str, str]]],
+        current: str,
+    ) -> None:
+        """Persist the branching state (no-op by default)."""
+        # Without branch support we persist only the active branch's history.
+        if current in branches:
+            self.save(session_id, branches[current])
 
     def list(self) -> list[str]: ...

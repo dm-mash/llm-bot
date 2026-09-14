@@ -38,8 +38,13 @@ trivial to add a **web interface** later without touching the logic.
 - **Context compression** — rolling-summary keeps long dialogs inside the token
   budget: recent turns stay verbatim, older ones fold into a running summary that
   is injected at the front of each request (see "Context compression" below).
-- **Comparison scripts** — reproducible experiments (`scripts/compare_compression.py`)
-  comparing answer quality and token spend with vs without compression.
+- **Pluggable context strategies** — three alternative ways to manage context
+  *without* summary, all selectable per-agent or per-session (`--strategy`):
+  sliding window / sticky facts (key-value durable memory) / branching
+  (see "Context strategies" below).
+- **Comparison scripts** — reproducible experiments (`scripts/compare_compression.py`,
+  `scripts/compare_context_strategies.py`) comparing answer quality and token spend
+  across strategies.
 - Pytest suite using `httpx.MockTransport` (no network needed).
 
 ## Project structure
@@ -52,6 +57,7 @@ llm-bot/
 │   ├── diagnostics.py         # RequestDetails/ResponseDetails + listener protocol
 │   ├── client.py              # LLMClient — transport + retries + errors + detail events
 │   ├── compress.py            # ContextCompressor + CompressionSettings (rolling summary)
+│   ├── context_strategies.py  # SlidingWindow / StickyFacts / Branching (pluggable strategies)
 │   ├── stores.py              # Repository interfaces (ModelStore/AgentStore/SessionStore)
 │   ├── yaml_stores.py         # YamlModelStore / YamlAgentStore (data/*.yaml)
 │   ├── json_session_store.py  # JsonSessionStore (data/sessions/*.json)
@@ -61,8 +67,9 @@ llm-bot/
 │   ├── cli.py                 # console entry point (interactive chat / single prompt)
 │   └── __main__.py            # enables `python -m llm_bot`
 ├── scripts/
-│   ├── compare_compression.py # token/quality experiment: with vs without compression
-│   └── ...                    # other comparison/demo scripts
+│   ├── compare_compression.py       # token/quality experiment: with vs without compression
+│   ├── compare_context_strategies.py# strategies on a shared "ТЗ" scenario
+│   └── ...                          # other comparison/demo scripts
 ├── tests/
 │   ├── test_client.py         # LLMClient tests (mocked transport)
 │   ├── test_agent.py          # Agent + Session tests
@@ -450,6 +457,61 @@ Set both per model in `data/models.yaml` (`context_window:`,
 .venv/bin/python scripts/token_demo.py
 .venv/bin/python scripts/token_demo.py --context-window 400 --max-request-tokens 200
 ```
+
+### Context strategies (without summary)
+
+Besides rolling-summary compression, you can manage context with one of three
+**pluggable strategies** that never build an LLM summary. They share a single
+code path (`Session` + `Agent.build_messages`) and are selected per-agent (in
+`data/agents.yaml`) or per-session via `--strategy`:
+
+| Key        | Strategy                | What is sent to the model                     | Loss? |
+|------------|-------------------------|-----------------------------------------------|-------|
+| `sliding`  | Sliding Window          | Only the last `context_window_messages` msgs  | early details drop out of the reply |
+| `facts`    | Sticky Facts / KV memory| A durable `facts` block + last N messages     | none (memory keeps details) |
+| `branching`| Branching               | Full history of the active branch             | none (per branch) |
+
+All three keep the **full** history on disk (in `data/sessions/*.json`); they only
+trim what reaches the model. Nothing is deleted from persistent storage.
+
+**Sliding window** — cheap and predictable; pick a `context_window_messages` that
+fits the task:
+```bash
+python -m llm_bot --agent assistant --strategy sliding --window-messages 8
+```
+
+**Sticky facts** — the agent maintains a key/value `facts` block (goal, constraints,
+preferences, decisions, agreements), refreshed after every turn by a small LLM call,
+and sends `facts` + the last N messages. Details survive a small window at the cost
+of extra tokens for the refresh:
+```bash
+python -m llm_bot --agent assistant --strategy facts --window-messages 8
+```
+
+**Branching** — fork the dialog into independent lines. `/branch <name>` snapshots
+the current position as an automatic checkpoint and starts a new branch; `/switch`
+moves between branches; `/branches` lists them:
+```
+> /branch web          # создаст ветку 'web' от текущей точки (checkpoint автоматически)
+> В ТЗ добавить веб-интерфейс
+> /switch main         # вернуться к основной линии
+```
+Each branch keeps its own full history and persists across restarts.
+
+Config example (`data/agents.yaml`):
+```yaml
+assistant-sliding:
+  model: openai-gpt4o
+  system_prompt: "Ты полезный помощник."
+  context_strategy: sliding
+  context_window_messages: 8
+```
+
+A reproducible comparison on a shared "ТЗ" scenario is available:
+```bash
+python scripts/compare_context_strategies.py
+```
+and its analysis is in [`results/context_strategies_analysis.md`](results/context_strategies_analysis.md).
 
 ### Context compression (rolling summary)
 

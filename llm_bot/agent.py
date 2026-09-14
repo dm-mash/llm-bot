@@ -21,6 +21,7 @@ from llm_bot.compress import (
     ContextCompressor,
     summarize_prompt,
 )
+from llm_bot.context_strategies import ContextStrategy
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.tokens import (
     DEFAULT_CONTEXT_WINDOW,
@@ -108,17 +109,26 @@ class Agent:
         history: list[dict[str, str]],
         *,
         summary: str = "",
+        prefix: list[dict[str, str]] | None = None,
     ) -> list[dict[str, str]]:
         """Return the full ``messages`` stack for a request.
 
         Prepends the assembled system prompt (if any) to the given *history*.
-        When a non-empty *summary* is provided it is injected as the very first
-        system message, so the model sees the compressed old dialog as durable
-        context before the agent's role prompt.
+        Durable context can be injected *before* the role prompt in two ways:
+
+        * *summary* — the rolling-summary string, injected as the very first
+          system message (compression path);
+        * *prefix* — a list of system messages carrying durable memory produced
+          by a context strategy (e.g. a rendered sticky-facts block).
+
+        Order: ``[summary?, prefix..., system, ...history]`` so durable memory
+        is always visible ahead of the agent's role prompt.
         """
         messages: list[dict[str, str]] = []
         if summary:
             messages.append({"role": "system", "content": summary})
+        if prefix:
+            messages.extend(prefix)
         system_prompt = self.config.effective_system_prompt()
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -172,6 +182,7 @@ class Session:
         history: list[dict[str, str]] | None = None,
         compression: CompressionSettings | None = None,
         on_compress: Callable[[CompressionEvent], None] | None = None,
+        strategy: ContextStrategy | None = None,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -199,11 +210,48 @@ class Session:
             )
         else:
             self._compressor = None
+        # Pluggable context-management strategy (sliding window / sticky facts /
+        # branching). When set it owns the conversation history and request
+        # assembly; it is mutually exclusive with rolling-summary compression.
+        self._strategy = strategy
+        if self._strategy is not None:
+            self._strategy.load_state(store, session_id)
 
     @property
     def history(self) -> list[dict[str, str]]:
-        """Read-only view of the conversation history."""
+        """Read-only view of the conversation history.
+
+        With a pluggable strategy the history is owned by the strategy (e.g. the
+        currently active branch); otherwise it is the session's own stack.
+        """
+        if self._strategy is not None:
+            return self._strategy.history
         return list(self._history)
+
+    @property
+    def strategy(self) -> ContextStrategy | None:
+        """The active context-management strategy, or ``None`` (full history)."""
+        return self._strategy
+
+    # -- Branching helpers (only meaningful for the "branching" strategy) ----- #
+
+    def branch(self, name: str) -> None:
+        """Create a new dialogue branch forking the current position.
+
+        Only valid when the session uses the ``branching`` strategy. The new
+        branch becomes active and the state is persisted.
+        """
+        if self._strategy is None:
+            raise ValueError("Сессия не использует стратегию 'branching'.")
+        self._strategy.branch(name)
+        self._strategy.save_state(self._store, self.session_id)
+
+    def switch_branch(self, name: str) -> None:
+        """Make *name* the active dialogue branch (branching strategy only)."""
+        if self._strategy is None:
+            raise ValueError("Сессия не использует стратегию 'branching'.")
+        self._strategy.switch(name)
+        self._strategy.save_state(self._store, self.session_id)
 
     @property
     def summary(self) -> str:
@@ -281,25 +329,35 @@ class Session:
         user_msg = {"role": "user", "content": user_message}
         request_tokens = count_message_tokens(user_msg)
 
-        # Project the history that will actually be sent: the current live history
-        # plus the new user turn. When compression is enabled and the projected
-        # history exceeds the block size, the oldest messages are folded into the
-        # running summary *in memory* here; the result is only committed to the
-        # session below, after the budget checks pass (so an overflow leaves the
-        # session and the persisted store untouched).
-        projected_history = [*self._history, user_msg]
-        projected_summary = self._summary
-        folded_messages: list[dict[str, str]] = []
-        if self._compressor is not None:
-            projected_history, projected_summary, folded_messages = (
-                self._compressor.compress(projected_history, projected_summary)
+        # Project the history that will actually be sent. There are two paths:
+        #
+        # 1. A pluggable context strategy (sliding / sticky-facts / branching)
+        #    computes the request view from its durable history plus this turn's
+        #    user message, WITHOUT mutating anything — so an overflow check below
+        #    can abort leaving the session and the store untouched.
+        # 2. Rolling-summary compression folds the oldest messages into a running
+        #    summary *in memory* here; the result is only committed after the
+        #    budget checks pass.
+        prepared = None
+        if self._strategy is not None:
+            prepared = self._strategy.prepare(user_msg)
+            messages = self.agent.build_messages(
+                prepared.request_history, prefix=prepared.prefix
             )
+        else:
+            projected_history = [*self._history, user_msg]
+            projected_summary = self._summary
+            folded_messages: list[dict[str, str]] = []
+            if self._compressor is not None:
+                projected_history, projected_summary, folded_messages = (
+                    self._compressor.compress(projected_history, projected_summary)
+                )
 
-        # Build the exact stack that would go to the model (summary + system +
-        # (possibly compressed) history).
-        messages = self.agent.build_messages(
-            projected_history, summary=projected_summary
-        )
+            # Build the exact stack that would go to the model (summary + system +
+            # (possibly compressed) history).
+            messages = self.agent.build_messages(
+                projected_history, summary=projected_summary
+            )
         # Defensive guard: history may also carry surrogates from earlier loads,
         # so sanitize the whole stack before handing it to the HTTP client.
         _sanitize_messages(messages)
@@ -338,21 +396,24 @@ class Session:
             )
 
         # Commit the projected history and summary now that the budget checks
-        # passed and the request is about to be sent.
-        self._history = projected_history
-        self._summary = projected_summary
+        # passed and the request is about to be sent. This applies only to the
+        # rolling-summary path; a pluggable strategy defers its (atomic) history
+        # update to ``on_turn_end`` after the reply arrives.
+        if self._strategy is None:
+            self._history = projected_history
+            self._summary = projected_summary
 
-        if folded_messages:
-            event = CompressionEvent(
-                messages_folded=len(folded_messages),
-                folded_tokens=count_messages_tokens(folded_messages),
-                summary_chars=len(projected_summary),
-                history_before=len(folded_messages) + len(projected_history),
-                history_after=len(projected_history),
-            )
-            self._compression_events.append(event)
-            if self._on_compress is not None:
-                self._on_compress(event)
+            if folded_messages:
+                event = CompressionEvent(
+                    messages_folded=len(folded_messages),
+                    folded_tokens=count_messages_tokens(folded_messages),
+                    summary_chars=len(projected_summary),
+                    history_before=len(folded_messages) + len(projected_history),
+                    history_after=len(projected_history),
+                )
+                self._compression_events.append(event)
+                if self._on_compress is not None:
+                    self._on_compress(event)
 
         reply = self.agent.client.chat(messages)
 
@@ -373,12 +434,18 @@ class Session:
         )
         self.last_usage = usage
 
-        self._history.append({"role": "assistant", "content": reply})
-        if self._compressor is not None:
-            # Persist both the compressed history and the running summary.
-            self._store.save_full(
-                self.session_id, self._history, summary=self._summary
-            )
+        if self._strategy is not None:
+            # Atomically record the completed turn in the strategy's durable
+            # history/memory and persist it (with any facts/branches).
+            self._strategy.on_turn_end(user_msg, reply)
+            self._strategy.save_state(self._store, self.session_id)
         else:
-            self._store.save(self.session_id, self._history)
+            self._history.append({"role": "assistant", "content": reply})
+            if self._compressor is not None:
+                # Persist both the compressed history and the running summary.
+                self._store.save_full(
+                    self.session_id, self._history, summary=self._summary
+                )
+            else:
+                self._store.save(self.session_id, self._history)
         return ChatResult(reply=reply, usage=usage)

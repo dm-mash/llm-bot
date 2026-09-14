@@ -34,6 +34,26 @@ agents:
     max_summary_tokens: 500          # optional: cap summary size
     # max_summary_ratio: 0.25        # optional: cap as a share of the context window
 
+  # --- Pluggable context strategies (without summary) -------------------------
+  # Instead of rolling-summary, you can pick ONE context-management strategy:
+  #   context_strategy: sliding   # only the last N messages are sent
+  #   context_strategy: facts     # durable key/value memory + last N messages
+  #   context_strategy: branching # fork the dialog into independent lines
+  # Optional shared knob:
+  #   context_window_messages: N  # sliding-window size in MESSAGES (for sliding/
+  #                               # facts; optional cap for branching). Default:
+  #                               # the full history is used when unset.
+  #   context_max_facts: K        # cap for the "facts" memory (default 20)
+  #
+  # Example:
+  #   assistant-sliding:
+  #     model: openai-gpt4o
+  #     system_prompt: "Ты полезный помощник."
+  #     context_strategy: sliding
+  #     context_window_messages: 8
+  #
+  # Note: a strategy takes precedence over keep_last_messages/summarize_messages_threshold.
+
   translator:
     model: openai-gpt4o
     system_prompt: "Переводи с русского на английский и обратно. Отвечай только переводом."
