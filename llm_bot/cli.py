@@ -170,6 +170,24 @@ def _new_session_id(agent_name: str) -> str:
     return f"{agent_name}-{stamp}"
 
 
+def _print_resume_info(session: Session) -> None:
+    """Print how much history is being resumed, if any.
+
+    Called right after opening an existing session: reports the number of
+    messages currently in the history and the running compression summary size
+    (in characters) when one exists. Uses ``getattr`` so lightweight fakes/tests
+    that only implement ``chat`` do not need to expose compression internals.
+    """
+    history = getattr(session, "history", None) or []
+    summary = getattr(session, "summary", "") or ""
+    if not history and not summary:
+        return
+    parts = [f"сообщений в истории: {len(history)}"]
+    if summary:
+        parts.append(f"summary: {len(summary)} симв.")
+    print("[session] " + ", ".join(parts), file=sys.stderr)
+
+
 def _print_usage(session: Session) -> None:
     """Print token accounting for the session's most recent turn to stderr.
 
@@ -240,6 +258,9 @@ def _run_agent_chat(
         session_store=session_store,
         detail_listener=detail_listener,
     )
+
+    # When resuming an existing conversation, surface how much context is loaded.
+    _print_resume_info(session)
 
     if prompt is not None:
         try:

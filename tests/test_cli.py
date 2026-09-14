@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from llm_bot.cli import _interactive_loop, _print_history, _read_input
+from llm_bot.cli import (
+    _interactive_loop,
+    _print_history,
+    _print_resume_info,
+    _read_input,
+)
 
 
 class _FakeAgent:
@@ -92,6 +97,49 @@ def test_print_history_empty_session(capsys):
     _print_history(_FakeSession("s9", "translator", []))
     err = capsys.readouterr().err
     assert "history is empty" in err
+
+
+def test_print_resume_info_reports_history_and_summary(capsys):
+    """Opening an existing session must report the message count and summary size."""
+    class _ResumedSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__(
+                "s1",
+                "assistant",
+                [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                ],
+            )
+            self.summary = "compressed context"
+
+    _print_resume_info(_ResumedSession())
+
+    err = capsys.readouterr().err
+    assert "сообщений в истории: 2" in err
+    assert "summary: 18 симв." in err
+
+
+def test_print_resume_info_reports_history_only_without_summary(capsys):
+    """Message count is shown even when there is no running summary."""
+    session = _FakeSession(
+        "s1",
+        "assistant",
+        [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}],
+    )
+
+    _print_resume_info(session)
+
+    err = capsys.readouterr().err
+    assert "сообщений в истории: 2" in err
+    assert "summary" not in err
+
+
+def test_print_resume_info_silent_for_fresh_session(capsys):
+    """A brand-new (empty) session should print nothing."""
+    _print_resume_info(_FakeSession("s1", "assistant", []))
+
+    assert capsys.readouterr().err == ""
 
 
 def test_read_input_uses_prompt_toolkit_on_tty(monkeypatch):
