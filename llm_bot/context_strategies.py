@@ -155,6 +155,11 @@ class SlidingWindow(ContextStrategy):
         self._window = max(1, int(window_size))
         self._history: list[dict[str, str]] = []
 
+    @property
+    def window_size(self) -> int:
+        """The sliding-window size (how many recent messages go to the model)."""
+        return self._window
+
     def prepare(self, user_msg: dict[str, str]) -> PreparedTurn:
         request_history, dropped = _tail([*self._history, user_msg], self._window)
         return PreparedTurn(
@@ -230,6 +235,16 @@ class StickyFacts(ContextStrategy):
     def facts(self) -> dict[str, str]:
         """Read-only snapshot of the durable key/value memory."""
         return dict(self._facts)
+
+    @property
+    def window_size(self) -> int:
+        """The sliding-window size (how many recent messages go to the model)."""
+        return self._window
+
+    @property
+    def max_facts(self) -> int:
+        """Hard cap on the number of sticky facts kept in memory."""
+        return self._max_facts
 
     @property
     def extra_tokens(self) -> int:

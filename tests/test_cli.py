@@ -142,6 +142,62 @@ def test_print_resume_info_silent_for_fresh_session(capsys):
     assert capsys.readouterr().err == ""
 
 
+class _FakeStrategy:
+    """Minimal stand-in for a ContextStrategy, exposing its public attrs."""
+
+    def __init__(self, **attrs) -> None:
+        self.__dict__.update(attrs)
+
+
+def test_print_resume_info_sliding_window_shows_window_size(capsys):
+    """Under the sliding strategy the window size must be reported."""
+    session = _FakeSession(
+        "s1", "assistant", [{"role": "user", "content": "q"}]
+    )
+    session.strategy = _FakeStrategy(name="sliding", window_size=6)
+
+    _print_resume_info(session)
+
+    err = capsys.readouterr().err
+    assert "окно: 6 сообщ." in err
+    assert "фактов" not in err
+
+
+def test_print_resume_info_sticky_facts_shows_fact_count_and_window(capsys):
+    """Under the facts strategy the fact count (and window) must be reported."""
+    session = _FakeSession(
+        "s1", "assistant", [{"role": "user", "content": "q"}]
+    )
+    session.strategy = _FakeStrategy(
+        name="facts",
+        window_size=8,
+        facts={"цель": "X", "стек": "py"},
+    )
+
+    _print_resume_info(session)
+
+    err = capsys.readouterr().err
+    assert "окно: 8 сообщ." in err
+    assert "фактов: 2" in err
+
+
+def test_print_resume_info_branching_lists_branches_with_current(capsys):
+    """Under the branching strategy all branches are listed, current marked."""
+    session = _FakeSession(
+        "s1", "assistant", [{"role": "user", "content": "q"}]
+    )
+    session.strategy = _FakeStrategy(
+        name="branching",
+        current_branch="feature",
+        branches={"main": [], "feature": []},
+    )
+
+    _print_resume_info(session)
+
+    err = capsys.readouterr().err
+    assert "ветки [feature]: main, *feature*" in err
+
+
 def test_read_input_uses_prompt_toolkit_on_tty(monkeypatch):
     """On an interactive terminal _read_input must delegate to prompt_toolkit,
     which edits on whole Unicode characters (so Backspace cannot split a

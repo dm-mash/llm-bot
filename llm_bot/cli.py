@@ -187,20 +187,50 @@ def _new_session_id(agent_name: str) -> str:
 
 
 def _print_resume_info(session: Session) -> None:
-    """Print how much history is being resumed, if any.
+    """Print context info when resuming an existing session, if any.
 
-    Called right after opening an existing session: reports the number of
-    messages currently in the history and the running compression summary size
-    (in characters) when one exists. Uses ``getattr`` so lightweight fakes/tests
-    that only implement ``chat`` do not need to expose compression internals.
+    Called right after opening an existing session. Reports the number of
+    messages currently in the history and, depending on the active context-
+    management strategy:
+
+    * ``sliding``  — the sliding-window size;
+    * ``facts``    — the number of sticky facts in durable memory (plus window);
+    * ``branching``— the list of dialogue branches with the current one marked.
+
+    Also reports the rolling-compression summary size (in characters) when a
+    summary exists. Uses ``getattr`` so lightweight fakes/tests that only
+    implement ``chat`` do not need to expose compression/strategy internals.
     """
     history = getattr(session, "history", None) or []
     summary = getattr(session, "summary", "") or ""
-    if not history and not summary:
+    strategy = getattr(session, "strategy", None)
+
+    if not history and not summary and strategy is None:
         return
+
     parts = [f"сообщений в истории: {len(history)}"]
     if summary:
         parts.append(f"summary: {len(summary)} симв.")
+
+    if strategy is not None:
+        name = getattr(strategy, "name", "") or "unknown"
+        window = getattr(strategy, "window_size", None)
+        if name == "sliding":
+            if window is not None:
+                parts.append(f"окно: {window} сообщ.")
+        elif name == "facts":
+            facts = getattr(strategy, "facts", None) or {}
+            if window is not None:
+                parts.append(f"окно: {window} сообщ.")
+            parts.append(f"фактов: {len(facts)}")
+        elif name == "branching":
+            branches = getattr(strategy, "branches", None) or {}
+            current = getattr(strategy, "current_branch", "")
+            rendered = ", ".join(
+                f"*{b}*" if b == current else b for b in branches
+            )
+            parts.append(f"ветки [{current}]: {rendered}")
+
     print("[session] " + ", ".join(parts), file=sys.stderr)
 
 
