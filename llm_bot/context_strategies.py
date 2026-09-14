@@ -35,10 +35,13 @@ Lifecycle driven by :class:`~llm_bot.agent.Session` for one turn:
 
 from __future__ import annotations
 
+import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # Shared value objects
@@ -287,7 +290,26 @@ class StickyFacts(ContextStrategy):
         self._extra_tokens += count_message_tokens(
             {"role": "assistant", "content": output}
         )
-        self._facts = parse_facts(output, self._max_facts)
+        logger.debug(
+            "[facts] refresh call (%d existing facts, agent max_tokens applies); "
+            "raw reply=%r",
+            len(self._facts),
+            output,
+        )
+        parsed = parse_facts(output, self._max_facts)
+        # MERGE, don't replace: the model is not forced to re-emit every prior
+        # fact in each refresh reply, so a wholesale replacement would silently
+        # drop accumulated memory whenever one reply happens to omit it.
+        merged = dict(self._facts)
+        merged.update(parsed)  # new values override same-key; omitted facts survive
+        self._facts = cap_facts(merged, self._max_facts)
+        logger.debug(
+            "[facts] parsed %d fact(s) -> %s; memory now %d (was %d)",
+            len(parsed),
+            list(parsed)[:5],
+            len(self._facts),
+            len(self._facts) - len(parsed),
+        )
 
     def load_state(self, store: Any, session_id: str) -> None:
         self._history = store.load(session_id)
@@ -318,29 +340,45 @@ def render_transcript(messages: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-_FACT_LINE_RE = re.compile(r"^\s*([^:\n]{1,60}?)\s*:\s*(.+?)\s*$")
+# A line is "key: value". The key may carry common formatting markers (a bullet,
+# markdown bold or a numbered-list prefix); those are stripped so the same fact
+# is always stored under a clean, deduplicated key.
+_FACT_LINE_RE = re.compile(
+    r"^\s*[*\-–•\d.)]*\s*([^:\n]{1,60}?)\s*:\s*(.+?)\s*$"
+)
+# Leading/trailing markdown bold and stray whitespace on a key.
+_KEY_CLEAN_RE = re.compile(r"^[*\s]+|[*\s]+$")
+
+
+def cap_facts(facts: dict[str, str], max_facts: int) -> dict[str, str]:
+    """Cap a facts dict to at most *max_facts* entries.
+
+    Keeps the *last* encountered (most recently stated) entries first so the
+    newest facts win over a full stale memory.
+    """
+    if len(facts) <= max_facts:
+        return facts
+    ordered = list(facts.items())
+    return dict(ordered[-max_facts:])
 
 
 def parse_facts(text: str, max_facts: int) -> dict[str, str]:
     """Parse ``key: value`` lines (e.g. from a facts-refresh reply) into a dict.
 
-    Non-matching lines are ignored; at most *max_facts* entries are kept, taking
-    the *last* encountered (most recently stated) entries first so the newest
-    facts win over a full stale memory.
+    Common list/markdown markers on the key (``-``, ``*``, ``1.``) are stripped so
+    the same logical fact deduplicates reliably. Non-matching lines are ignored;
+    at most *max_facts* entries are kept.
     """
     facts: dict[str, str] = {}
     for raw in text.splitlines():
         m = _FACT_LINE_RE.match(raw)
         if not m:
             continue
-        key = m.group(1).strip().lower()
+        key = _KEY_CLEAN_RE.sub("", m.group(1)).strip().lower()
         value = m.group(2).strip()
         if key:
             facts[key] = value
-    if len(facts) > max_facts:
-        ordered = list(facts.items())
-        facts = dict(ordered[-max_facts:])
-    return facts
+    return cap_facts(facts, max_facts)
 
 
 # --------------------------------------------------------------------------- #

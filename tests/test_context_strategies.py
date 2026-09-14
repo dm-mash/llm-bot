@@ -213,6 +213,34 @@ def test_sticky_facts_after_reply_updates_memory_via_chat():
     assert "ставим цель" in calls[0][0]["content"]
 
 
+def test_sticky_facts_merges_not_replaces_when_refresh_omits_prior_facts():
+    """Regression: a refresh returning only a subset must NOT wipe memory.
+
+    Real-model refresh replies often omit previously accumulated facts; replacing
+    the whole dict would collapse memory (e.g. 4 facts -> 1). New facts are merged
+    on top of the existing ones so omitted facts survive.
+    """
+    strategy = StickyFacts(window_size=6, max_facts=50)
+    # Seed memory with two facts as if accumulated earlier.
+    strategy._facts = {"цель": "требуется уточнение", "доставка": "выбор дня"}
+    replies = iter(["аудитория: офис-менеджеры"])  # next refresh only mentions new fact
+    strategy._chat = lambda msgs: next(replies)
+    strategy.on_turn_end({"role": "user", "content": "кто пользователи?"}, "ок")
+
+    assert "аудитория" in strategy.facts          # new fact added
+    assert "цель" in strategy.facts                # prior fact survived the merge
+    assert "доставка" in strategy.facts            # prior fact survived the merge
+
+
+def test_parse_facts_strips_list_and_markdown_markers_from_keys():
+    text = "- цель: бот\n* **ограничения**: python\n1. срок: март"
+    assert parse_facts(text, 10) == {
+        "цель": "бот",
+        "ограничения": "python",
+        "срок": "март",
+    }
+
+
 def test_sticky_facts_survive_small_window_in_session(tmp_path):
     # window=4 so old turns drop out of the request, but facts persist via prefix.
     captured = []
