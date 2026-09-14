@@ -239,6 +239,13 @@ python -m llm_bot --agent assistant --session my-conversation   # resume
 Inside the interactive chat, type `/history` (or `/история`) to print all
 previous messages of the current session; `exit`/`quit`/Ctrl-D leave the chat.
 
+When you resume an existing session (with `--session`), the CLI prints a
+`[session]` line to stderr with how much context is loaded: the number of
+messages in the history and, depending on the active context strategy, the
+sliding-window size (`окно`), the sticky-fact count (`фактов`), or the list of
+dialogue branches with the current one marked (`ветки [<current>]: ...`). A
+rolling-compression summary is reported as `summary: N симв.`.
+
 A single one-shot turn via an agent:
 
 ```bash
