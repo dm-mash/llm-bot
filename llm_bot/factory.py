@@ -27,6 +27,13 @@ from llm_bot.context_strategies import (
 )
 from llm_bot.diagnostics import DetailListener
 from llm_bot.gigachat import GigaChatTokenProvider
+from llm_bot.memory import (
+    LongTermMemory,
+    MemoryLayers,
+    ShortTermMemory,
+    WorkingMemory,
+)
+from llm_bot.memory_store import JsonMemoryStore, MemoryStore
 from llm_bot.stores import AgentConfig, AgentStore, ModelConfig, ModelStore, SessionStore
 
 
@@ -155,6 +162,9 @@ def make_session(
     strategy: ContextStrategy | None = None,
     strategy_override: str | None = None,
     window_messages: int | None = None,
+    owner_id: str = "default",
+    memory_store: MemoryStore | None = None,
+    memory_auto_extract: bool = True,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
 
@@ -191,6 +201,21 @@ def make_session(
             override=strategy_override,
             window_messages=window_messages,
         )
+    # Build the explicit layered memory (short / working / long) when a store is
+    # provided. Long-term memory is isolated per (agent, owner) for privacy, so
+    # one user's durable data never leaks into another user's session.
+    memory = None
+    if memory_store is not None:
+        memory = MemoryLayers(
+            short=ShortTermMemory(),
+            working=WorkingMemory(
+                store=memory_store, session_id=session_id
+            ),
+            long=LongTermMemory(
+                store=memory_store, agent=agent_name, owner=owner_id
+            ),
+        )
+
     return Session(
         session_id,
         agent,
@@ -199,4 +224,6 @@ def make_session(
         compression=effective,
         on_compress=on_compress,
         strategy=effective_strategy,
+        memory=memory,
+        memory_auto_extract=memory_auto_extract,
     )

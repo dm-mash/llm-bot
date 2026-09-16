@@ -31,6 +31,7 @@ from llm_bot.diagnostics import (
 from llm_bot.factory import make_session
 from llm_bot.gigachat import build_gigachat_client
 from llm_bot.json_session_store import JsonSessionStore
+from llm_bot.memory_store import JsonMemoryStore
 from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
 
 
@@ -101,6 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Sliding-window size in MESSAGES kept in each request for "
         "--strategy sliding/facts (overrides the agent's context_window_messages).",
+    )
+    parser.add_argument(
+        "--owner",
+        default="default",
+        metavar="ID",
+        help="Owner/user namespace for long-term memory isolation (privacy). "
+        "Different owners of the same agent never share profile/decisions/knowledge.",
     )
 
     # Legacy direct-call options (used only without --agent).
@@ -204,8 +212,9 @@ def _print_resume_info(session: Session) -> None:
     history = getattr(session, "history", None) or []
     summary = getattr(session, "summary", "") or ""
     strategy = getattr(session, "strategy", None)
+    memory = getattr(session, "memory", None)
 
-    if not history and not summary and strategy is None:
+    if not history and not summary and strategy is None and memory is None:
         return
 
     parts = [f"сообщений в истории: {len(history)}"]
@@ -230,6 +239,11 @@ def _print_resume_info(session: Session) -> None:
                 f"*{b}*" if b == current else b for b in branches
             )
             parts.append(f"ветки [{current}]: {rendered}")
+
+    if memory is not None:
+        owner = getattr(memory.long, "owner", "")
+        parts.append(f"owner={owner}")
+        parts.append(f"память: working={len(memory.working)} long={len(memory.long)}")
 
     print("[session] " + ", ".join(parts), file=sys.stderr)
 
@@ -283,6 +297,31 @@ def _print_compression(session: Session) -> None:
     print("[compression] " + ", ".join(parts), file=sys.stderr)
 
 
+def _print_memory(session: Session) -> None:
+    """Print a service message to stderr when memory was just auto-extracted.
+
+    Reports how many facts were written to the working vs long-term layers and
+    the tokens the classifier call cost. Uses ``getattr`` so lightweight fakes
+    that only implement ``chat`` do not need to expose memory internals.
+    """
+    memory = getattr(session, "memory", None)
+    if memory is None:
+        return
+    event = getattr(session, "last_memory_event", None)
+    if event is None:
+        return
+    written = len(event.working_written) + len(event.long_term_written)
+    parts = [
+        f"память: working={len(memory.working)} long={len(memory.long)}",
+        f"добавлено фактов: {written}",
+        f"токены классификации: {event.total_tokens}",
+    ]
+    total = getattr(session, "total_memory_extractions", 0)
+    if total:
+        parts.append(f"(всего ходов с извлечением: {total})")
+    print("[memory] " + ", ".join(parts), file=sys.stderr)
+
+
 def _run_agent_chat(
     agent_name: str,
     *,
@@ -291,11 +330,13 @@ def _run_agent_chat(
     detail_listener: DetailListener | None,
     strategy_override: str | None = None,
     window_messages: int | None = None,
+    owner_id: str = "default",
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
     model_store = YamlModelStore()
     session_store = JsonSessionStore()
+    memory_store = JsonMemoryStore()
     session_id = session_id or _new_session_id(agent_name)
 
     session = make_session(
@@ -304,6 +345,8 @@ def _run_agent_chat(
         model_store=model_store,
         agent_store=agent_store,
         session_store=session_store,
+        memory_store=memory_store,
+        owner_id=owner_id,
         detail_listener=detail_listener,
         strategy_override=strategy_override,
         window_messages=window_messages,
@@ -321,6 +364,7 @@ def _run_agent_chat(
         print(result.reply)
         _print_usage(session)
         _print_compression(session)
+        _print_memory(session)
         return 0
 
     return _interactive_loop(session)
@@ -499,6 +543,7 @@ def _interactive_loop(session: Session) -> int:
                 continue
             _print_usage(session)
             _print_compression(session)
+            _print_memory(session)
     except KeyboardInterrupt:
         pass
     return 0
@@ -637,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
             detail_listener=detail_listener,
             strategy_override=args.strategy,
             window_messages=args.window_messages,
+            owner_id=args.owner,
         )
 
     # Legacy path.

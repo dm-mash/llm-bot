@@ -12,6 +12,7 @@ reply text.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 from llm_bot.client import ContextOverflowError, ContextTooLargeError, LLMClient
@@ -22,6 +23,7 @@ from llm_bot.compress import (
     summarize_prompt,
 )
 from llm_bot.context_strategies import ContextStrategy
+from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.tokens import (
     DEFAULT_CONTEXT_WINDOW,
@@ -31,6 +33,8 @@ from llm_bot.tokens import (
     count_messages_tokens,
     merge_provider_usage,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_text(text: str) -> str:
@@ -183,13 +187,25 @@ class Session:
         compression: CompressionSettings | None = None,
         on_compress: Callable[[CompressionEvent], None] | None = None,
         strategy: ContextStrategy | None = None,
+        memory: MemoryLayers | None = None,
+        memory_auto_extract: bool = True,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
         self._store = store
+        self._memory = memory
+        # When enabled, after each turn the reply is classified via a small LLM
+        # call and the extracted facts are written explicitly into the working /
+        # long-term layers (see ``extract_memory``).
+        self._memory_auto_extract = memory_auto_extract
+        self._memory_events: list[MemoryEvent] = []
         self._history = (
             list(history) if history is not None else store.load(session_id)
         )
+        if memory is not None:
+            memory.short.clear()
+            for msg in self._history:
+                memory.short.push(msg)
         # Token usage of the most recent turn (see ``chat`` / ``chat_with_details``).
         self.last_usage: TokenUsage | None = None
         # Context compression. When enabled, the older part of the history is
@@ -232,6 +248,42 @@ class Session:
     def strategy(self) -> ContextStrategy | None:
         """The active context-management strategy, or ``None`` (full history)."""
         return self._strategy
+
+    @property
+    def memory(self) -> MemoryLayers | None:
+        """The session's explicit layered memory (short / working / long).
+
+        ``None`` when the session was created without memory wiring. When set,
+        durable blocks (working + long-term) are injected ahead of the system
+        prompt on every turn and each dialog message is mirrored into the
+        short-term layer.
+        """
+        return self._memory
+
+    @property
+    def memory_auto_extract(self) -> bool:
+        """Whether each turn's reply is auto-classified into working/long-term."""
+        return self._memory_auto_extract
+
+    @property
+    def memory_events(self) -> list[MemoryEvent]:
+        """Every automatic memory-extraction event recorded in this session."""
+        return list(self._memory_events)
+
+    @property
+    def last_memory_event(self) -> MemoryEvent | None:
+        """The most recent memory-extraction event, or ``None`` if none happened."""
+        return self._memory_events[-1] if self._memory_events else None
+
+    @property
+    def total_memory_extractions(self) -> int:
+        """How many turns were classified into durable memory."""
+        return len(self._memory_events)
+
+    @property
+    def total_memory_tokens(self) -> int:
+        """Total tokens spent on memory-classification calls across the session."""
+        return sum(e.total_tokens for e in self._memory_events)
 
     # -- Branching helpers (only meaningful for the "branching" strategy) ----- #
 
@@ -338,11 +390,25 @@ class Session:
         # 2. Rolling-summary compression folds the oldest messages into a running
         #    summary *in memory* here; the result is only committed after the
         #    budget checks pass.
+        # Mirror the user message into the short-term (current dialog) layer.
+        if self._memory is not None:
+            self._memory.short.push(user_msg)
+
+        # Durable memory (long-term profile/decisions + working task data) is
+        # injected as a prefix so it is visible ahead of the system prompt on
+        # every turn, even under a small sliding window or a fresh session.
+        memory_prefix = (
+            self._memory.prefix_messages() if self._memory is not None else []
+        )
+
         prepared = None
         if self._strategy is not None:
             prepared = self._strategy.prepare(user_msg)
+            # Combine the strategy's own durable prefix (e.g. sticky facts) with
+            # the layered-memory prefix, long-term memory first.
+            prefix = [*memory_prefix, *prepared.prefix]
             messages = self.agent.build_messages(
-                prepared.request_history, prefix=prepared.prefix
+                prepared.request_history, prefix=prefix
             )
         else:
             projected_history = [*self._history, user_msg]
@@ -354,9 +420,11 @@ class Session:
                 )
 
             # Build the exact stack that would go to the model (summary + system +
-            # (possibly compressed) history).
+            # (possibly compressed) history), injecting durable memory as prefix.
             messages = self.agent.build_messages(
-                projected_history, summary=projected_summary
+                projected_history,
+                summary=projected_summary,
+                prefix=memory_prefix or None,
             )
         # Defensive guard: history may also carry surrogates from earlier loads,
         # so sanitize the whole stack before handing it to the HTTP client.
@@ -416,6 +484,28 @@ class Session:
                     self._on_compress(event)
 
         reply = self.agent.client.chat(messages)
+
+        # Mirror the assistant reply into the short-term (current dialog) layer.
+        if self._memory is not None:
+            self._memory.short.push({"role": "assistant", "content": reply})
+
+        # Optionally classify this completed turn into working / long-term memory
+        # via a small LLM call, writing extracted facts EXPLICITLY to their layers.
+        if (
+            self._memory is not None
+            and self._memory_auto_extract
+        ):
+            try:
+                event = extract_memory(
+                    self._memory,
+                    user_msg,
+                    reply,
+                    self.agent.client.chat,
+                )
+            except Exception:  # noqa: BLE001 - never let memory break the turn
+                logger.exception("[memory] авто-классификация не удалась")
+                event = MemoryEvent(recognized=False)
+            self._memory_events.append(event)
 
         provider_usage = self.agent.client.last_usage
         reply_tokens = count_message_tokens({"role": "assistant", "content": reply})
