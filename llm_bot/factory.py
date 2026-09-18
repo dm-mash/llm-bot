@@ -34,7 +34,15 @@ from llm_bot.memory import (
     WorkingMemory,
 )
 from llm_bot.memory_store import JsonMemoryStore, MemoryStore
-from llm_bot.stores import AgentConfig, AgentStore, ModelConfig, ModelStore, SessionStore
+from llm_bot.profiles import apply_profile
+from llm_bot.stores import (
+    AgentConfig,
+    AgentStore,
+    ModelConfig,
+    ModelStore,
+    ProfileStore,
+    SessionStore,
+)
 
 
 def llm_config_for(
@@ -82,6 +90,30 @@ def build_client(
     )
 
 
+def make_agent_from_config(
+    agent_config: AgentConfig,
+    *,
+    model_store: ModelStore,
+    transport: httpx.BaseTransport | None = None,
+    detail_listener: DetailListener | None = None,
+) -> Agent:
+    """Build an :class:`Agent` from an (already composed) :class:`AgentConfig`.
+
+    This is the low-level half of :func:`make_agent`; it exists so callers that
+    pre-compose the config (e.g. with a personalization profile via
+    :func:`llm_bot.profiles.apply_profile`) can reuse the client wiring without
+    re-reading the agent store.
+    """
+    model_config = model_store.get(agent_config.model)
+    client = build_client(
+        model_config,
+        agent_config,
+        transport=transport,
+        detail_listener=detail_listener,
+    )
+    return Agent(agent_config, client=client)
+
+
 def make_agent(
     agent_name: str,
     *,
@@ -92,14 +124,12 @@ def make_agent(
 ) -> Agent:
     """Build an :class:`Agent` by resolving its config and referenced model."""
     agent_config = agent_store.get(agent_name)
-    model_config = model_store.get(agent_config.model)
-    client = build_client(
-        model_config,
+    return make_agent_from_config(
         agent_config,
+        model_store=model_store,
         transport=transport,
         detail_listener=detail_listener,
     )
-    return Agent(agent_config, client=client)
 
 
 def make_strategy(
@@ -165,6 +195,8 @@ def make_session(
     owner_id: str = "default",
     memory_store: MemoryStore | None = None,
     memory_auto_extract: bool = True,
+    profile: str | None = None,
+    profile_store: ProfileStore | None = None,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
 
@@ -182,11 +214,25 @@ def make_session(
     When compression triggers, *on_compress* (if given) is called with a
     :class:`~llm_bot.compress.CompressionEvent` so callers (e.g. a CLI) can print
     a service message about the fold and its token impact.
+
+    Personalization: when *profile* names an entry from a
+    :class:`~llm_bot.stores.ProfileStore` (``data/profiles.yaml`` by default),
+    it is composed onto the agent config BEFORE the client is built (see
+    :func:`llm_bot.profiles.apply_profile`). This is orchestration config, not
+    memory — the profile only changes the composed agent behaviour; no profile
+    data is ever written to or read from the memory layers.
     """
-    agent = make_agent(
-        agent_name,
+    agent_config = agent_store.get(agent_name)
+    if profile is not None:
+        if profile_store is None:
+            from llm_bot.yaml_stores import YamlProfileStore
+
+            profile_store = YamlProfileStore()
+        profile_config = profile_store.get(profile)
+        agent_config = apply_profile(agent_config, profile_config)
+    agent = make_agent_from_config(
+        agent_config,
         model_store=model_store,
-        agent_store=agent_store,
         transport=transport,
         detail_listener=detail_listener,
     )

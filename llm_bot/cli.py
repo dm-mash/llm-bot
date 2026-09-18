@@ -3,8 +3,11 @@
 Usage examples:
     python -m llm_bot --agent assistant                 # interactive chat
     python -m llm_bot --agent assistant --session my1   # resume session
+    python -m llm_bot --agent assistant --profile dev   # personalized chat
     python -m llm_bot --agent translator "Hello"        # one-shot via agent
     python -m llm_bot --list-agents                     # show available agents
+    python -m llm_bot --list-profiles                   # show available profiles
+    python -m llm_bot --show-profile dev                # inspect one profile
 
 Legacy (single direct call, no agent):
     python -m llm_bot "Hello, who are you?"
@@ -32,7 +35,12 @@ from llm_bot.factory import make_session
 from llm_bot.gigachat import build_gigachat_client
 from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.memory_store import JsonMemoryStore
-from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
+from llm_bot.profiles import profile_prompt_block
+from llm_bot.yaml_stores import (
+    YamlAgentStore,
+    YamlModelStore,
+    YamlProfileStore,
+)
 
 
 def _sanitize_text(text: str) -> str:
@@ -109,6 +117,25 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ID",
         help="Owner/user namespace for long-term memory isolation (privacy). "
         "Different owners of the same agent never share profile/decisions/knowledge.",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        metavar="NAME",
+        help="Personalization profile from data/profiles.yaml (style, format, "
+        "constraints). Applied on top of the agent config at composition time; "
+        "memory is not affected.",
+    )
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="List the names of all defined profiles and exit.",
+    )
+    parser.add_argument(
+        "--show-profile",
+        default=None,
+        metavar="NAME",
+        help="Show one profile's settings and exit.",
     )
 
     # Legacy direct-call options (used only without --agent).
@@ -331,6 +358,7 @@ def _run_agent_chat(
     strategy_override: str | None = None,
     window_messages: int | None = None,
     owner_id: str = "default",
+    profile_name: str | None = None,
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
@@ -350,6 +378,7 @@ def _run_agent_chat(
         detail_listener=detail_listener,
         strategy_override=strategy_override,
         window_messages=window_messages,
+        profile=profile_name,
     )
 
     # When resuming an existing conversation, surface how much context is loaded.
@@ -617,6 +646,89 @@ def _read_interactive() -> str:
     return "\n".join(lines).strip()
 
 
+def _print_profiles() -> int:
+    """Print detailed information about every defined profile."""
+    profile_store = YamlProfileStore()
+    try:
+        names = profile_store.list()
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not names:
+        print("No profiles defined.", file=sys.stderr)
+        return 0
+
+    for name in names:
+        profile = profile_store.get(name)
+        print(f"[{name}]")
+        if profile.style:
+            print(f"  style       : {profile.style}")
+        if profile.format:
+            print(f"  format      : {profile.format}")
+        if profile.expertise:
+            print(f"  expertise   : {profile.expertise}")
+        if profile.language:
+            print(f"  language    : {profile.language}")
+        if profile.max_response_words is not None:
+            print(f"  max words   : {profile.max_response_words}")
+        if profile.temperature is not None:
+            print(f"  temperature : {profile.temperature}")
+        if profile.forbidden_topics:
+            print(f"  forbidden   : {', '.join(profile.forbidden_topics)}")
+        if profile.interests:
+            print(f"  interests   : {', '.join(profile.interests)}")
+        if profile.extra_instructions:
+            print(f"  extra       : {profile.extra_instructions!r}")
+        print()
+    return 0
+
+
+def _show_profile(name: str) -> int:
+    """Print one profile's settings and the prompt block it generates."""
+    profile_store = YamlProfileStore()
+    try:
+        profile = profile_store.get(name)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyError:
+        try:
+            available = ", ".join(profile_store.list()) or "(none)"
+        except FileNotFoundError:
+            available = "(profiles.yaml not found)"
+        print(
+            f"error: unknown profile '{name}'. Available: {available}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"[{profile.name}]")
+    for field_name in (
+        "style",
+        "format",
+        "expertise",
+        "language",
+        "max_response_words",
+        "temperature",
+    ):
+        value = getattr(profile, field_name)
+        if value is not None:
+            print(f"  {field_name.replace('_', ' ')}: {value}")
+    if profile.forbidden_topics:
+        print(f"  forbidden topics: {', '.join(profile.forbidden_topics)}")
+    if profile.interests:
+        print(f"  interests: {', '.join(profile.interests)}")
+    if profile.extra_instructions:
+        print(f"  extra instructions: {profile.extra_instructions!r}")
+
+    block = profile_prompt_block(profile)
+    if block:
+        print("\nGenerated prompt block:")
+        for line in block.splitlines():
+            print(f"  {line}")
+    return 0
+
+
 def _print_agents() -> int:
     """Print detailed information about every defined agent."""
     agent_store = YamlAgentStore()
@@ -667,6 +779,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_agents:
         return _print_agents()
 
+    if args.list_profiles:
+        return _print_profiles()
+
+    if args.show_profile:
+        return _show_profile(args.show_profile)
+
+    if args.profile and not args.agent:
+        print(
+            "error: --profile requires --agent (profiles personalize an "
+            "agent's behaviour).",
+            file=sys.stderr,
+        )
+        return 2
+
     detail_listener = _DetailPrinter() if args.details else None
 
     if args.agent:
@@ -683,6 +809,7 @@ def main(argv: list[str] | None = None) -> int:
             strategy_override=args.strategy,
             window_messages=args.window_messages,
             owner_id=args.owner,
+            profile_name=args.profile,
         )
 
     # Legacy path.

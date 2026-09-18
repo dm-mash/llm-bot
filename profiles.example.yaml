@@ -1,0 +1,59 @@
+# Copy this file to data/profiles.yaml and fill in your values.
+#
+# This file defines PROFILES — orchestration-level personalization. A profile
+# declares HOW an agent behaves for a given user or task: communication style,
+# response format, expertise assumptions and constraints.
+#
+# A profile is NOT memory. Memory (data/memory/) accumulates learned dialog
+# data (facts, decisions); a profile is static config you edit here, mirroring
+# how agents.yaml defines roles and models.yaml defines connections.
+#
+# Apply a profile at launch (composed onto the agent config before any
+# request; no profile data ever touches the memory layers):
+#
+#   python -m llm_bot --agent assistant --profile developer
+#   python -m llm_bot --list-profiles
+#   python -m llm_bot --show-profile developer
+#
+# Fields (all optional unless noted):
+#   style               formal | casual | technical | friendly | professional
+#   format              concise | detailed | structured | conversational | bullet_points
+#   expertise           beginner | intermediate | expert
+#   language            response language, e.g. "ru" ("" = no override)
+#   max_response_words  brevity cap in words (overrides the agent's value)
+#   temperature         generation temperature override (e.g. 0.2 for precision)
+#   extra_instructions  free-form additional directives
+#   forbidden_topics    list of topics to avoid
+#   interests           list of interests (used to tailor examples)
+
+profiles:
+  developer:
+    style: technical
+    format: concise
+    expertise: expert
+    language: ru
+    max_response_words: 200
+    temperature: 0.3
+    extra_instructions: "Приводи примеры кода на Python. Термины не упрощай."
+    forbidden_topics: []
+    interests: [python, software architecture, databases]
+
+  student:
+    style: friendly
+    format: structured
+    expertise: beginner
+    language: ru
+    max_response_words: 400
+    extra_instructions: "Объясняй пошагово, приводи аналогии и простые примеры."
+    forbidden_topics: []
+    interests: []
+
+  child:
+    style: friendly
+    format: conversational
+    expertise: beginner
+    language: ru
+    max_response_words: 100
+    extra_instructions: "Только простые слова и короткие предложения, добрый тон."
+    forbidden_topics: [насилие, оружие]
+    interests: [космос, динозавры, игры]

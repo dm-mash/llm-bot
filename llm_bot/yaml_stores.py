@@ -13,7 +13,14 @@ from typing import Any
 
 import yaml
 
-from llm_bot.stores import AgentConfig, AgentStore, ModelConfig, ModelStore
+from llm_bot.stores import (
+    AgentConfig,
+    AgentStore,
+    ModelConfig,
+    ModelStore,
+    ProfileConfig,
+    ProfileStore,
+)
 
 
 class _YamlFile:
@@ -80,6 +87,24 @@ class YamlAgentStore:
 
     def get(self, name: str) -> AgentConfig:
         return AgentConfig.from_dict(name, self._file.item(name))
+
+    def list(self) -> list[str]:
+        return self._file.names()
+
+
+class YamlProfileStore:
+    """Loads :class:`ProfileConfig` entries from a ``profiles.yaml`` file.
+
+    Mirrors :class:`YamlAgentStore`: the file has a top-level ``profiles`` key
+    mapping profile name -> settings. Profiles are orchestration config (style,
+    format, constraints) — see :mod:`llm_bot.profiles`.
+    """
+
+    def __init__(self, path: str = "data/profiles.yaml") -> None:
+        self._file = _YamlFile(path, "profiles")
+
+    def get(self, name: str) -> ProfileConfig:
+        return ProfileConfig.from_dict(name, self._file.item(name))
 
     def list(self) -> list[str]:
         return self._file.names()

@@ -216,6 +216,62 @@ def _opt_str(value: Any) -> str | None:
     return text or None
 
 
+@dataclass(frozen=True)
+class ProfileConfig:
+    """Orchestration-level personalization: HOW the agent behaves for a user.
+
+    A profile is static configuration (declared in ``data/profiles.yaml``), NOT
+    memory: it never stores learned dialog data. It is composed onto an
+    :class:`AgentConfig` at composition time via
+    :func:`llm_bot.profiles.apply_profile`.
+
+    Attributes:
+        name: Profile key (same as the YAML mapping key).
+        style: Communication style (``formal`` / ``casual`` / ``technical`` /
+            ``friendly`` / ``professional``).
+        format: Response format (``concise`` / ``detailed`` / ``structured`` /
+            ``conversational`` / ``bullet_points``).
+        expertise: User expertise level (``beginner`` / ``intermediate`` /
+            ``expert``).
+        language: Response language (ISO code or name). Empty = no override.
+        max_response_words: Brevity cap in words (overrides the agent's value
+            when set).
+        temperature: Generation temperature override (when set).
+        extra_instructions: Free-form additional directives.
+        forbidden_topics: Topics the assistant must not discuss.
+        interests: User interests, used to tailor examples.
+    """
+
+    name: str
+    style: str = ""
+    format: str = ""
+    expertise: str = ""
+    language: str = ""
+    max_response_words: int | None = None
+    temperature: float | None = None
+    extra_instructions: str = ""
+    forbidden_topics: list[str] = field(default_factory=list)
+    interests: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, name: str, data: dict[str, Any]) -> "ProfileConfig":
+        """Build a :class:`ProfileConfig` from a raw YAML/dict entry."""
+        raw_topics = data.get("forbidden_topics") or []
+        raw_interests = data.get("interests") or []
+        return cls(
+            name=name,
+            style=str(data.get("style", "")).strip(),
+            format=str(data.get("format", "")).strip(),
+            expertise=str(data.get("expertise", "")).strip(),
+            language=str(data.get("language", "")).strip(),
+            max_response_words=_opt_int(data.get("max_response_words")),
+            temperature=_opt_float(data.get("temperature")),
+            extra_instructions=str(data.get("extra_instructions", "")).strip(),
+            forbidden_topics=[str(t) for t in raw_topics if str(t).strip()],
+            interests=[str(i) for i in raw_interests if str(i).strip()],
+        )
+
+
 @runtime_checkable
 class ModelStore(Protocol):
     """Read access to LLM model/provider credentials by name."""
@@ -229,6 +285,14 @@ class AgentStore(Protocol):
     """Read access to agent definitions by name."""
 
     def get(self, name: str) -> AgentConfig: ...
+    def list(self) -> list[str]: ...
+
+
+@runtime_checkable
+class ProfileStore(Protocol):
+    """Read access to personalization profile definitions by name."""
+
+    def get(self, name: str) -> ProfileConfig: ...
     def list(self) -> list[str]: ...
 
 

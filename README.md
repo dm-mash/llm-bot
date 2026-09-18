@@ -26,6 +26,10 @@ trivial to add a **web interface** later without touching the logic.
   can define any number of LLM profiles.
 - **Named agents** — roles defined in `data/agents.yaml` (system prompt,
   temperature, max tokens) that reference a model profile.
+- **Personalization profiles** — orchestration config in `data/profiles.yaml`
+  (style, format, expertise, constraints) composed onto an agent at session
+  creation (`--profile developer`); memory is never touched by profiles
+  (see "Profiles (personalization)" below).
 - **Persistent chat sessions** — each conversation keeps its own history in
   `data/sessions/*.json` and survives process restarts.
 - Automatic retries with exponential backoff for transient failures
@@ -58,8 +62,9 @@ llm-bot/
 │   ├── client.py              # LLMClient — transport + retries + errors + detail events
 │   ├── compress.py            # ContextCompressor + CompressionSettings (rolling summary)
 │   ├── context_strategies.py  # SlidingWindow / StickyFacts / Branching (pluggable strategies)
-│   ├── stores.py              # Repository interfaces (ModelStore/AgentStore/SessionStore)
-│   ├── yaml_stores.py         # YamlModelStore / YamlAgentStore (data/*.yaml)
+│   ├── profiles.py            # apply_profile: compose ProfileConfig onto AgentConfig
+│   ├── stores.py              # Repository interfaces (ModelStore/AgentStore/ProfileStore/SessionStore)
+│   ├── yaml_stores.py         # YamlModelStore / YamlAgentStore / YamlProfileStore (data/*.yaml)
 │   ├── json_session_store.py  # JsonSessionStore (data/sessions/*.json)
 │   ├── agent.py               # Agent (role) + Session (conversation with history)
 │   ├── factory.py             # Wiring: assemble client/agent/session from stores
@@ -224,6 +229,69 @@ List available agents:
 python -m llm_bot --list-agents
 ```
 
+## Profiles (personalization)
+
+Profiles answer "HOW should the agent behave for THIS user/task" — the third
+config layer. The separation of concerns is strict:
+
+| Layer | File | Answers |
+|---|---|---|
+| Transport | `data/models.yaml` | which API and how to call it |
+| Role | `data/agents.yaml` | who the agent is (role, defaults) |
+| **Profile** | `data/profiles.yaml` | how to answer THIS user (style, format, constraints) |
+| Memory | `data/memory/` | what was learned from the dialog (facts, decisions) |
+
+A profile is **orchestration config, not memory**: it is declared in YAML like
+agents and models, applied once at session creation by
+[`apply_profile`](llm_bot/profiles.py) (system-prompt directives +
+`max_response_words`/`temperature` overrides), and never written to or read
+from the memory layers.
+
+Create the file from the template:
+
+```bash
+cp profiles.example.yaml data/profiles.yaml
+```
+
+Then personalize a chat (the launch command you already use, plus one flag):
+
+```bash
+python -m llm_bot --agent assistant --profile developer   # terse, technical, code-first
+python -m llm_bot --agent assistant --profile student     # step-by-step, friendly
+python -m llm_bot --agent assistant                       # unchanged, no profile
+```
+
+Inspect profiles without chatting:
+
+```bash
+python -m llm_bot --list-profiles            # all profiles with settings
+python -m llm_bot --show-profile developer   # one profile + its generated prompt block
+```
+
+Unknown profile names fail fast with the list of available ones — the same
+behaviour as unknown agents.
+
+Verify that different profiles give observably different answers to the SAME
+question (writes `results/compare_profiles.md` + `.json`):
+
+```bash
+python scripts/compare_profiles.py --profiles developer,student,child
+python scripts/compare_profiles.py --include-none   # add a no-profile baseline row
+```
+
+Programmatic composition (no CLI needed):
+
+```python
+from llm_bot.profiles import apply_profile
+from llm_bot.stores import AgentConfig, ProfileConfig
+from llm_bot.yaml_stores import YamlProfileStore
+
+agent = AgentConfig(name="assistant", model="gpt4o",
+                    system_prompt="Ты полезный помощник.")
+profile = YamlProfileStore().get("developer")
+personalized = apply_profile(agent, profile)
+```
+
 ## Usage
 
 ### Interactive chat with an agent
@@ -250,6 +318,14 @@ A single one-shot turn via an agent:
 
 ```bash
 python -m llm_bot --agent translator "Good morning"
+```
+
+A personalized turn — same agent, different behaviour via a profile
+(see "Profiles (personalization)" above):
+
+```bash
+python -m llm_bot --agent assistant --profile student "Объясни рекурсию"
+python -m llm_bot --agent assistant --profile developer --session dev1   # resumes a session too
 ```
 
 ### Legacy: single direct call
