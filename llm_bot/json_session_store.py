@@ -100,6 +100,29 @@ class JsonSessionStore:
             return {}
         return {str(k): str(v) for k, v in raw.items()}
 
+    def load_task_state(self, session_id: str) -> dict[str, Any] | None:
+        """Return the persisted task-state snapshot (``None`` when absent)."""
+        path = self._path(session_id)
+        data = self._read_payload(session_id, path)
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("task_state")
+        return raw if isinstance(raw, dict) else None
+
+    def save_task_state(self, session_id: str, state: dict[str, Any]) -> None:
+        """Persist the task-state snapshot alongside the existing session data."""
+        data = self._read_payload(session_id, self._path(session_id))
+        history, summary = self._split(data)
+        self._save_compound(
+            session_id,
+            history,
+            summary=summary,
+            facts=self.load_facts(session_id),
+            branches=self._load_branches_from(data),
+            current_branch=self._load_current_from(data),
+            task_state=state,
+        )
+
     def load_branches(
         self, session_id: str, *, default_branch: str
     ) -> tuple[dict[str, list[dict[str, str]]], str]:
@@ -221,8 +244,18 @@ class JsonSessionStore:
         facts: dict[str, str] | None,
         branches: dict[str, list[dict[str, str]]] | None,
         current_branch: str | None,
+        task_state: dict[str, Any] | None = None,
     ) -> None:
-        """Write the full compound session payload, preserving all state."""
+        """Write the full compound session payload, preserving all state.
+
+        When *task_state* is ``None`` (the default for history/summary/facts/
+        branch saves), any previously persisted task state is carried over
+        untouched, so partial writers never drop each other's data.
+        """
+        if task_state is None:
+            task_state = self._load_task_state_from_payload(
+                self._read_payload(session_id, self._path(session_id))
+            )
         path = self._path(session_id)
         payload: dict[str, Any] = {
             "summary": summary,
@@ -234,8 +267,18 @@ class JsonSessionStore:
             payload["branches"] = branches
         if current_branch:
             payload["current_branch"] = current_branch
+        if task_state:
+            payload["task_state"] = task_state
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _load_task_state_from_payload(data: Any) -> dict[str, Any] | None:
+        """Extract the ``task_state`` mapping from a raw session payload."""
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("task_state")
+        return raw if isinstance(raw, dict) else None
 
     def list(self) -> list[str]:
         names = sorted(

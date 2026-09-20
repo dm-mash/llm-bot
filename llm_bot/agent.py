@@ -25,6 +25,12 @@ from llm_bot.compress import (
 from llm_bot.context_strategies import ContextStrategy
 from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
 from llm_bot.stores import AgentConfig, SessionStore
+from llm_bot.task_state import (
+    TaskDetectionEvent,
+    TaskState,
+    TaskStateMachine,
+    detect_task_turn,
+)
 from llm_bot.tokens import (
     DEFAULT_CONTEXT_WINDOW,
     ChatResult,
@@ -189,6 +195,8 @@ class Session:
         strategy: ContextStrategy | None = None,
         memory: MemoryLayers | None = None,
         memory_auto_extract: bool = True,
+        task: TaskStateMachine | None = None,
+        task_auto_detect: bool = True,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -232,6 +240,23 @@ class Session:
         self._strategy = strategy
         if self._strategy is not None:
             self._strategy.load_state(store, session_id)
+        # Formalized task state (stage / step / expected action). When enabled,
+        # the machine loads its persisted snapshot via a change-hook and injects
+        # a rendered block into the request prefix so the model can continue the
+        # task without re-explanation after a pause or a process restart.
+        self._task = task
+        self._task_events: list[TaskDetectionEvent] = []
+        self._task_auto_detect = task_auto_detect
+        if self._task is not None:
+            saved = store.load_task_state(session_id)
+            if saved is not None:
+                self._task.load(TaskState.from_dict(saved))
+            self._task._on_change = self._persist_task_state
+
+    def _persist_task_state(self, state: TaskState) -> None:
+        """Persist the task snapshot whenever the machine changes it."""
+        if self._task is not None:
+            self._store.save_task_state(self.session_id, state.to_dict())
 
     @property
     def history(self) -> list[dict[str, str]]:
@@ -284,6 +309,38 @@ class Session:
     def total_memory_tokens(self) -> int:
         """Total tokens spent on memory-classification calls across the session."""
         return sum(e.total_tokens for e in self._memory_events)
+
+    # -- Task state machine -------------------------------------------------- #
+
+    @property
+    def task(self) -> TaskStateMachine | None:
+        """The session's task state machine, or ``None`` when not enabled."""
+        return self._task
+
+    @property
+    def task_state(self) -> TaskState | None:
+        """The current task snapshot, or ``None`` when the machine is off."""
+        return self._task.state if self._task is not None else None
+
+    @property
+    def task_events(self) -> list[TaskDetectionEvent]:
+        """Every auto-detection event recorded in this session."""
+        return list(self._task_events)
+
+    @property
+    def last_task_event(self) -> TaskDetectionEvent | None:
+        """The most recent task auto-detection event, or ``None``."""
+        return self._task_events[-1] if self._task_events else None
+
+    @property
+    def total_task_extractions(self) -> int:
+        """How many turns were classified into the task state machine."""
+        return len(self._task_events)
+
+    @property
+    def total_task_tokens(self) -> int:
+        """Total tokens spent on task-classification calls across the session."""
+        return sum(e.total_tokens for e in self._task_events)
 
     # -- Branching helpers (only meaningful for the "branching" strategy) ----- #
 
@@ -401,12 +458,23 @@ class Session:
             self._memory.prefix_messages() if self._memory is not None else []
         )
 
+        # Formalized task state is rendered as a prefix system message so the
+        # model sees stage/step/expected-action ahead of the role prompt on
+        # every turn (this is what makes "continue" work without re-explaining).
+        task_block = (
+            self._task.render_prompt_block() if self._task is not None else ""
+        )
+        task_prefix = (
+            [{"role": "system", "content": task_block}] if task_block else []
+        )
+
         prepared = None
         if self._strategy is not None:
             prepared = self._strategy.prepare(user_msg)
             # Combine the strategy's own durable prefix (e.g. sticky facts) with
-            # the layered-memory prefix, long-term memory first.
-            prefix = [*memory_prefix, *prepared.prefix]
+            # the layered-memory prefix and the task-state block, durable state
+            # first.
+            prefix = [*memory_prefix, *task_prefix, *prepared.prefix]
             messages = self.agent.build_messages(
                 prepared.request_history, prefix=prefix
             )
@@ -420,11 +488,12 @@ class Session:
                 )
 
             # Build the exact stack that would go to the model (summary + system +
-            # (possibly compressed) history), injecting durable memory as prefix.
+            # (possibly compressed) history), injecting durable memory and the
+            # task-state block as prefix.
             messages = self.agent.build_messages(
                 projected_history,
                 summary=projected_summary,
-                prefix=memory_prefix or None,
+                prefix=[*memory_prefix, *task_prefix] or None,
             )
         # Defensive guard: history may also carry surrogates from earlier loads,
         # so sanitize the whole stack before handing it to the HTTP client.
@@ -502,10 +571,37 @@ class Session:
                     reply,
                     self.agent.client.chat,
                 )
-            except Exception:  # noqa: BLE001 - never let memory break the turn
-                logger.exception("[memory] авто-классификация не удалась")
+            except Exception as exc:  # noqa: BLE001 - never let memory break the turn
+                # One concise line for the user; the full traceback goes to
+                # the debug log (visible with -v) instead of the terminal.
+                logger.error("[memory] авто-классификация не удалась: %s", exc)
+                logger.debug("[memory] авто-классификация trace:", exc_info=True)
                 event = MemoryEvent(recognized=False)
             self._memory_events.append(event)
+
+        # Optionally drive the task state machine from this completed turn via a
+        # small LLM call (task setup / stage hints / pause & resume phrases).
+        # Skip detection while paused: the task is explicitly stopped, and the
+        # detection call would waste tokens and risk rate limits.
+        if (
+            self._task is not None
+            and self._task_auto_detect
+            and not self._task.state.is_paused
+        ):
+            try:
+                task_event = detect_task_turn(
+                    self._task,
+                    user_msg,
+                    reply,
+                    self.agent.client.chat,
+                )
+            except Exception as exc:  # noqa: BLE001 - never let the task FSM break a turn
+                # One concise line for the user; the full traceback goes to
+                # the debug log (visible with -v) instead of the terminal.
+                logger.error("[task] авто-детект не удался: %s", exc)
+                logger.debug("[task] авто-детект trace:", exc_info=True)
+                task_event = TaskDetectionEvent(recognized=False)
+            self._task_events.append(task_event)
 
         provider_usage = self.agent.client.last_usage
         reply_tokens = count_message_tokens({"role": "assistant", "content": reply})

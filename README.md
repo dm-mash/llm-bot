@@ -46,6 +46,13 @@ trivial to add a **web interface** later without touching the logic.
   *without* summary, all selectable per-agent or per-session (`--strategy`):
   sliding window / sticky facts (key-value durable memory) / branching
   (see "Context strategies" below).
+- **Task state machine** — the work on a task is formalized as a finite-state
+  machine (stage `planning → execution → validation → done` + `paused`, current
+  step, expected action). The stage is recognized from the dialog by a small
+  LLM call or driven manually via `/task` commands; the snapshot is persisted
+  with the session and injected into the system context on every turn, so
+  after a pause or a process restart a bare «продолжай» is enough
+  (see "Task state machine" below).
 - **Comparison scripts** — reproducible experiments (`scripts/compare_compression.py`,
   `scripts/compare_context_strategies.py`) comparing answer quality and token spend
   across strategies.
@@ -62,6 +69,7 @@ llm-bot/
 │   ├── client.py              # LLMClient — transport + retries + errors + detail events
 │   ├── compress.py            # ContextCompressor + CompressionSettings (rolling summary)
 │   ├── context_strategies.py  # SlidingWindow / StickyFacts / Branching (pluggable strategies)
+│   ├── task_state.py          # TaskStateMachine: formal task stage/step/action FSM
 │   ├── profiles.py            # apply_profile: compose ProfileConfig onto AgentConfig
 │   ├── stores.py              # Repository interfaces (ModelStore/AgentStore/ProfileStore/SessionStore)
 │   ├── yaml_stores.py         # YamlModelStore / YamlAgentStore / YamlProfileStore (data/*.yaml)
@@ -79,6 +87,7 @@ llm-bot/
 │   ├── test_client.py         # LLMClient tests (mocked transport)
 │   ├── test_agent.py          # Agent + Session tests
 │   ├── test_compress.py       # context-compression tests
+│   ├── test_task_state.py     # task state machine tests
 │   ├── test_compare_compression.py
 │   ├── test_stores.py         # YAML/JSON store tests
 │   └── test_gigachat.py       # GigaChat token provider tests
@@ -595,6 +604,104 @@ A reproducible comparison on a shared "ТЗ" scenario is available:
 python scripts/compare_context_strategies.py
 ```
 and its analysis is in [`results/context_strategies_analysis.md`](results/context_strategies_analysis.md).
+
+### Task state machine
+
+The work on a task is formalized as a **finite-state machine**
+([`task_state.py`](llm_bot/task_state.py)) with three axes:
+
+* **stage** — the pipeline `planning → execution → validation → done`
+  enforced by a transition table (illegal jumps are rejected; `done` is
+  terminal);
+* **step** — what is being done right now;
+* **expected_action** — what should happen next.
+
+`paused` is a first-class state reachable from *any* non-terminal stage; it
+remembers the originating stage, so resume returns the machine exactly where
+it was.
+
+```mermaid
+stateDiagram-v2
+    [*] --> planning: start
+    planning --> execution: next
+    execution --> validation: next
+    validation --> done: next
+    planning --> paused: pause
+    execution --> paused: pause
+    validation --> paused: pause
+    paused --> planning: resume
+    paused --> execution: resume
+    paused --> validation: resume
+    done --> [*]
+```
+
+Two ways to drive the machine:
+
+* **auto-detect** (default) — after every turn a small LLM call recognizes a
+  task being set from the dialog, stage hints, and pause/resume phrases
+  (same technique as memory auto-extraction). Only *legal* transitions are
+  ever applied; a classifier failure never breaks the turn.
+* **manual** — slash-commands take priority over auto-detection:
+
+```text
+/task                      — status: stage, pause, step, expected action
+/task start <описание>     — start a task (stage = planning)
+/task step <текст>         — set the current step
+/task action <текст>       — set the expected action
+/task next                 — advance to the next pipeline stage
+/task pause                — pause from any stage
+/task resume               — continue (no re-explanation needed)
+/task reset                — drop the task state
+```
+
+Enable with `--task-state` (CLI override) or `task_state: true` in
+`data/agents.yaml`; `--no-task-detect` disables the automatic LLM call.
+
+The snapshot (stage / step / expected action / log) is persisted with the
+session (`task_state` key in `data/sessions/<id>.json`) and **injected as a
+system message into every request**. This is what makes the two key
+requirements work:
+
+* **pause at any stage** — `/task pause` from planning, execution or
+  validation (not from `done`; pausing an already-paused task is rejected,
+  so no duplicate log entries);
+* **continue without re-explaining** — after a pause *or a process restart*,
+  a fresh session restores the snapshot from the store and the model sees the
+  full task state, so a bare «продолжай» is enough.
+
+Pause is enforced on **two levels**:
+
+1. **Prompt directive** — while paused, the injected block carries a strict,
+   non-contradictory instruction («работа ПРИОСТАНОВЛЕНА — не выполняй шаги
+   задачи и не предлагай следующие»); the «Продолжай работу…» line is only
+   present when the task is active.
+2. **CLI hard gate** — in the interactive loop a paused task blocks ordinary
+   chat input entirely: messages are not sent to the model until an explicit
+   `/task resume` (control commands and `/task ...` still work). While
+   stopped, the auto-detection LLM call is skipped too, saving tokens.
+
+**Stages change what the model actually does** — each stage injects its own
+behaviour directive ([`_STAGE_DIRECTIVES`](llm_bot/task_state.py)):
+`planning` → "предлагай план, не реализуй"; `execution` → "реализуй текущий
+шаг, результат — артефакт"; `validation` → "проверяй по критериям, ничего
+нового"; `done` → "только итоговая сводка". Advancing a stage also auto-fills
+`expected_action` with a stage-typical default (a user-set action is kept), so
+after `/task next` the model immediately knows what is expected next.
+
+**Auto-turn on stage change** — `/task start`, `/task next` and `/task resume`
+immediately send the model one service turn («этап задачи изменился на … —
+действуй по состоянию задачи», see
+[`_task_auto_turn`](llm_bot/cli.py)), so the stage directive takes effect
+*right away* instead of waiting for the user's next message. The reply is
+printed in the chat; an `LLMError` is reported to stderr without aborting the
+command. `/task pause` deliberately sends **no** auto-turn (the model is never
+prompted while paused).
+
+Diagnostics: `session.task_state`, `session.task_events`,
+`session.total_task_tokens` (token spend of the detection calls).
+
+Verification on a real model: `python scripts/verify_task_state.py`
+(report: [`results/task_state_verification.md`](results/task_state_verification.md)).
 
 ### Context compression (rolling summary)
 

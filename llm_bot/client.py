@@ -175,6 +175,50 @@ def _extract_size(text: str, label: str) -> int | None:
         return None
 
 
+def _embedded_error(data: Any) -> tuple[str, bool, int | None] | None:
+    """Recognize a JSON body that carries an embedded ``error`` object.
+
+    Some gateways (e.g. OpenRouter in front of Nvidia) answer with HTTP 200
+    but put the upstream failure into the body::
+
+        {"error": {"message": "Upstream error from Nvidia: ...",
+                   "code": 502,
+                   "metadata": {"error_type": "provider_unavailable"}}}
+
+    Such a body has no ``choices`` and would otherwise surface as a
+    *permanent* "Unexpected response shape" error even though the failure is
+    a transient upstream outage that a retry can fix.
+
+    Returns ``(message, transient, code)`` where *message* is a clean,
+    user-facing error text (no raw dict dump), *transient* marks retryable
+    failures (embedded code 429/5xx or ``error_type=provider_unavailable``),
+    and *code* is the embedded numeric code when present. Returns ``None``
+    when the body is not an embedded-error payload.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("error"), dict):
+        return None
+    error = data["error"]
+    message = str(error.get("message") or "unknown upstream error").strip()
+    try:
+        code = int(error.get("code"))
+    except (TypeError, ValueError):
+        code = None
+    metadata = error.get("metadata")
+    error_type = (
+        str(metadata.get("error_type") or "").lower()
+        if isinstance(metadata, dict)
+        else ""
+    )
+    detail = f"Ошибка провайдера LLM: {message}"
+    if code is not None:
+        detail = f"Ошибка провайдера LLM (HTTP {code}): {message}"
+    transient = (
+        (code is not None and (code == 429 or code >= 500))
+        or error_type in {"provider_unavailable", "overloaded", "rate_limit_error"}
+    )
+    return detail, transient, code
+
+
 @runtime_checkable
 class TokenProvider(Protocol):
     """Provides a bearer access token to be sent as ``Authorization: Bearer ...``.
@@ -355,6 +399,16 @@ class LLMClient:
             )
         response.raise_for_status()
         data = response.json()
+        embedded = _embedded_error(data)
+        if embedded is not None:
+            # Gateway replied HTTP 200 but embedded the upstream failure in
+            # the body (no "choices"). Classify it as transient/permanent
+            # directly instead of falling through to a misleading shape error.
+            self._emit_response(response.status_code, attempt, elapsed_ms, data)
+            detail, transient, code = embedded
+            if transient:
+                raise _TransientHTTPError(code or 503, detail)
+            raise LLMRequestError(detail)
         self._emit_response(response.status_code, attempt, elapsed_ms, data)
         return data
 
@@ -382,8 +436,13 @@ class LLMClient:
             if attempt < self.config.max_retries:
                 self._sleep_between_retries(attempt)
 
+        detail = str(last_error) if last_error is not None else "unknown error"
+        # _TransientHTTPError truncates its str() to "HTTP <code>"; the body
+        # (with the provider's clean message) is surfaced in the final error.
+        if isinstance(last_error, _TransientHTTPError) and last_error.body:
+            detail = last_error.body
         raise LLMRetryExhaustedError(
-            f"LLM request failed after {self.config.max_retries + 1} attempts: {last_error}"
+            f"LLM request failed after {self.config.max_retries + 1} attempts: {detail}"
         ) from last_error
 
     def _sleep_between_retries(self, attempt: int) -> None:
@@ -455,6 +514,11 @@ class LLMClient:
             message = choice["message"]
             finish_reason = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError) as exc:
+            # Defense in depth: an embedded provider error that reaches this
+            # point still gets a clean message instead of a raw dict dump.
+            embedded = _embedded_error(data)
+            if embedded is not None:
+                raise LLMRequestError(embedded[0]) from exc
             raise LLMRequestError(f"Unexpected response shape from LLM API: {data!r}") from exc
 
         content = message.get("content")

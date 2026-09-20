@@ -36,6 +36,7 @@ from llm_bot.gigachat import build_gigachat_client
 from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.memory_store import JsonMemoryStore
 from llm_bot.profiles import profile_prompt_block
+from llm_bot.task_state import TaskStage
 from llm_bot.yaml_stores import (
     YamlAgentStore,
     YamlModelStore,
@@ -136,6 +137,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="NAME",
         help="Show one profile's settings and exit.",
+    )
+    parser.add_argument(
+        "--task-state",
+        action="store_true",
+        help="Enable the task state machine (stage planning/execution/validation/"
+        "done + pause) for this session; the stage/step/expected-action block is "
+        "injected into the system context on every turn. Takes precedence over "
+        "the agent's configured task_state.",
+    )
+    parser.add_argument(
+        "--no-task-detect",
+        action="store_true",
+        help="Disable automatic task detection (the small LLM call after each "
+        "turn that recognizes task setup, stage hints and pause/resume phrases).",
     )
 
     # Legacy direct-call options (used only without --agent).
@@ -359,6 +374,8 @@ def _run_agent_chat(
     window_messages: int | None = None,
     owner_id: str = "default",
     profile_name: str | None = None,
+    task_state: bool | None = None,
+    task_auto_detect: bool = True,
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
@@ -379,6 +396,8 @@ def _run_agent_chat(
         strategy_override=strategy_override,
         window_messages=window_messages,
         profile=profile_name,
+        task_state=task_state,
+        task_auto_detect=task_auto_detect,
     )
 
     # When resuming an existing conversation, surface how much context is loaded.
@@ -401,6 +420,9 @@ def _run_agent_chat(
 
 _HISTORY_COMMANDS = {"/history", "/история"}
 _BRANCH_COMMANDS = {"/branch", "/switch", "/branches"}
+_TASK_COMMANDS = {
+    "/task", "/задача",
+}
 
 # Words offered by tab-completion in the interactive prompt.
 _COMMAND_WORDS = [
@@ -409,6 +431,8 @@ _COMMAND_WORDS = [
     "/branch",
     "/switch",
     "/branches",
+    "/task",
+    "/задача",
     "exit",
     "quit",
 ]
@@ -536,6 +560,143 @@ def _handle_branch_command(session: Session, raw: str) -> bool:
     return True
 
 
+def _print_task_status(session: Session) -> None:
+    """Print the current task state (stage / pause / step / action)."""
+    state = session.task_state
+    if state is None:
+        print("[task] машина состояния задачи не включена "
+              "(запустите с --task-state).", file=sys.stderr)
+        return
+    if not state.description and state.stage is TaskStage.PLANNING \
+            and not state.step and not state.log:
+        print("[task] задача не начата. /task start <описание> — начать.",
+              file=sys.stderr)
+        return
+    stage = state.stage.value
+    if state.is_paused and state.paused_from is not None:
+        stage = f"{stage} (пауза; до паузы — {state.paused_from.value})"
+    print(f"[task] этап: {stage}", file=sys.stderr)
+    if state.description:
+        print(f"[task] задача: {state.description}", file=sys.stderr)
+    if state.step:
+        print(f"[task] шаг: {state.step}", file=sys.stderr)
+    if state.expected_action:
+        print(f"[task] ожидаемое действие: {state.expected_action}", file=sys.stderr)
+    for entry in state.log[-3:]:
+        print(f"[task]   • {entry}", file=sys.stderr)
+
+
+def _task_auto_turn(session: Session, stage: TaskStage) -> None:
+    """Send one service chat turn so the model reacts to a stage change now.
+
+    Called after ``/task start`` / ``next`` / ``resume``: without it the model
+    would only learn about the new stage when the user sends their next
+    message. The reply is printed like an ordinary chat answer. Failures are
+    reported to stderr but never abort the command.
+    """
+    service = (
+        f"Этап задачи изменился на '{stage.value}'. Действуй по актуальному "
+        "состоянию задачи (см. блок состояния)."
+    )
+    try:
+        reply = session.chat(service)
+    except LLMError as exc:
+        print(f"[task] авто-ход не удался: {exc}", file=sys.stderr)
+        return
+    print(f"[task] авто-ход (этап '{stage.value}'):", file=sys.stderr)
+    print(reply)
+
+
+def _handle_task_command(session: Session, raw: str) -> bool:
+    """Handle a task-state slash-command; True when the input was a command.
+
+    Supports ``/task`` (status), ``/task start <описание>``, ``/task step <текст>``,
+    ``/task action <текст>``, ``/task next``, ``/task pause``, ``/task resume``
+    and ``/task reset``. Manual commands take priority over auto-detection and
+    edit the machine directly; every change is persisted immediately.
+    """
+    cmd = raw.split(None, 1)
+    if cmd[0].lower() not in _TASK_COMMANDS:
+        return False
+    task = session.task
+    if task is None:
+        print("[task] машина состояния задачи не включена "
+              "(запустите с --task-state).", file=sys.stderr)
+        return True
+    arg = cmd[1].strip() if len(cmd) > 1 else ""
+    sub = arg.split(None, 1)
+    name = sub[0].lower() if sub else ""
+    rest = sub[1].strip() if len(sub) > 1 else ""
+
+    try:
+        if not name or name in {"status", "статус"}:
+            _print_task_status(session)
+        elif name in {"start", "начать"}:
+            if not rest:
+                print("[task] укажите описание: /task start <описание>",
+                      file=sys.stderr)
+            else:
+                state = task.start(rest)
+                print(f"[task] задача запущена (этап planning): {rest}",
+                      file=sys.stderr)
+                _task_auto_turn(session, state.stage)
+        elif name in {"step", "шаг"}:
+            if not rest:
+                print("[task] укажите текст: /task step <текст>", file=sys.stderr)
+            else:
+                task.set_step(rest)
+                print(f"[task] шаг: {rest}", file=sys.stderr)
+        elif name in {"action", "действие"}:
+            if not rest:
+                print("[task] укажите текст: /task action <текст>",
+                      file=sys.stderr)
+            else:
+                task.set_expected_action(rest)
+                print(f"[task] ожидаемое действие: {rest}", file=sys.stderr)
+        elif name in {"next", "далее"}:
+            state = task.next_stage()
+            print(f"[task] этап: {state.stage.value}", file=sys.stderr)
+            _task_auto_turn(session, state.stage)
+        elif name in {"pause", "пауза"}:
+            state = task.pause()
+            print(f"[task] пауза (был этап '{state.paused_from.value if state.paused_from else '?'}'); "
+                  "после перезапуска достаточно сказать «продолжай».",
+                  file=sys.stderr)
+            # No auto-turn on pause: the model must not be prompted while paused.
+        elif name in {"resume", "продолжить", "продолжай"}:
+            state = task.resume()
+            print(f"[task] продолжаем на этапе '{state.stage.value}'.",
+                  file=sys.stderr)
+            _task_auto_turn(session, state.stage)
+        elif name in {"reset", "сброс"}:
+            task.reset()
+            print("[task] состояние задачи сброшено.", file=sys.stderr)
+        else:
+            print("[task] неизвестная подкоманда. Доступны: status, start, step, "
+                  "action, next, pause, resume, reset.", file=sys.stderr)
+    except ValueError as exc:
+        print(f"[task] {exc}", file=sys.stderr)
+    return True
+
+
+def _task_paused_gate(session: Session, raw: str) -> bool:
+    """Return True when the input was consumed by the pause gate.
+
+    While the task is paused, ordinary chat input is NOT sent to the model
+    (hard-gate mode): the user is told to resume first. Control commands and
+    slash-commands still work.
+    """
+    task = getattr(session, "task", None)
+    if task is None or not task.state.is_paused:
+        return False
+    print(
+        "[task] задача на паузе — сообщение не отправлено. "
+        "/task resume — продолжить; /task — статус.",
+        file=sys.stderr,
+    )
+    return True
+
+
 def _interactive_loop(session: Session) -> int:
     """Run an interactive REPL-style chat against a session."""
     print(f"Starting chat with agent '{session.agent.name}' "
@@ -564,6 +725,12 @@ def _interactive_loop(session: Session) -> int:
                 _print_history(session)
                 continue
             if _handle_branch_command(session, raw):
+                continue
+            if _handle_task_command(session, raw):
+                continue
+            # Hard pause gate: while the task is paused, ordinary messages are
+            # NOT sent to the model until the user resumes explicitly.
+            if _task_paused_gate(session, raw):
                 continue
             try:
                 print(session.chat(raw))
@@ -810,6 +977,8 @@ def main(argv: list[str] | None = None) -> int:
             window_messages=args.window_messages,
             owner_id=args.owner,
             profile_name=args.profile,
+            task_state=True if args.task_state else None,
+            task_auto_detect=not args.no_task_detect,
         )
 
     # Legacy path.

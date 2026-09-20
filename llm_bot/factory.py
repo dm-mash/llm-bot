@@ -43,6 +43,7 @@ from llm_bot.stores import (
     ProfileStore,
     SessionStore,
 )
+from llm_bot.task_state import TaskStateMachine
 
 
 def llm_config_for(
@@ -197,6 +198,8 @@ def make_session(
     memory_auto_extract: bool = True,
     profile: str | None = None,
     profile_store: ProfileStore | None = None,
+    task_state: bool | None = None,
+    task_auto_detect: bool = True,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
 
@@ -221,6 +224,15 @@ def make_session(
     :func:`llm_bot.profiles.apply_profile`). This is orchestration config, not
     memory — the profile only changes the composed agent behaviour; no profile
     data is ever written to or read from the memory layers.
+
+    Task state machine: when *task_state* is true (or the agent config declares
+    ``task_state: true``), a :class:`~llm_bot.task_state.TaskStateMachine` is
+    attached to the session. It persists its snapshot (stage / step / expected
+    action) through the session store and injects a rendered block into the
+    request prefix so the model can continue the task without re-explanation
+    after a pause or a process restart. When auto-detection is on (default),
+    the machine also drives itself from the dialog after each turn via a small
+    LLM call (see :func:`llm_bot.task_state.detect_task_turn`).
     """
     agent_config = agent_store.get(agent_name)
     if profile is not None:
@@ -262,6 +274,14 @@ def make_session(
             ),
         )
 
+    # Task state machine: enabled explicitly via *task_state* or via the agent
+    # config; the explicit flag wins (mirrors strategy_override semantics).
+    task_enabled = (
+        task_state
+        if task_state is not None
+        else agent.config.task_state
+    )
+
     return Session(
         session_id,
         agent,
@@ -272,4 +292,12 @@ def make_session(
         strategy=effective_strategy,
         memory=memory,
         memory_auto_extract=memory_auto_extract,
+        task=(
+            TaskStateMachine()
+            if task_enabled
+            else None
+        ),
+        task_auto_detect=(
+            task_auto_detect and agent.config.task_auto_detect
+        ),
     )

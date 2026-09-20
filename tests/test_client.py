@@ -427,6 +427,78 @@ def test_unexpected_response_shape_raises():
         client.send_prompt("ping")
 
 
+def test_embedded_transient_error_is_retried_and_clean():
+    """An HTTP-200 body with an embedded upstream error (e.g. OpenRouter
+    proxying Nvidia's ResourceExhausted) must be treated as transient: the
+    client retries and, when the outage persists, raises a *clean* message
+    instead of a raw dict dump.
+    """
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "id": "gen-123",
+                "error": {
+                    "message": "Upstream error from Nvidia: ResourceExhausted",
+                    "code": 502,
+                    "metadata": {"error_type": "provider_unavailable"},
+                },
+            },
+        )
+
+    client = _make_client(handler)
+
+    with pytest.raises(LLMRetryExhaustedError, match="ResourceExhausted"):
+        client.send_prompt("ping")
+    assert calls["count"] == 3  # 1 attempt + max_retries=2
+
+
+def test_embedded_permanent_error_is_not_retried():
+    """An embedded error that is neither 429 nor 5xx stays permanent."""
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(
+            200,
+            json={"error": {"message": "Invalid model", "code": 400}},
+        )
+
+    client = _make_client(handler)
+
+    with pytest.raises(LLMRequestError, match="Invalid model") as exc_info:
+        client.send_prompt("ping")
+    assert not isinstance(exc_info.value, LLMRetryExhaustedError)
+    assert calls["count"] == 1
+
+
+def test_embedded_error_recovers_on_retry():
+    """When the upstream outage clears, the retry succeeds transparently."""
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "error": {
+                        "message": "provider overloaded",
+                        "code": 429,
+                        "metadata": {"error_type": "provider_unavailable"},
+                    }
+                },
+            )
+        return _ok_response()
+
+    client = _make_client(handler)
+    assert client.send_prompt("ping") == "Hello from the LLM!"
+    assert calls["count"] == 2
+
+
 def test_reasoning_model_empty_content_falls_back_to_reasoning():
     """A reasoning model (e.g. gpt-oss-120b on Groq) may return content == \"\"
     while placing its chain-of-thought in a separate reasoning field. The client

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from llm_bot.cli import (
+    _handle_task_command,
     _interactive_loop,
     _print_history,
     _print_resume_info,
     _read_input,
 )
+from llm_bot.client import LLMError
+from llm_bot.task_state import TaskStage, TaskState, TaskStateMachine
 
 
 class _FakeAgent:
@@ -29,6 +32,25 @@ class _FakeSession:
         self.history.append({"role": "user", "content": text})
         self.history.append({"role": "assistant", "content": "reply-ok"})
         return "reply-ok"
+
+
+class _TaskSession(_FakeSession):
+    """Fake session exposing a task machine, like ``Session`` does.
+
+    The real ``Session`` reads the machine through ``Session.task``; the fake
+    wraps a real :class:`TaskStateMachine` so CLI commands operate on actual
+    FSM transitions while ``chat`` stays recorded, not sent to a model.
+    """
+
+    def __init__(self, session_id: str = "s1", agent_name: str = "assistant") -> None:
+        super().__init__(session_id, agent_name, [])
+        self.task = TaskStateMachine()
+
+    @property
+    def task_state(self) -> TaskState:
+        # Mirrors ``Session.task_state`` (llm_bot/agent.py), which
+        # ``_print_task_status`` in llm_bot/cli.py reads.
+        return self.task.state
 
 
 def test_interactive_loop_prints_history_via_slash_commands(capsys, monkeypatch):
@@ -261,6 +283,61 @@ def test_read_input_falls_back_to_builtin_input(monkeypatch):
         "sys.stdin",
         type("PipedStdin", (), {"isatty": lambda self: False})(),
     )
+
+
+# -- auto-turn on stage change (/task start|next|resume) --------------------- #
+
+
+def test_task_next_sends_one_auto_turn(capsys):
+    """/task next must immediately send exactly one service chat turn."""
+    session = _TaskSession()
+    assert _handle_task_command(session, "/task start написать парсер") is True
+    assert len(session.chat_calls) == 1  # auto-turn after start
+    assert "planning" in session.chat_calls[0]
+
+    session.chat_calls.clear()
+    assert _handle_task_command(session, "/task next") is True
+    auto_turns = [c for c in session.chat_calls if "Этап задачи изменился" in c]
+    assert auto_turns == session.chat_calls  # nothing else was sent
+    assert len(auto_turns) == 1
+    assert session.task.state.stage is TaskStage.EXECUTION
+
+
+def test_task_resume_sends_auto_turn_but_pause_does_not(capsys):
+    """Pause must not prompt the model; resume must send one service turn."""
+    session = _TaskSession()
+    _handle_task_command(session, "/task start демо")
+    session.chat_calls.clear()
+
+    assert _handle_task_command(session, "/task pause") is True
+    assert session.chat_calls == []  # hard rule: no model calls while paused
+    assert session.task.state.is_paused
+
+    assert _handle_task_command(session, "/task resume") is True
+    assert len(session.chat_calls) == 1
+    assert "Этап задачи изменился" in session.chat_calls[0]
+    assert not session.task.state.is_paused
+
+
+def test_task_auto_turn_error_is_reported_not_raised(capsys, monkeypatch):
+    """An LLM failure during the auto-turn must not crash the command."""
+    session = _TaskSession()
+
+    def boom(text: str) -> str:
+        raise LLMError("provider down")
+
+    session.chat = boom  # type: ignore[method-assign]
+    assert _handle_task_command(session, "/task start сломанный ход") is True
+    err = capsys.readouterr().err
+    assert "авто-ход" in err
+
+
+def test_task_status_sends_no_auto_turn(capsys, monkeypatch):
+    """/task (status) and unknown subcommands must not touch the model."""
+    session = _TaskSession()
+    assert _handle_task_command(session, "/task") is True
+    assert _handle_task_command(session, "/task белиберда") is True
+    assert session.chat_calls == []
     monkeypatch.setattr(
         "builtins.input", lambda prompt: f"echo:{prompt}"
     )

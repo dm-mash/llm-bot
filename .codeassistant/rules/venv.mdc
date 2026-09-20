@@ -1,0 +1,7 @@
+---
+name: venv
+---
+
+This is rule for Agent (it would be better to give the Agent more context about his work).
+Edit this file to customize Agent behavior.
+use current directory's venv for running python scripts and tests.

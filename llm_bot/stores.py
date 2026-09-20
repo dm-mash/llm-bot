@@ -121,6 +121,14 @@ class AgentConfig:
     # When unset, the agent falls back to its compression settings (if any), else
     # to the full-history behaviour.
     context_strategy: str | None = None
+    # Task state machine: track the formal stage (planning/execution/validation/
+    # done + paused) of the work being done in the session and inject it into the
+    # system context on every turn. See :mod:`llm_bot.task_state`.
+    task_state: bool = False
+    # When the task state machine is on, auto-detect task setup / stage hints /
+    # pause & resume phrases from the dialog after each turn via a small LLM
+    # call (mirrors the memory auto-extraction behaviour).
+    task_auto_detect: bool = True
     # How many of the most recent MESSAGES the strategy keeps in the request
     # (sliding window size N) for the "sliding"/"facts" strategies (and, when set,
     # as a cap for "branching"). Measured in messages, not tokens.
@@ -150,6 +158,10 @@ class AgentConfig:
             context_strategy=_opt_str(data.get("context_strategy")),
             context_window_messages=_opt_int(data.get("context_window_messages")),
             context_max_facts=_opt_int(data.get("context_max_facts")),
+            task_state=_opt_bool(data.get("task_state"), default=False),
+            task_auto_detect=_opt_bool(
+                data.get("task_auto_detect"), default=True
+            ),
         )
 
     @property
@@ -214,6 +226,19 @@ def _opt_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _opt_bool(value: Any, *, default: bool) -> bool:
+    """Interpret a YAML value as a bool, falling back to *default*.
+
+    Accepts real booleans and the usual string forms ("true"/"yes"/"on"/"1").
+    Missing/blank values fall back to *default*.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "yes", "on", "1"}
 
 
 @dataclass(frozen=True)
@@ -362,5 +387,19 @@ class SessionStore(Protocol):
         # Without branch support we persist only the active branch's history.
         if current in branches:
             self.save(session_id, branches[current])
+
+    # --- Task state machine ------------------------------------------------ #
+    # Used by :class:`llm_bot.task_state.TaskStateMachine` so the formal task
+    # stage/step/expected-action survive process restarts ("continue without
+    # re-explaining"). Stores that do not support it can rely on the defaults
+    # below (permanently absent), so a plain store keeps working.
+
+    def load_task_state(self, session_id: str) -> dict[str, Any] | None:
+        """Return the persisted task-state snapshot (``None`` when there is none)."""
+        return None
+
+    def save_task_state(self, session_id: str, state: dict[str, Any]) -> None:
+        """Persist the task-state snapshot for a session (no-op by default)."""
+        del state
 
     def list(self) -> list[str]: ...
