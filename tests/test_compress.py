@@ -84,6 +84,7 @@ def _session(
         transport=transport,
         compression=compression,
         on_compress=on_compress,
+        invariants=False,
     )
 
 
@@ -320,6 +321,7 @@ def test_session_legacy_flat_store_reads_with_empty_summary(tmp_path):
         session_store=store,
         transport=httpx.MockTransport(_ok_handler()),
         compression=CompressionSettings(keep_last=4, block_size=6),
+        invariants=False,
     )
     assert session.history == [{"role": "user", "content": "hi"}]
     assert session.summary == ""

@@ -338,6 +338,7 @@ def test_make_session_applies_profile_end_to_end(tmp_path):
         transport=transport,
         profile="developer",
         profile_store=_StubProfileStore({"developer": developer}),
+        invariants=False,
     )
 
     # The session's agent carries the composed config.
@@ -368,6 +369,7 @@ def test_make_session_without_profile_is_unchanged(tmp_path):
         agent_store=_StubAgentStore(_base_agent()),
         session_store=JsonSessionStore(str(tmp_path / "sessions")),
         transport=transport,
+        invariants=False,
     )
 
     assert session.agent.config.system_prompt == "Ты полезный помощник."
@@ -387,6 +389,7 @@ def test_make_session_unknown_profile_raises_clear_error(tmp_path):
             session_store=JsonSessionStore(str(tmp_path / "sessions")),
             profile="ghost",
             profile_store=_StubProfileStore({}),
+            invariants=False,
         )
 
 

@@ -1,0 +1,79 @@
+# Copy this file to data/invariants.yaml and fill in your values.
+#
+# This file defines GLOBAL INVARIANTS — hard constraints the assistant must
+# never violate: the chosen architecture, accepted technical decisions, stack
+# limits, business rules. Invariants are owner configuration, NOT memory:
+# nothing from the dialog ever becomes an invariant automatically, and the
+# dialog can never remove a global invariant.
+#
+# Enforcement works on three levels:
+#   1. The rendered block (with a refusal protocol) is injected into the
+#      system context on EVERY request, so the model reasons within the
+#      constraints and refuses conflicting requests itself.
+#   2. `forbidden_patterns` (optional, case-insensitive regex) are checked in
+#      code BEFORE the request is sent — a match refuses the request without
+#      calling the model at all (no tokens spent).
+#   3. After the reply, a post-flight audit LLM call checks whether the
+#      assistant's response violates any invariant. By default this is a HARD
+#      gate: a violating reply is refused, history is rolled back, and
+#      InvariantViolationError is raised. Use --audit-invariants-warn to
+#      downgrade to a warning-only mode (the reply is shown but the violation
+#      is logged to stderr).
+#
+# Usage:
+#   python -m llm_bot --agent assistant                 # auto-loads data/invariants.yaml
+#   python -m llm_bot --list-invariants                 # inspect without chatting
+#   python -m llm_bot --agent assistant --no-invariants # disable for one run
+#
+# Session-scoped invariants (added via `/invariant add <тип> <текст>` in the
+# interactive chat) are stored per session in data/sessions/<id>.json and are
+# removable via `/invariant drop <id>` — global ones are not.
+#
+# Fields:
+#   id                 (the YAML key) unique, e.g. STACK-1, ARCH-2, RULE-LANG
+#   kind               free-form category tag; human-readable labels come from
+#                      the optional `kind_labels` section below — the code knows
+#                      no fixed taxonomy, add new categories without code changes
+#   statement          (required) the normative rule text, verbatim in the prompt
+#   rationale          why the rule exists; refusals explain themselves through it
+#   forbidden_patterns optional regex list for the deterministic code gate
+
+# Optional: human-readable labels for the `kind` tags (used in the prompt
+# block, refusals and /invariants output). Unknown kinds render as-is.
+kind_labels:
+  architecture: выбранная архитектура
+  decision: принятое техническое решение
+  stack: ограничение по стеку
+  business_rule: бизнес-правило
+
+invariants:
+  STACK-1:
+    kind: stack
+    statement: "Проект использует только stdlib, httpx, PyYAML и prompt_toolkit; новые зависимости не добавляются."
+    rationale: "Минимум зависимостей: запуск и аудит поставок остаются простыми."
+    forbidden_patterns:
+      - '\b(django|flask|fastapi|sqlalchemy|pydantic|symfony|spring|rails|express|laravel|nestjs)\b'
+      - '(веб[- ]?фреймворк|web[- ]?framework|фреймворк)\s'
+      - '\b(ORM|о[- ]?р[- ]?м)\b'
+      - '(добавь|подключи|установи|install|add)\s+(зависимость|пакет|библиотеку|dependency|package|library)'
+
+  ARCH-1:
+    kind: architecture
+    statement: "Слои client / agent / session не смешиваются: транспорт изолирован в LLMClient, а CLI не ходит в HTTP напрямую."
+    rationale: "Изоляция транспорта позволяет менять бэкенд и добавлять веб-интерфейс без правки логики."
+
+  ARCH-2:
+    kind: architecture
+    statement: "История диалога хранится только в сессии (data/sessions/); инварианты и профили никогда не пишутся в историю сообщений."
+    rationale: "Разделение состояний: диалог воспроизводим, конфигурация версионируется отдельно."
+
+  RULE-LANG:
+    kind: business_rule
+    statement: "Отвечай на том же языке, на котором написан запрос пользователя."
+    rationale: "Аудитория проекта русскоязычная и англоязычная одновременно."
+
+  RULE-SECRETS:
+    kind: business_rule
+    statement: "Никогда не предлагай коммитить секреты: API-ключи только через ${ENV_VAR} в data/*.yaml и .env, data/ не попадает в git."
+    rationale: "Утечка ключей в репозиторий — самый дорогой класс инцидентов."
+    forbidden_patterns: ['закоммит(ь|им|ите)\s+(ключ|api[_ -]?key|секрет)', 'commit\s+(the\s+)?(api[_ -]?key|secret)']

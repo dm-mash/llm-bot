@@ -123,6 +123,33 @@ class JsonSessionStore:
             task_state=state,
         )
 
+    def load_invariants(self, session_id: str) -> list[dict[str, Any]]:
+        """Return persisted session-scoped invariant entries (``[]`` when absent)."""
+        path = self._path(session_id)
+        data = self._read_payload(session_id, path)
+        if not isinstance(data, dict):
+            return []
+        raw = data.get("invariants")
+        if not isinstance(raw, list):
+            return []
+        return [entry for entry in raw if isinstance(entry, dict)]
+
+    def save_invariants(
+        self, session_id: str, invariants: list[dict[str, Any]]
+    ) -> None:
+        """Persist session-scoped invariants alongside the existing session data."""
+        data = self._read_payload(session_id, self._path(session_id))
+        history, summary = self._split(data)
+        self._save_compound(
+            session_id,
+            history,
+            summary=summary,
+            facts=self.load_facts(session_id),
+            branches=self._load_branches_from(data),
+            current_branch=self._load_current_from(data),
+            invariants=invariants,
+        )
+
     def load_branches(
         self, session_id: str, *, default_branch: str
     ) -> tuple[dict[str, list[dict[str, str]]], str]:
@@ -245,17 +272,20 @@ class JsonSessionStore:
         branches: dict[str, list[dict[str, str]]] | None,
         current_branch: str | None,
         task_state: dict[str, Any] | None = None,
+        invariants: list[dict[str, Any]] | None = None,
     ) -> None:
         """Write the full compound session payload, preserving all state.
 
-        When *task_state* is ``None`` (the default for history/summary/facts/
-        branch saves), any previously persisted task state is carried over
-        untouched, so partial writers never drop each other's data.
+        When *task_state* / *invariants* is ``None`` (the default for
+        history/summary/facts/branch saves), any previously persisted value is
+        carried over untouched, so partial writers never drop each other's
+        data.
         """
+        current_payload = self._read_payload(session_id, self._path(session_id))
         if task_state is None:
-            task_state = self._load_task_state_from_payload(
-                self._read_payload(session_id, self._path(session_id))
-            )
+            task_state = self._load_task_state_from_payload(current_payload)
+        if invariants is None:
+            invariants = self._load_invariants_from_payload(current_payload)
         path = self._path(session_id)
         payload: dict[str, Any] = {
             "summary": summary,
@@ -269,6 +299,8 @@ class JsonSessionStore:
             payload["current_branch"] = current_branch
         if task_state:
             payload["task_state"] = task_state
+        if invariants:
+            payload["invariants"] = invariants
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
 
@@ -279,6 +311,16 @@ class JsonSessionStore:
             return None
         raw = data.get("task_state")
         return raw if isinstance(raw, dict) else None
+
+    @staticmethod
+    def _load_invariants_from_payload(data: Any) -> list[dict[str, Any]] | None:
+        """Extract the ``invariants`` list from a raw session payload."""
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("invariants")
+        if not isinstance(raw, list):
+            return None
+        return [entry for entry in raw if isinstance(entry, dict)]
 
     def list(self) -> list[str]:
         names = sorted(

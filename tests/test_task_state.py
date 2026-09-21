@@ -387,6 +387,7 @@ def _make_session(session_id, directory, transport, **kwargs):
         agent_store=_StubAgentStore(agent_cfg),
         session_store=JsonSessionStore(str(directory)),
         transport=transport,
+        invariants=False,
         **kwargs,
     )
 

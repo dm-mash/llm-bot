@@ -26,6 +26,7 @@ from typing import Any
 from llm_bot.agent import Session
 from llm_bot.client import LLMClient, LLMError
 from llm_bot.config import LLMConfig
+from llm_bot.invariants import Invariant, InvariantRegistry, InvariantViolationError
 from llm_bot.diagnostics import (
     DetailListener,
     RequestDetails,
@@ -39,6 +40,7 @@ from llm_bot.profiles import profile_prompt_block
 from llm_bot.task_state import TaskStage
 from llm_bot.yaml_stores import (
     YamlAgentStore,
+    YamlInvariantStore,
     YamlModelStore,
     YamlProfileStore,
 )
@@ -151,6 +153,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable automatic task detection (the small LLM call after each "
         "turn that recognizes task setup, stage hints and pause/resume phrases).",
+    )
+    # --- Invariants (hard constraints) --------------------------------------
+    parser.add_argument(
+        "--invariants-file",
+        default=None,
+        help=(
+            "Path to the global invariants YAML (default: "
+            "data/invariants.yaml). A missing file means no global "
+            "invariants; session-scoped ones still work."
+        ),
+    )
+    parser.add_argument(
+        "--no-invariants",
+        action="store_true",
+        help="Disable the whole invariant layer for this run.",
+    )
+    parser.add_argument(
+        "--audit-invariants-warn",
+        action="store_true",
+        help=(
+            "Downgrade the post-reply invariant audit from a hard gate "
+            "(default: violating replies are refused) to a warn-only mode "
+            "(violations are logged to stderr but the reply is shown)."
+        ),
+    )
+    parser.add_argument(
+        "--list-invariants",
+        action="store_true",
+        help="List global invariants from the invariants YAML and exit.",
     )
 
     # Legacy direct-call options (used only without --agent).
@@ -376,6 +407,9 @@ def _run_agent_chat(
     profile_name: str | None = None,
     task_state: bool | None = None,
     task_auto_detect: bool = True,
+    invariants_file: str | None = None,
+    no_invariants: bool = False,
+    audit_invariants_warn: bool = False,
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
@@ -398,6 +432,9 @@ def _run_agent_chat(
         profile=profile_name,
         task_state=task_state,
         task_auto_detect=task_auto_detect,
+        invariants_file=invariants_file,
+        invariants=False if no_invariants else None,
+        audit_invariants_warn=audit_invariants_warn,
     )
 
     # When resuming an existing conversation, surface how much context is loaded.
@@ -406,6 +443,17 @@ def _run_agent_chat(
     if prompt is not None:
         try:
             result = session.chat_with_details(prompt)
+        except InvariantViolationError as exc:
+            print(exc.refusal)
+            if exc.matched_pattern:
+                # Code gate: the request never reached the model.
+                print("[invariants] запрос отклонён инвариантом (не отправлен "
+                      "модели).", file=sys.stderr)
+            else:
+                # Audit gate: the reply was refused after review.
+                print("[invariants] ответ отклонён аудитом инвариантов "
+                      "(история откачена).", file=sys.stderr)
+            return 3
         except LLMError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -413,9 +461,26 @@ def _run_agent_chat(
         _print_usage(session)
         _print_compression(session)
         _print_memory(session)
+        _print_invariant_warnings(session)
         return 0
 
     return _interactive_loop(session)
+
+
+def _print_invariant_warnings(session: Session) -> None:
+    """Print a stderr warning when the last reply violated an invariant."""
+    event = getattr(session, "last_invariant_event", None)
+    if event is not None and event.violated:
+        item = session.invariants.get(event.violated_id) \
+            if session.invariants is not None else None
+        label = f"{event.violated_id}" + (
+            f" ({item.kind})" if item is not None else ""
+        )
+        print(
+            f"[invariants] ПРЕДУПРЕЖДЕНИЕ: ответ нарушает инвариант "
+            f"{label}: {event.rationale}",
+            file=sys.stderr,
+        )
 
 
 _HISTORY_COMMANDS = {"/history", "/история"}
@@ -423,6 +488,7 @@ _BRANCH_COMMANDS = {"/branch", "/switch", "/branches"}
 _TASK_COMMANDS = {
     "/task", "/задача",
 }
+_INVARIANT_COMMANDS = {"/invariants", "/invariant", "/инварианты"}
 
 # Words offered by tab-completion in the interactive prompt.
 _COMMAND_WORDS = [
@@ -433,6 +499,9 @@ _COMMAND_WORDS = [
     "/branches",
     "/task",
     "/задача",
+    "/invariants",
+    "/invariant",
+    "/инварианты",
     "exit",
     "quit",
 ]
@@ -728,18 +797,32 @@ def _interactive_loop(session: Session) -> int:
                 continue
             if _handle_task_command(session, raw):
                 continue
+            if _handle_invariant_command(session, raw):
+                continue
             # Hard pause gate: while the task is paused, ordinary messages are
             # NOT sent to the model until the user resumes explicitly.
             if _task_paused_gate(session, raw):
                 continue
             try:
                 print(session.chat(raw))
+            except InvariantViolationError as exc:
+                print(exc.refusal)
+                if exc.matched_pattern:
+                    # Code gate: the request never reached the model.
+                    print("[invariants] запрос отклонён инвариантом (не отправлен "
+                          "модели).", file=sys.stderr)
+                else:
+                    # Audit gate: the reply was refused after review.
+                    print("[invariants] ответ отклонён аудитом инвариантов "
+                          "(история откачена).", file=sys.stderr)
+                continue
             except LLMError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 continue
             _print_usage(session)
             _print_compression(session)
             _print_memory(session)
+            _print_invariant_warnings(session)
     except KeyboardInterrupt:
         pass
     return 0
@@ -896,6 +979,120 @@ def _show_profile(name: str) -> int:
     return 0
 
 
+def _print_invariants(path: str | None) -> int:
+    """Print detailed information about every global invariant."""
+    store = YamlInvariantStore(path or "data/invariants.yaml")
+    try:
+        names = store.list()
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not names:
+        print("No global invariants defined.", file=sys.stderr)
+        return 0
+    labels = store.kind_labels()
+    for name in names:
+        try:
+            item = Invariant.from_dict(store.get(name), source="global")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        label = labels.get(item.kind, item.kind)
+        print(f"[{item.id}]")
+        print(f"  kind      : {label}")
+        print(f"  statement : {item.statement}")
+        if item.rationale:
+            print(f"  rationale : {item.rationale}")
+        if item.forbidden_patterns:
+            print(f"  forbidden : {', '.join(item.forbidden_patterns)}")
+        print()
+    return 0
+
+
+def _print_session_invariants(session: Session) -> None:
+    """Print the session's registry (global + session-scoped) to stderr."""
+    registry = session.invariants
+    if registry is None:
+        print("[invariants] слой инвариантов отключён (--no-invariants).",
+              file=sys.stderr)
+        return
+    if len(registry) == 0:
+        print("[invariants] инвариантов нет. /invariant add <тип> <текст> — "
+              "добавить сессионный.", file=sys.stderr)
+        return
+    print(f"[invariants] всего: {len(registry)}", file=sys.stderr)
+    for item in registry.items():
+        origin = "global" if item.source == "global" else "session"
+        print(f"[invariants]   [{item.id}] ({item.kind}, {origin}) "
+              f"{item.statement}", file=sys.stderr)
+
+
+def _handle_invariant_command(session: Session, raw: str) -> bool:
+    """Handle an invariant slash-command; True when the input was a command.
+
+    ``/invariants`` (or ``/инварианты``) lists the registry; ``/invariant add
+    <kind> <statement>`` adds a session-scoped invariant (persisted with the
+    session, removable); ``/invariant drop <id>`` removes a session-scoped
+    one — global invariants are protected.
+    """
+    cmd = raw.split(None, 1)
+    if cmd[0].lower() not in _INVARIANT_COMMANDS:
+        return False
+    registry = session.invariants
+    if registry is None:
+        print("[invariants] слой инвариантов отключён (--no-invariants).",
+              file=sys.stderr)
+        return True
+    arg = cmd[1].strip() if len(cmd) > 1 else ""
+    parts = arg.split(None, 1)
+    name = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if not name or name in {"list", "список"}:
+        _print_session_invariants(session)
+    elif name in {"add", "добавить"}:
+        # /invariant add <kind> <statement>
+        sub = rest.split(None, 1)
+        if len(sub) < 2:
+            print("[invariant] формат: /invariant add <тип> <текст правила>",
+                  file=sys.stderr)
+            return True
+        try:
+            item = session.add_invariant(
+                invariant_id=_next_invariant_id(registry),
+                kind=sub[0],
+                statement=sub[1],
+            )
+        except ValueError as exc:
+            print(f"[invariant] {exc}", file=sys.stderr)
+            return True
+        print(f"[invariant] добавлен {item.id} ({item.kind}): "
+              f"{item.statement}", file=sys.stderr)
+    elif name in {"drop", "удалить"}:
+        if not rest:
+            print("[invariant] укажите id: /invariant drop <id>",
+                  file=sys.stderr)
+            return True
+        try:
+            session.drop_invariant(rest)
+        except (ValueError, KeyError) as exc:
+            print(f"[invariant] {exc}", file=sys.stderr)
+            return True
+        print(f"[invariant] удалён: {rest}", file=sys.stderr)
+    else:
+        print("[invariant] неизвестная подкоманда. Доступны: list, add, drop.",
+              file=sys.stderr)
+    return True
+
+
+def _next_invariant_id(registry: InvariantRegistry) -> str:
+    """Generate the next free session-scoped invariant id (SESSION-1, ...)."""
+    n = 1
+    while registry.has(f"SESSION-{n}"):
+        n += 1
+    return f"SESSION-{n}"
+
+
 def _print_agents() -> int:
     """Print detailed information about every defined agent."""
     agent_store = YamlAgentStore()
@@ -952,6 +1149,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.show_profile:
         return _show_profile(args.show_profile)
 
+    if args.list_invariants:
+        return _print_invariants(args.invariants_file)
+
     if args.profile and not args.agent:
         print(
             "error: --profile requires --agent (profiles personalize an "
@@ -979,6 +1179,9 @@ def main(argv: list[str] | None = None) -> int:
             profile_name=args.profile,
             task_state=True if args.task_state else None,
             task_auto_detect=not args.no_task_detect,
+            invariants_file=args.invariants_file,
+            no_invariants=args.no_invariants,
+            audit_invariants_warn=args.audit_invariants_warn,
         )
 
     # Legacy path.

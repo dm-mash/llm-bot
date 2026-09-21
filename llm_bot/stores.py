@@ -322,6 +322,15 @@ class ProfileStore(Protocol):
 
 
 @runtime_checkable
+class InvariantStore(Protocol):
+    """Read access to global invariant definitions by name (id)."""
+
+    def get(self, name: str) -> dict[str, Any]: ...
+    def list(self) -> list[str]: ...
+    def kind_labels(self) -> dict[str, str]: ...
+
+
+@runtime_checkable
 class SessionStore(Protocol):
     """Persistent storage for session (conversation) histories.
 
@@ -401,5 +410,22 @@ class SessionStore(Protocol):
     def save_task_state(self, session_id: str, state: dict[str, Any]) -> None:
         """Persist the task-state snapshot for a session (no-op by default)."""
         del state
+
+    # --- Session-scoped invariants ----------------------------------------- #
+    # Used by :class:`llm_bot.invariants.InvariantRegistry` so invariants added
+    # from the dialog (`/invariant add`) survive restarts. Stores that do not
+    # support them rely on the defaults below (permanently empty), so a plain
+    # store keeps working. Global invariants live in data/invariants.yaml and
+    # are NEVER stored in the session.
+
+    def load_invariants(self, session_id: str) -> list[dict[str, Any]]:
+        """Return persisted session-scoped invariant entries (``[]`` if none)."""
+        return []
+
+    def save_invariants(
+        self, session_id: str, invariants: list[dict[str, Any]]
+    ) -> None:
+        """Persist session-scoped invariant entries (no-op by default)."""
+        del invariants
 
     def list(self) -> list[str]: ...

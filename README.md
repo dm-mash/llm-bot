@@ -46,6 +46,11 @@ trivial to add a **web interface** later without touching the logic.
   *without* summary, all selectable per-agent or per-session (`--strategy`):
   sliding window / sticky facts (key-value durable memory) / branching
   (see "Context strategies" below).
+- **Invariants (hard constraints)** — owner-declared architecture/decision/stack/
+  business rules stored separately from the dialog (`data/invariants.yaml` +
+  per-session entries); injected into every request and enforced by a
+  deterministic regex gate BEFORE anything is sent, with self-explaining
+  refusals (see "Invariants" below).
 - **Task state machine** — the work on a task is formalized as a finite-state
   machine (stage `planning → execution → validation → done` + `paused`, current
   step, expected action). The stage is recognized from the dialog by a small
@@ -70,6 +75,7 @@ llm-bot/
 │   ├── compress.py            # ContextCompressor + CompressionSettings (rolling summary)
 │   ├── context_strategies.py  # SlidingWindow / StickyFacts / Branching (pluggable strategies)
 │   ├── task_state.py          # TaskStateMachine: formal task stage/step/action FSM
+│   ├── invariants.py          # Invariant/InvariantRegistry: hard constraints + gate
 │   ├── profiles.py            # apply_profile: compose ProfileConfig onto AgentConfig
 │   ├── stores.py              # Repository interfaces (ModelStore/AgentStore/ProfileStore/SessionStore)
 │   ├── yaml_stores.py         # YamlModelStore / YamlAgentStore / YamlProfileStore (data/*.yaml)
@@ -94,6 +100,7 @@ llm-bot/
 ├── results/                   # experiment reports (markdown)
 ├── models.example.yaml        # template -> copy to data/models.yaml
 ├── agents.example.yaml        # template -> copy to data/agents.yaml
+├── invariants.example.yaml    # template -> copy to data/invariants.yaml
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -702,6 +709,94 @@ Diagnostics: `session.task_state`, `session.task_events`,
 
 Verification on a real model: `python scripts/verify_task_state.py`
 (report: [`results/task_state_verification.md`](results/task_state_verification.md)).
+
+### Invariants (hard constraints)
+
+Invariants are **hard constraints the assistant must never violate** — the
+chosen architecture, accepted technical decisions, stack limits, business
+rules. They follow the project doctrine: explicit *owner configuration*, NOT
+memory — nothing from the dialog ever becomes an invariant automatically, and
+the dialog can never remove a global invariant.
+
+Create the file from the template:
+
+```bash
+cp invariants.example.yaml data/invariants.yaml
+```
+
+Storage is separate from the dialog by construction:
+
+* **global** invariants live in `data/invariants.yaml` (`kind_labels` is an
+  optional `kind → label` section; the code knows no fixed category taxonomy —
+  add new kinds without code changes);
+* **session-scoped** invariants (added via `/invariant add`) are persisted
+  under the `invariants` key of `data/sessions/<id>.json` — never in the
+  message history.
+
+Enforcement is three-level, mirroring the task-pause design:
+
+1. **Prompt directive (always)** — the rendered block (id, kind, statement,
+   rationale + a **strengthened refusal protocol** in ALL CAPS with an
+   explicit pre-check step: check → refuse → name invariant → explain
+   rationale → offer alternative; no workarounds) is injected as the FIRST
+   prefix system message on every request (ahead of memory and task state),
+   so the model explicitly reasons within the constraints. Additionally, a
+   **recency-bias footer** (`render_footer()`) — a short reminder
+   "НАПОМИНАНИЕ: check invariants before answering" — is injected as a
+   system message immediately before the current user message, so the model
+   sees the constraint at the point of maximum attention.
+2. **Code gate (pre-flight)** — `forbidden_patterns` (case-insensitive regex
+   per invariant) are matched against the user message BEFORE the request is
+   sent. A match raises `InvariantViolationError` with a ready refusal naming
+   the invariant, its rationale and how to proceed: the request never reaches
+   the model, no tokens are spent, and the history is untouched. A conflicting
+   one-shot request exits with code **3**.
+3. **Reply audit (post-flight, always on)** — one small LLM call after each
+   reply checks compliance (detection only, the reply is never rewritten).
+   The audit receives the **full turn context** (user message + assistant
+   reply) so it can recognize whether the user's request was provocative.
+   By default this is a **hard gate**: a violating reply is refused
+   (`InvariantViolationError` raised), the assistant reply and user message
+   are rolled back from history, and the persisted state is updated. Use
+   `--audit-invariants-warn` to downgrade to a warning-only mode (the reply
+   is shown but the violation is logged to stderr). The audit is skipped
+   entirely when the registry is empty (no invariants wired).
+
+```bash
+python -m llm_bot --agent assistant                       # auto-loads data/invariants.yaml
+python -m llm_bot --list-invariants                       # inspect global invariants
+python -m llm_bot --agent assistant --no-invariants       # disable for one run
+python -m llm_bot --agent assistant --audit-invariants-warn  # warn-only audit mode
+python -m llm_bot --agent assistant \
+  --invariants-file path/to/rules.yaml                    # custom location
+```
+
+Inside the interactive chat:
+
+```text
+/invariants                     — list the registry (global + session)
+/invariant add <тип> <текст>    — add a session-scoped invariant (persisted)
+/invariant drop <id>            — remove a session-scoped one (global are protected)
+```
+
+When a request conflicts with an invariant, the refusal explains itself: it
+names the invariant (id and kind), states the rule, gives the rationale and
+asks the user to reformulate or propose alternatives within the constraint —
+whether the refusal came from the deterministic gate or from the model
+following the prompt protocol.
+
+Programmatic use:
+
+```python
+from llm_bot import InvariantRegistry
+
+registry = InvariantRegistry(kind_labels={"stack": "ограничение по стеку"})
+violated = registry.check_request("давай перепишем на Django")
+if violated is not None:
+    print(violated.refusal_text("django"))   # deterministic refusal text
+print(registry.render_prompt_block())        # system-prompt fragment
+print(registry.render_footer())              # recency-bias reminder ("" if empty)
+```
 
 ### Context compression (rolling summary)
 

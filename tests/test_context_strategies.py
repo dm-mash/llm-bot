@@ -100,6 +100,7 @@ def _make_session(tmp_path, strategy=None, *, agent_cfg=None, session_id="s1"):
         session_store=store,
         transport=httpx.MockTransport(_echo_handler(captured)),
         strategy=strategy,
+        invariants=False,
     )
     return session, captured
 
@@ -272,6 +273,7 @@ def test_sticky_facts_survive_small_window_in_session(tmp_path):
         session_store=store,
         transport=httpx.MockTransport(handler),
         strategy=strategy,
+        invariants=False,
     )
     for i in range(8):
         session.chat_with_details(f"вопрос {i}")
@@ -358,6 +360,7 @@ def test_branching_session_isolates_sibling_branch(tmp_path):
         session_store=store,
         transport=httpx.MockTransport(_echo_handler(captured)),
         strategy=strategy,
+        invariants=False,
     )
     session.chat_with_details("q-trunk")
     session.branch("alt")

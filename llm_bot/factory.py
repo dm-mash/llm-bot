@@ -27,6 +27,7 @@ from llm_bot.context_strategies import (
 )
 from llm_bot.diagnostics import DetailListener
 from llm_bot.gigachat import GigaChatTokenProvider
+from llm_bot.invariants import Invariant, InvariantRegistry
 from llm_bot.memory import (
     LongTermMemory,
     MemoryLayers,
@@ -200,6 +201,9 @@ def make_session(
     profile_store: ProfileStore | None = None,
     task_state: bool | None = None,
     task_auto_detect: bool = True,
+    invariants_file: str | None = None,
+    invariants: bool | InvariantRegistry | None = None,
+    audit_invariants_warn: bool = False,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
 
@@ -282,6 +286,49 @@ def make_session(
         else agent.config.task_state
     )
 
+    # Invariants: merge global ones (data/invariants.yaml by default) with the
+    # session-scoped subset persisted under the session file. Three modes:
+    #   * an InvariantRegistry instance is used directly (programmatic use /
+    #     tests) — the file is not read;
+    #   * False disables the whole layer (CLI --no-invariants);
+    #   * None (default) loads the global YAML; a missing file simply means
+    #     no global invariants. Labels come from the optional ``kind_labels``
+    #     section of the same file. Session-scoped entries always merge
+    #     inside Session.
+    invariant_registry: InvariantRegistry | None = None
+    if isinstance(invariants, InvariantRegistry):
+        invariant_registry = invariants
+    elif invariants is not False:
+        labels: dict[str, str] = {}
+        global_entries: list[dict] = []
+        try:
+            from llm_bot.yaml_stores import YamlInvariantStore
+
+            store = YamlInvariantStore(
+                invariants_file or "data/invariants.yaml"
+            )
+            labels = store.kind_labels()
+            global_entries = [store.get(name) for name in store.list()]
+        except FileNotFoundError:
+            global_entries = []
+        if global_entries:
+            try:
+                invariant_registry = InvariantRegistry(
+                    [
+                        Invariant.from_dict(entry, source="global")
+                        for entry in global_entries
+                    ],
+                    kind_labels=labels,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Конфигурация инвариантов некорректна: {exc}"
+                ) from exc
+        # When no global invariants exist and no explicit file was given,
+        # leave invariant_registry as None so the audit does not fire on
+        # every turn. Session-scoped invariants added via /invariant add
+        # will still work because Session loads them from the store.
+
     return Session(
         session_id,
         agent,
@@ -300,4 +347,6 @@ def make_session(
         task_auto_detect=(
             task_auto_detect and agent.config.task_auto_detect
         ),
+        invariants=invariant_registry,
+        audit_invariants_warn=audit_invariants_warn,
     )

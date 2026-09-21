@@ -14,6 +14,12 @@ from llm_bot.client import (
     TokenProvider,
 )
 from llm_bot.compress import CompressionSettings, ContextCompressor
+from llm_bot.invariants import (
+    Invariant,
+    InvariantAuditEvent,
+    InvariantRegistry,
+    InvariantViolationError,
+)
 from llm_bot.diagnostics import (
     DetailListener,
     RequestDetails,
@@ -31,6 +37,10 @@ __all__ = [
     "TokenProvider",
     "CompressionSettings",
     "ContextCompressor",
+    "Invariant",
+    "InvariantAuditEvent",
+    "InvariantRegistry",
+    "InvariantViolationError",
     "DetailListener",
     "RequestDetails",
     "ResponseDetails",

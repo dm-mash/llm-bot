@@ -83,6 +83,7 @@ def _session(transport, tmp_path, *, agent_cfg=None, model_cfg=None):
         agent_store=_StubAgentStore(agent_cfg),
         session_store=session_store,
         transport=transport,
+        invariants=False,
     )
 
 

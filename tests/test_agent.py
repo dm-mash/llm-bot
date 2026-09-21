@@ -87,6 +87,7 @@ def _make_session(session_id, agent_cfg, transport, directory):
         agent_store=agent_store,
         session_store=session_store,
         transport=transport,
+        invariants=False,
     )
 
 

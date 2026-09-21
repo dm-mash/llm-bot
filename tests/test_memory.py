@@ -96,6 +96,7 @@ def _make_session(session_id, agent_cfg, transport, directory, owner="default",
         owner_id=owner,
         memory_auto_extract=auto_extract,
         transport=transport,
+        invariants=False,
     )
 
 

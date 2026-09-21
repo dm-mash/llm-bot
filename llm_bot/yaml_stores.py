@@ -108,3 +108,48 @@ class YamlProfileStore:
 
     def list(self) -> list[str]:
         return self._file.names()
+
+
+class YamlInvariantStore:
+    """Loads global invariant entries from an ``invariants.yaml`` file.
+
+    The file has an optional top-level ``kind_labels`` mapping (free-form
+    category -> human-readable label) and a top-level ``invariants`` key
+    mapping invariant id -> settings (see :mod:`llm_bot.invariants`). Raw
+    dicts are returned — parsing/validation belongs to
+    :meth:`llm_bot.invariants.Invariant.from_dict`, keeping this store as thin
+    as :class:`YamlProfileStore`.
+    """
+
+    def __init__(self, path: str = "data/invariants.yaml") -> None:
+        self._file = _YamlFile(path, "invariants")
+        self._labels: dict[str, str] | None = None
+
+    def _load_labels(self) -> dict[str, str]:
+        if self._labels is None:
+            if not os.path.exists(self._file.path):
+                raise FileNotFoundError(
+                    f"Config file '{self._file.path}' not found. Create it from "
+                    "invariants.example.yaml."
+                )
+            with open(self._file.path, "r", encoding="utf-8") as fh:
+                document = yaml.safe_load(fh) or {}
+            raw = document.get("kind_labels")
+            self._labels = (
+                {str(k): str(v) for k, v in raw.items()}
+                if isinstance(raw, dict)
+                else {}
+            )
+        return self._labels
+
+    def kind_labels(self) -> dict[str, str]:
+        """Return the optional ``kind -> label`` mapping (empty when absent)."""
+        return dict(self._load_labels())
+
+    def get(self, name: str) -> dict[str, Any]:
+        entry = dict(self._file.item(name))
+        entry.setdefault("id", name)
+        return entry
+
+    def list(self) -> list[str]:
+        return self._file.names()

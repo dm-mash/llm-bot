@@ -13,6 +13,7 @@ reply text.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable
 
 from llm_bot.client import ContextOverflowError, ContextTooLargeError, LLMClient
@@ -23,6 +24,13 @@ from llm_bot.compress import (
     summarize_prompt,
 )
 from llm_bot.context_strategies import ContextStrategy
+from llm_bot.invariants import (
+    Invariant,
+    InvariantAuditEvent,
+    InvariantRegistry,
+    InvariantViolationError,
+    audit_reply,
+)
 from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.task_state import (
@@ -197,6 +205,8 @@ class Session:
         memory_auto_extract: bool = True,
         task: TaskStateMachine | None = None,
         task_auto_detect: bool = True,
+        invariants: InvariantRegistry | None = None,
+        audit_invariants_warn: bool = False,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -252,11 +262,42 @@ class Session:
             if saved is not None:
                 self._task.load(TaskState.from_dict(saved))
             self._task._on_change = self._persist_task_state
+        # Invariants: hard constraints stored SEPARATELY from the dialog. A
+        # registry passed by the factory already carries the global (YAML)
+        # invariants; here the session-scoped ones (persisted under the
+        # session file's ``invariants`` key) are merged in. Every user message
+        # passes a deterministic regex gate BEFORE the request is assembled,
+        # and the rendered block is injected ahead of the role prompt on
+        # every turn.
+        self._invariants = invariants
+        self._invariant_events: list[InvariantAuditEvent] = []
+        self._audit_invariants_warn = audit_invariants_warn
+        if self._invariants is not None:
+            for entry in store.load_invariants(session_id):
+                try:
+                    self._invariants.add(
+                        Invariant.from_dict(entry, source="session")
+                    )
+                except (ValueError, KeyError):
+                    continue  # a corrupt entry never breaks session restore
+            self._invariants._on_change = self._persist_invariants
 
     def _persist_task_state(self, state: TaskState) -> None:
         """Persist the task snapshot whenever the machine changes it."""
         if self._task is not None:
             self._store.save_task_state(self.session_id, state.to_dict())
+
+    def _persist_invariants(self) -> None:
+        """Persist session-scoped invariants whenever the registry changes."""
+        if self._invariants is not None:
+            self._store.save_invariants(
+                self.session_id,
+                [
+                    item.to_dict()
+                    for item in self._invariants.items()
+                    if item.source == "session"
+                ],
+            )
 
     @property
     def history(self) -> list[dict[str, str]]:
@@ -309,6 +350,79 @@ class Session:
     def total_memory_tokens(self) -> int:
         """Total tokens spent on memory-classification calls across the session."""
         return sum(e.total_tokens for e in self._memory_events)
+
+    # -- Invariants (hard constraints) ---------------------------------------- #
+
+    @property
+    def invariants(self) -> InvariantRegistry | None:
+        """The session's invariant registry, or ``None`` when not wired."""
+        return self._invariants
+
+    @property
+    def invariant_events(self) -> list[InvariantAuditEvent]:
+        """Every post-reply audit event recorded in this session."""
+        return list(self._invariant_events)
+
+    @property
+    def last_invariant_event(self) -> InvariantAuditEvent | None:
+        """The most recent invariant-audit event, or ``None``."""
+        return (
+            self._invariant_events[-1] if self._invariant_events else None
+        )
+
+    @property
+    def total_invariant_tokens(self) -> int:
+        """Total tokens spent on invariant-audit calls across the session."""
+        return sum(e.total_tokens for e in self._invariant_events)
+
+    def add_invariant(
+        self,
+        invariant_id: str,
+        kind: str,
+        statement: str,
+        rationale: str = "",
+        forbidden_patterns: list[str] | None = None,
+    ) -> Invariant:
+        """Add a session-scoped invariant and persist it.
+
+        The invariant is stored under the session file (never in the dialog
+        history) and survives restarts. Raises ``ValueError`` on duplicate
+        ids (including global ones) or invalid fields.
+        """
+        if self._invariants is None:
+            raise ValueError(
+                "Инварианты не подключены к этой сессии."
+            )
+        item = Invariant.from_dict(
+            {
+                "id": invariant_id,
+                "kind": kind,
+                "statement": statement,
+                "rationale": rationale,
+                "forbidden_patterns": forbidden_patterns or [],
+            },
+            source="session",
+        )
+        self._invariants.add(item)
+        return item
+
+    def drop_invariant(self, invariant_id: str) -> Invariant:
+        """Remove a session-scoped invariant by id and persist the change.
+
+        Global invariants (from ``data/invariants.yaml``) are protected:
+        attempting to drop one raises ``ValueError`` — owner configuration is
+        immutable from the dialog.
+        """
+        if self._invariants is None:
+            raise ValueError(
+                "Инварианты не подключены к этой сессии."
+            )
+        if self._invariants.is_protected(invariant_id):
+            raise ValueError(
+                f"Инвариант {invariant_id!r} глобальный и не может быть "
+                "удалён из диалога."
+            )
+        return self._invariants.drop(invariant_id)
 
     # -- Task state machine -------------------------------------------------- #
 
@@ -435,6 +549,27 @@ class Session:
         if not user_message:
             raise ValueError("Message must not be empty.")
 
+        # Invariant gate: a deterministic pre-flight check that runs BEFORE
+        # anything else — a refusal costs zero tokens, never touches the
+        # provider and leaves the history untouched (the user message is not
+        # even appended yet).
+        if self._invariants is not None:
+            violated = self._invariants.check_request(user_message)
+            if violated is not None:
+                matched = next(
+                    (
+                        pattern
+                        for pattern in violated.forbidden_patterns
+                        if re.search(pattern, user_message, re.IGNORECASE)
+                    ),
+                    "",
+                )
+                raise InvariantViolationError(
+                    violated,
+                    matched_pattern=matched,
+                    refusal=violated.refusal_text(matched),
+                )
+
         user_msg = {"role": "user", "content": user_message}
         request_tokens = count_message_tokens(user_msg)
 
@@ -450,6 +585,17 @@ class Session:
         # Mirror the user message into the short-term (current dialog) layer.
         if self._memory is not None:
             self._memory.short.push(user_msg)
+
+        # Invariants block: hard constraints are injected as the FIRST prefix
+        # system message (ahead of memory and task state) so the model
+        # explicitly reasons within them on every turn.
+        invariant_prefix = []
+        if self._invariants is not None:
+            block = self._invariants.render_prompt_block()
+            if block:
+                invariant_prefix = [
+                    {"role": "system", "content": block}
+                ]
 
         # Durable memory (long-term profile/decisions + working task data) is
         # injected as a prefix so it is visible ahead of the system prompt on
@@ -474,7 +620,12 @@ class Session:
             # Combine the strategy's own durable prefix (e.g. sticky facts) with
             # the layered-memory prefix and the task-state block, durable state
             # first.
-            prefix = [*memory_prefix, *task_prefix, *prepared.prefix]
+            prefix = [
+                *invariant_prefix,
+                *memory_prefix,
+                *task_prefix,
+                *prepared.prefix,
+            ]
             messages = self.agent.build_messages(
                 prepared.request_history, prefix=prefix
             )
@@ -493,8 +644,19 @@ class Session:
             messages = self.agent.build_messages(
                 projected_history,
                 summary=projected_summary,
-                prefix=[*memory_prefix, *task_prefix] or None,
+                prefix=[*invariant_prefix, *memory_prefix, *task_prefix]
+                or None,
             )
+        # Recency-bias footer: inject a short invariant reminder as a
+        # system message right before the current user message so the
+        # model sees the constraint immediately before the request it
+        # must check.  This complements the full invariant block at the
+        # top of the context (which may be thousands of tokens away).
+        if self._invariants is not None:
+            footer = self._invariants.render_footer()
+            if footer and messages:
+                # Insert before the last message (the current user msg).
+                messages.insert(-1, {"role": "system", "content": footer})
         # Defensive guard: history may also carry surrogates from earlier loads,
         # so sanitize the whole stack before handing it to the HTTP client.
         _sanitize_messages(messages)
@@ -602,6 +764,65 @@ class Session:
                 logger.debug("[task] авто-детект trace:", exc_info=True)
                 task_event = TaskDetectionEvent(recognized=False)
             self._task_events.append(task_event)
+
+        # Post-reply audit: one small LLM call checks the reply against the
+        # invariants. By default this is a HARD gate — a violating reply is
+        # refused (InvariantViolationError raised, history rolled back) just
+        # like the pre-flight request gate. When ``audit_invariants_warn`` is
+        # True the violation is only logged to stderr (soft mode for
+        # debugging). An audit call failure never breaks the turn.
+        if self._invariants is not None and len(self._invariants) > 0:
+            try:
+                audit_event = audit_reply(
+                    self._invariants,
+                    reply,
+                    self.agent.client.chat,
+                    user_message=user_message,
+                )
+            except Exception as exc:  # noqa: BLE001 - never break a turn
+                logger.error("[invariants] аудит не удался: %s", exc)
+                logger.debug("[invariants] аудит trace:", exc_info=True)
+                audit_event = InvariantAuditEvent(recognized=False)
+            self._invariant_events.append(audit_event)
+            if audit_event.violated and not self._audit_invariants_warn:
+                # HARD gate: roll back the turn and refuse the reply.
+                if self._strategy is None:
+                    # Roll back the assistant reply from in-memory history.
+                    if (
+                        self._history
+                        and self._history[-1].get("role") == "assistant"
+                        and self._history[-1].get("content") == reply
+                    ):
+                        self._history.pop()
+                    # Roll back the user message too.
+                    if (
+                        self._history
+                        and self._history[-1].get("role") == "user"
+                        and self._history[-1].get("content") == user_message
+                    ):
+                        self._history.pop()
+                    # Persist the rolled-back history.
+                    if self._compressor is not None:
+                        self._store.save_full(
+                            self.session_id, self._history,
+                            summary=self._summary,
+                        )
+                    else:
+                        self._store.save(self.session_id, self._history)
+                violated_item = self._invariants.get(audit_event.violated_id)
+                raise InvariantViolationError(
+                    violated_item,
+                    refusal=(
+                        f"Ответ отклонён: он нарушает инвариант "
+                        f"{audit_event.violated_id}"
+                        f" ({violated_item.kind if violated_item else '?'}). "
+                        f"{audit_event.rationale} "
+                        f"Инвариант: "
+                        f"{violated_item.statement if violated_item else ''} "
+                        "Переформулируйте запрос так, чтобы ответ не "
+                        "противоречил ограничению."
+                    ),
+                )
 
         provider_usage = self.agent.client.last_usage
         reply_tokens = count_message_tokens({"role": "assistant", "content": reply})
