@@ -11,6 +11,7 @@ instances; the wiring here does not change.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 import httpx
@@ -26,6 +27,7 @@ from llm_bot.context_strategies import (
     StickyFacts,
 )
 from llm_bot.diagnostics import DetailListener
+from llm_bot.mcp_tools import MCPRouter, router_from_config
 from llm_bot.gigachat import GigaChatTokenProvider
 from llm_bot.invariants import Invariant, InvariantRegistry
 from llm_bot.memory import (
@@ -204,6 +206,9 @@ def make_session(
     invariants_file: str | None = None,
     invariants: bool | InvariantRegistry | None = None,
     audit_invariants_warn: bool = False,
+    mcp_servers: list[str] | None = None,
+    mcp_config_file: str | None = None,
+    mcp_router: MCPRouter | None = None,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
 
@@ -349,4 +354,12 @@ def make_session(
         ),
         invariants=invariant_registry,
         audit_invariants_warn=audit_invariants_warn,
+        mcp=(
+            mcp_router
+            if mcp_router is not None
+            else router_from_config(
+                mcp_servers,
+                Path(mcp_config_file) if mcp_config_file else None,
+            )
+        ),
     )

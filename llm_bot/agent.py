@@ -31,6 +31,7 @@ from llm_bot.invariants import (
     InvariantViolationError,
     audit_reply,
 )
+from llm_bot.mcp_tools import MCPEvent, MCPRouter
 from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.task_state import (
@@ -207,11 +208,20 @@ class Session:
         task_auto_detect: bool = True,
         invariants: InvariantRegistry | None = None,
         audit_invariants_warn: bool = False,
+        mcp: MCPRouter | None = None,
+        mcp_max_rounds: int = 2,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
         self._store = store
         self._memory = memory
+        # MCP tool integration: an optional router over MCP servers. When set,
+        # its tools block is injected into every request and a model reply in
+        # the {"call_tool": ...} directive form triggers a real tool call,
+        # whose result is fed back as a service turn (bounded by mcp_max_rounds).
+        self._mcp = mcp
+        self._mcp_max_rounds = max(1, mcp_max_rounds)
+        self._mcp_events: list[MCPEvent] = []
         # When enabled, after each turn the reply is classified via a small LLM
         # call and the extracted facts are written explicitly into the working /
         # long-term layers (see ``extract_memory``).
@@ -357,6 +367,23 @@ class Session:
     def invariants(self) -> InvariantRegistry | None:
         """The session's invariant registry, or ``None`` when not wired."""
         return self._invariants
+
+    # -- MCP tools ------------------------------------------------------------- #
+
+    @property
+    def mcp(self) -> MCPRouter | None:
+        """The session's MCP tool router, or ``None`` when not wired."""
+        return self._mcp
+
+    @property
+    def mcp_events(self) -> list[MCPEvent]:
+        """Every MCP tool round-trip recorded in this session."""
+        return list(self._mcp_events)
+
+    @property
+    def last_mcp_event(self) -> MCPEvent | None:
+        """The most recent MCP tool event, or ``None``."""
+        return self._mcp_events[-1] if self._mcp_events else None
 
     @property
     def invariant_events(self) -> list[InvariantAuditEvent]:
@@ -624,6 +651,15 @@ class Session:
             [{"role": "system", "content": task_block}] if task_block else []
         )
 
+        # MCP tools block: advertise available external tools and the call
+        # directive. Injected after the task block, before the role prompt, so
+        # the model always knows which tools it can reach this turn.
+        mcp_prefix = []
+        if self._mcp is not None:
+            block = self._mcp.render_tools_block()
+            if block:
+                mcp_prefix = [{"role": "system", "content": block}]
+
         prepared = None
         if self._strategy is not None:
             prepared = self._strategy.prepare(user_msg)
@@ -634,6 +670,7 @@ class Session:
                 *invariant_prefix,
                 *memory_prefix,
                 *task_prefix,
+                *mcp_prefix,
                 *prepared.prefix,
             ]
             messages = self.agent.build_messages(
@@ -654,7 +691,12 @@ class Session:
             messages = self.agent.build_messages(
                 projected_history,
                 summary=projected_summary,
-                prefix=[*invariant_prefix, *memory_prefix, *task_prefix]
+                prefix=[
+                    *invariant_prefix,
+                    *memory_prefix,
+                    *task_prefix,
+                    *mcp_prefix,
+                ]
                 or None,
             )
         # Recency-bias footer: inject a short invariant reminder as a
@@ -725,6 +767,53 @@ class Session:
                     self._on_compress(event)
 
         reply = self.agent.client.chat(messages)
+
+        # MCP tool loop: the model may answer with a {"call_tool": ...}
+        # directive (single call or a batch array) instead of a user-facing
+        # reply. Execute every call through the router, append the directive
+        # + all results to THIS turn's request view, and let the model produce
+        # the final answer. Bounded by mcp_max_rounds (rounds = model replies)
+        # so a misbehaving model cannot loop forever; several calls in ONE
+        # reply do not consume extra rounds.
+        if self._mcp is not None:
+            for _ in range(self._mcp_max_rounds):
+                directives = self._mcp.parse_directives(reply)
+                if not directives:
+                    break
+                feedbacks = []
+                for directive in directives:
+                    event = self._mcp.call_tool(
+                        directive.name, directive.arguments
+                    )
+                    self._mcp_events.append(event)
+                    if event.ok:
+                        feedbacks.append(
+                            f"Результат инструмента {directive.name}:\n"
+                            f"{event.result}"
+                        )
+                    else:
+                        feedbacks.append(
+                            f"Инструмент {directive.name} завершился ошибкой: "
+                            f"{event.error}"
+                        )
+                messages.append({"role": "assistant", "content": reply})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "\n\n".join(feedbacks)
+                            + "\nИспользуй эти результаты и дай финальный"
+                            " ответ пользователю обычным текстом. Если часть"
+                            " действий ещё не выполнена (а не отвергнута),"
+                            " снова верни директиву call_tool."
+                        ),
+                    }
+                )
+                reply = self.agent.client.chat(messages)
+            if self._mcp_events:
+                # Token accounting must reflect what was actually sent across
+                # the whole turn, including tool round-trips.
+                context_tokens = count_messages_tokens(messages)
 
         # Mirror the assistant reply into the short-term (current dialog) layer.
         if self._memory is not None:

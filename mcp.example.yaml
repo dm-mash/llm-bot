@@ -1,0 +1,23 @@
+# MCP servers available to the agent (template).
+#
+# Copy to data/mcp.yaml and edit. Each key is a server name; the agent selects
+# servers with `--mcp <name>[,<name>...]` (or `--mcp all`).
+#
+#   stdio server : command (+ optional args / env) spawned as a child process
+#   HTTP server  : url of a Streamable HTTP MCP endpoint
+#
+servers:
+  # Own mock-CRM server (scripts/notes_mcp_server.py) over a JSON file.
+  notes:
+    command: python
+    args: [scripts/notes_mcp_server.py]
+    env:
+      NOTES_DB: data/notes.json
+
+  # Examples of adding more servers later — just new entries:
+  #
+  # time:                        # reference server from requirements.txt
+  #   command: mcp-server-time
+  #
+  # deepwiki:                    # remote public MCP endpoint (no key needed)
+  #   url: https://mcp.deepwiki.com/mcp

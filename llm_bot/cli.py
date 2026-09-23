@@ -21,6 +21,7 @@ import json
 import logging
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from llm_bot.agent import Session
@@ -154,6 +155,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable automatic task detection (the small LLM call after each "
         "turn that recognizes task setup, stage hints and pause/resume phrases).",
     )
+    # --- MCP tools -------------------------------------------------------------
+    parser.add_argument(
+        "--mcp",
+        help="MCP servers to enable (comma-separated names from "
+        "data/mcp.yaml, or 'all'). Default: none.",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        help="Path to the MCP servers config (default: data/mcp.yaml).",
+    )
+    parser.add_argument(
+        "--list-mcp",
+        action="store_true",
+        help="List configured MCP servers and their tools, then exit.",
+    )
+
     # --- Invariants (hard constraints) --------------------------------------
     parser.add_argument(
         "--invariants-file",
@@ -410,6 +427,8 @@ def _run_agent_chat(
     invariants_file: str | None = None,
     no_invariants: bool = False,
     audit_invariants_warn: bool = False,
+    mcp_servers: list[str] | None = None,
+    mcp_config: str | None = None,
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
@@ -418,24 +437,32 @@ def _run_agent_chat(
     memory_store = JsonMemoryStore()
     session_id = session_id or _new_session_id(agent_name)
 
-    session = make_session(
-        session_id,
-        agent_name,
-        model_store=model_store,
-        agent_store=agent_store,
-        session_store=session_store,
-        memory_store=memory_store,
-        owner_id=owner_id,
-        detail_listener=detail_listener,
-        strategy_override=strategy_override,
-        window_messages=window_messages,
-        profile=profile_name,
-        task_state=task_state,
-        task_auto_detect=task_auto_detect,
-        invariants_file=invariants_file,
-        invariants=False if no_invariants else None,
-        audit_invariants_warn=audit_invariants_warn,
-    )
+    try:
+        session = make_session(
+            session_id,
+            agent_name,
+            model_store=model_store,
+            agent_store=agent_store,
+            session_store=session_store,
+            memory_store=memory_store,
+            owner_id=owner_id,
+            detail_listener=detail_listener,
+            strategy_override=strategy_override,
+            window_messages=window_messages,
+            profile=profile_name,
+            task_state=task_state,
+            task_auto_detect=task_auto_detect,
+            invariants_file=invariants_file,
+            invariants=False if no_invariants else None,
+            audit_invariants_warn=audit_invariants_warn,
+            mcp_servers=mcp_servers,
+            mcp_config_file=mcp_config,
+        )
+    except ValueError as exc:
+        # Configuration mistakes (bad --mcp name, missing config file, ...)
+        # print a clean one-line error instead of a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     # When resuming an existing conversation, surface how much context is loaded.
     _print_resume_info(session)
@@ -461,10 +488,60 @@ def _run_agent_chat(
         _print_usage(session)
         _print_compression(session)
         _print_memory(session)
+        _print_mcp_events(session)
         _print_invariant_warnings(session)
         return 0
 
     return _interactive_loop(session)
+
+
+def _print_mcp_events(session: Session) -> None:
+    """Print one stderr line per MCP tool call performed in the last turn."""
+    for event in session.mcp_events:
+        if event.ok:
+            print(
+                f"[mcp] {event.server}__{event.tool} -> {event.result}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[mcp] {event.server}__{event.tool} FAILED: {event.error}",
+                file=sys.stderr,
+            )
+
+
+def _print_mcp_catalog(mcp_config: str | None) -> int:
+    """Print configured MCP servers and their tool catalogs (--list-mcp)."""
+    from llm_bot.mcp_tools import load_mcp_config, MCPToolBridge
+
+    servers = load_mcp_config(
+        Path(mcp_config) if mcp_config else None
+    )
+    if not servers:
+        print(
+            "MCP-серверы не настроены. Скопируйте mcp.example.yaml в "
+            "data/mcp.yaml и отредактируйте."
+        )
+        return 0
+    for name, cfg in servers.items():
+        target = cfg.get("url") or " ".join(
+            [str(cfg.get("command", ""))] + [str(a) for a in cfg.get("args", [])]
+        )
+        print(f"- {name}: {target}")
+        try:
+            bridge = MCPToolBridge(
+                name,
+                command=str(cfg.get("command") or "") or None,
+                args=[str(a) for a in cfg.get("args", [])],
+                url=cfg.get("url"),
+                env={str(k): str(v) for k, v in (cfg.get("env") or {}).items()},
+            )
+            for spec in bridge.list_tools():
+                desc = spec.description.splitlines()[0] if spec.description else ""
+                print(f"    - {spec.name}: {desc}")
+        except Exception as exc:  # noqa: BLE001 - listing must never crash
+            print(f"    (недоступен: {exc})")
+    return 0
 
 
 def _print_invariant_warnings(session: Session) -> None:
@@ -1264,6 +1341,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_invariants:
         return _print_invariants(args.invariants_file)
 
+    if args.list_mcp:
+        return _print_mcp_catalog(args.mcp_config)
+
     if args.profile and not args.agent:
         print(
             "error: --profile requires --agent (profiles personalize an "
@@ -1280,6 +1360,10 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        mcp_servers = (
+            [s.strip() for s in args.mcp.split(",") if s.strip()]
+            if args.mcp else None
+        )
         return _run_agent_chat(
             args.agent,
             session_id=args.session,
@@ -1294,6 +1378,8 @@ def main(argv: list[str] | None = None) -> int:
             invariants_file=args.invariants_file,
             no_invariants=args.no_invariants,
             audit_invariants_warn=args.audit_invariants_warn,
+            mcp_servers=mcp_servers,
+            mcp_config=args.mcp_config,
         )
 
     # Legacy path.

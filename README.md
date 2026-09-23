@@ -550,6 +550,47 @@ Ready-made servers to point the client at:
 | DeepWiki | `https://mcp.deepwiki.com/mcp` | repo documentation Q&A |
 | Context7 | `https://mcp.context7.com/mcp` | library documentation lookup |
 
+## Own MCP server: notes-CRM + agent tool use
+
+The project ships its **own MCP server** around a small API — a mock-CRM of
+notes kept in a JSON file — and an agent integration that calls it
+(verification report: [`results/mcp_notes_verification.md`](results/mcp_notes_verification.md)).
+
+- [`llm_bot/notes_api.py`](llm_bot/notes_api.py) — the mock-CRM API
+  (`add_note` / `list_notes` / `find_notes`) over `NOTES_DB`
+  (default `data/notes.json`).
+- [`scripts/notes_mcp_server.py`](scripts/notes_mcp_server.py) — FastMCP
+  stdio server registering the three tools with typed parameter schemas and
+  text results.
+- [`llm_bot/mcp_tools.py`](llm_bot/mcp_tools.py) — `MCPToolBridge` (one
+  connection per server) and `MCPRouter` (aggregated catalog, `server__tool`
+  namespacing, per-server failure isolation).
+
+Agent integration uses a **prompt protocol** (the transport speaks plain
+chat-completions): the router injects a system block advertising the tools;
+when the model needs one it replies `{"call_tool": {"name": ..., "arguments":
+{...}}}` — or a batch `{"call_tool": [{...}, ...]}` when one request needs
+several actions. The session executes the call(s) over MCP, feeds the
+results back as a service turn and the model produces the final answer
+(rounds bounded by `mcp_max_rounds`; a batch costs one round). Each
+round-trip is recorded in `session.mcp_events` and printed as `[mcp] ...`
+lines on stderr. MCP is opt-in: without `--mcp` the feature is off even when
+`data/mcp.yaml` exists, and an explicit `--mcp` with a broken/missing setup
+fails with a clean one-line error instead of a traceback.
+
+```bash
+cp mcp.example.yaml data/mcp.yaml    # server list (stdio command or HTTP url)
+
+python -m llm_bot --list-mcp                                   # catalog check
+python -m llm_bot --agent assistant --mcp notes \
+    "запиши заметку: купить корм коту, тег покупки"            # one-shot use
+python scripts/mcp_notes_demo.py                               # live 2-turn demo
+```
+
+Adding more MCP servers is config-only — new entries in `data/mcp.yaml`
+(e.g. `mcp-server-time` or `https://mcp.deepwiki.com/mcp`) selected with
+`--mcp notes,time` / `--mcp all`.
+
 ## Token accounting and context limits
 
 The agent counts tokens on every turn and can refuse to send a request that would
