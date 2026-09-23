@@ -34,10 +34,20 @@ mcp = FastMCP("notes-crm")
 
 @mcp.tool()
 def add_note(text: str, tags: list[str] | None = None) -> str:
-    """Добавить заметку в CRM. Возвращает подтверждение с id заметки."""
-    note = notes_api.add_note(text, tags)
+    """Добавить заметку в CRM. Возвращает подтверждение с id заметки.
+
+    Идемпотентно: повторное добавление той же заметки (тот же текст и теги)
+    НЕ создаёт дубликат — возвращается id уже существующей записи. Это делает
+    безопасным повторное выполнение пакета после сетевых сбоев и ретраев LLM.
+    """
+    try:
+        note = notes_api.add_note(text, tags)
+        action = "Заметка сохранена"
+    except notes_api.DuplicateNoteError as exc:
+        note = exc.existing
+        action = "Заметка уже существует, дубликат не создан"
     tags_part = f", теги: {', '.join(note.tags)}" if note.tags else ""
-    return f"Заметка сохранена: id={note.id}{tags_part}"
+    return f"{action}: id={note.id}{tags_part}"
 
 
 @mcp.tool()

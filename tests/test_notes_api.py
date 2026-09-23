@@ -7,6 +7,7 @@ import json
 import pytest
 
 from llm_bot.notes_api import (
+    DuplicateNoteError,
     Note,
     add_note,
     default_db_path,
@@ -41,6 +42,22 @@ def test_add_note_assigns_sequential_ids(db):
 def test_add_note_normalizes_tags(db):
     note = add_note("text", ["A", " a ", "b"])
     assert note.tags == ["a", "b"]
+
+
+def test_add_note_is_idempotent_by_default(db):
+    first = add_note("Купить хлеб", ["покупки"])
+    with pytest.raises(DuplicateNoteError) as exc_info:
+        add_note("Купить хлеб", ["Покупки"])  # tags normalized identically
+    assert exc_info.value.existing.id == first.id
+    # Exactly one record stored.
+    assert len(list_notes()) == 1
+
+
+def test_add_note_duplicate_opt_out(db):
+    add_note("Купить хлеб")
+    second = add_note("Купить хлеб", allow_duplicates=True)
+    assert second.id == 2
+    assert len(list_notes()) == 2
 
 
 def test_add_note_rejects_empty_text(db):

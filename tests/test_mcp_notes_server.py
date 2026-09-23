@@ -84,6 +84,28 @@ async def test_server_returns_tool_results(tmp_path):
     assert listed.content[0].text.count("id=") == 1
 
 
+async def test_server_add_note_is_idempotent(tmp_path):
+    """Re-adding the same note returns the existing id, no duplicate."""
+
+    async def action(session: ClientSession):
+        first = await session.call_tool(
+            "add_note", {"text": "Купить хлеб", "tags": ["покупки"]}
+        )
+        again = await session.call_tool(
+            "add_note", {"text": "Купить хлеб", "tags": ["покупки"]}
+        )
+        listed = await session.call_tool("list_notes", {})
+        return first, again, listed
+
+    first, again, listed = await _with_session(tmp_path, action)
+
+    assert "id=1" in first.content[0].text
+    assert not again.isError
+    assert "дубликат не создан" in again.content[0].text
+    assert "id=1" in again.content[0].text
+    assert listed.content[0].text.count("id=") == 1
+
+
 async def test_server_error_result_on_bad_input(tmp_path):
     """Invalid input surfaces as an MCP error result, not a crash."""
 

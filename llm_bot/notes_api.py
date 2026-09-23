@@ -25,6 +25,19 @@ DEFAULT_DB_PATH = Path("data") / "notes.json"
 _lock = threading.Lock()
 
 
+class DuplicateNoteError(Exception):
+    """An identical note (same normalized text + tags) already exists.
+
+    Carries the existing note so callers (the MCP tool) can report its id
+    instead of creating a duplicate — makes re-execution after retries or
+    turn failures safe.
+    """
+
+    def __init__(self, existing: Note) -> None:
+        self.existing = existing
+        super().__init__(f"Заметка уже существует: id={existing.id}")
+
+
 def default_db_path() -> Path:
     """Return the notes database path (``NOTES_DB`` or ``data/notes.json``)."""
     raw = os.getenv(_ENV_NOTES_DB)
@@ -70,9 +83,20 @@ def _normalize_tags(tags: list[str] | None) -> list[str]:
 
 
 def add_note(
-    text: str, tags: list[str] | None = None, *, db_path: Path | None = None
+    text: str,
+    tags: list[str] | None = None,
+    *,
+    db_path: Path | None = None,
+    allow_duplicates: bool = False,
 ) -> Note:
-    """Append a note and return it with its assigned id."""
+    """Append a note and return it with its assigned id.
+
+    The operation is idempotent by default: an identical note (same
+    normalized text + tags) is NOT created twice; :class:`DuplicateNoteError`
+    is raised carrying the existing note. This makes re-execution safe when a
+    turn fails after the tool ran (LLM rate limits, retries) and the model
+    repeats the whole batch. Pass ``allow_duplicates=True`` to opt out.
+    """
     text = (text or "").strip()
     if not text:
         raise ValueError("Текст заметки не может быть пустым.")
@@ -80,6 +104,19 @@ def add_note(
     clean_tags = _normalize_tags(tags)
     with _lock:
         notes = _load(path)
+        if not allow_duplicates:
+            for item in notes:
+                if (
+                    str(item.get("text", "")).strip() == text
+                    and [str(t) for t in item.get("tags", [])] == clean_tags
+                ):
+                    raise DuplicateNoteError(
+                        Note(
+                            id=int(item.get("id", 0)),
+                            text=str(item.get("text", "")),
+                            tags=[str(t) for t in item.get("tags", [])],
+                        )
+                    )
         note_id = (
             max((int(item.get("id", 0)) for item in notes), default=0) + 1
         )
