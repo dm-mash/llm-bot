@@ -3,5 +3,9 @@ python-dotenv>=1.0.0
 PyYAML>=6.0
 prompt_toolkit>=3.0.0
 
+# MCP (Model Context Protocol) client SDK + reference time server
+mcp>=1.0.0
+mcp-server-time>=0.6.0
+
 # Development / testing
 pytest>=8.0.0

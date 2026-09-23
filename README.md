@@ -508,6 +508,48 @@ client = LLMClient(LLMConfig.from_env(), detail_listener=Printer())
 print(client.send_prompt("Hello"))
 ```
 
+## MCP connection
+
+The project includes a minimal **MCP (Model Context Protocol) client** that
+connects to a ready-made MCP server and prints its tool catalog
+([`scripts/mcp_list_tools.py`](scripts/mcp_list_tools.py), covered by
+[`tests/test_mcp_list_tools.py`](tests/test_mcp_list_tools.py); verification
+log in [`results/mcp_verification.md`](results/mcp_verification.md)).
+
+```bash
+# Local stdio server (default): the mcp-server-time reference server
+python scripts/mcp_list_tools.py
+# protocol : 2025-11-25
+# server   : mcp-time 1.30.0
+# tools    : 2
+#   - get_current_time   (arg timezone: string, required)
+#   - convert_time       (args source_timezone, time, target_timezone)
+
+# Another local stdio server
+python scripts/mcp_list_tools.py --command mcp-server-fetch
+
+# Remote server over Streamable HTTP
+python scripts/mcp_list_tools.py --url https://mcp.deepwiki.com/mcp
+```
+
+How it works: the client spawns the server as a child process and speaks MCP
+over stdin/stdout (`stdio_client`), or opens a Streamable HTTP connection
+(`streamablehttp_client`); then it performs the `initialize` handshake and
+calls `tools/list`. Exit code 0 = connection OK. Dependencies: `mcp`
+(official SDK) and `mcp-server-time` — both in [`requirements.txt`](requirements.txt).
+
+Ready-made servers to point the client at:
+
+| Server | How to run / endpoint | Tools |
+| --- | --- | --- |
+| `mcp-server-time` | `pip install mcp-server-time` (default) | `get_current_time`, `convert_time` |
+| `mcp-server-fetch` | `pip install mcp-server-fetch` | `fetch` (URL → markdown) |
+| `mcp-server-git` | `pip install mcp-server-git` | `git_status`, `git_log`, `git_diff`, … |
+| `mcp-server-memory` | `pip install mcp-server-memory` | knowledge-graph memory tools |
+| `@modelcontextprotocol/server-filesystem` | `npx @modelcontextprotocol/server-filesystem <dir>` (Node.js) | sandboxed file read/write |
+| DeepWiki | `https://mcp.deepwiki.com/mcp` | repo documentation Q&A |
+| Context7 | `https://mcp.context7.com/mcp` | library documentation lookup |
+
 ## Token accounting and context limits
 
 The agent counts tokens on every turn and can refuse to send a request that would
