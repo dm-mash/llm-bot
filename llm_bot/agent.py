@@ -518,16 +518,19 @@ class Session:
         reply = self.agent.client.chat([{"role": "user", "content": prompt}])
         return _sanitize_text(reply.strip())
 
-    def chat(self, user_message: str) -> str:
+    def chat(self, user_message: str, *, service_turn: bool = False) -> str:
         """Send a user message and return only the assistant's reply text.
 
         Equivalent to :meth:`chat_with_details`, but returns just the reply
         string for callers that do not care about token accounting. Token stats
-        remain available on :attr:`last_usage`.
+        remain available on :attr:`last_usage`. *service_turn* is forwarded —
+        machine-generated turns skip the task auto-detector.
         """
-        return self.chat_with_details(user_message).reply
+        return self.chat_with_details(user_message, service_turn=service_turn).reply
 
-    def chat_with_details(self, user_message: str) -> ChatResult:
+    def chat_with_details(
+        self, user_message: str, *, service_turn: bool = False
+    ) -> ChatResult:
         """Send a user message and return a :class:`ChatResult` with token usage.
 
         The message is appended to the history, the whole stack is sent to the
@@ -544,6 +547,13 @@ class Session:
         :class:`~llm_bot.client.ContextOverflowError` is raised and nothing is
         sent — this is where the caller should trim history or start a new
         session.
+
+        *service_turn* marks a machine-generated message (e.g. the CLI
+        auto-turn after a stage change). Such turns update the dialog history
+        but are NOT fed to the task auto-detector: otherwise the classifier
+        would read the machine's own stage report («проверка пройдена,
+        дефектов нет») and could autonomously advance the pipeline
+        (``validation → done``) without any user decision.
         """
         user_message = _sanitize_text(user_message.strip())
         if not user_message:
@@ -745,10 +755,15 @@ class Session:
         # small LLM call (task setup / stage hints / pause & resume phrases).
         # Skip detection while paused: the task is explicitly stopped, and the
         # detection call would waste tokens and risk rate limits.
+        # Skip detection on SERVICE turns (CLI auto-turn after a stage change):
+        # the classifier would read the machine's own stage report and could
+        # autonomously advance the pipeline (validation → done) without any
+        # user decision — only the real dialog drives the machine.
         if (
             self._task is not None
             and self._task_auto_detect
             and not self._task.state.is_paused
+            and not service_turn
         ):
             try:
                 task_event = detect_task_turn(

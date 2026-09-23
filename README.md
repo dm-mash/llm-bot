@@ -618,8 +618,9 @@ The work on a task is formalized as a **finite-state machine**
 ([`task_state.py`](llm_bot/task_state.py)) with three axes:
 
 * **stage** — the pipeline `planning → execution → validation → done`
-  enforced by a transition table (illegal jumps are rejected; `done` is
-  terminal);
+  enforced by a transition table (`done` is terminal; there are **no**
+  `planning → done` / `execution → done` edges, so a final without validation
+  is impossible even for the model);
 * **step** — what is being done right now;
 * **expected_action** — what should happen next.
 
@@ -633,6 +634,7 @@ stateDiagram-v2
     planning --> execution: next
     execution --> validation: next
     validation --> done: next
+    validation --> execution: rework
     planning --> paused: pause
     execution --> paused: pause
     validation --> paused: pause
@@ -646,8 +648,9 @@ Two ways to drive the machine:
 
 * **auto-detect** (default) — after every turn a small LLM call recognizes a
   task being set from the dialog, stage hints, and pause/resume phrases
-  (same technique as memory auto-extraction). Only *legal* transitions are
-  ever applied; a classifier failure never breaks the turn.
+  (same technique as memory auto-extraction). A legal hint moves the machine
+  *exactly* to the hinted stage (`move_to`); a classifier failure never
+  breaks the turn.
 * **manual** — slash-commands take priority over auto-detection:
 
 ```text
@@ -655,7 +658,8 @@ Two ways to drive the machine:
 /task start <описание>     — start a task (stage = planning)
 /task step <текст>         — set the current step
 /task action <текст>       — set the expected action
-/task next                 — advance to the next pipeline stage
+/task next [заметка]       — advance to the next pipeline stage
+/task rework [причина]     — validation → execution (fix defects)
 /task pause                — pause from any stage
 /task resume               — continue (no re-explanation needed)
 /task reset                — drop the task state
@@ -687,19 +691,76 @@ Pause is enforced on **two levels**:
    `/task resume` (control commands and `/task ...` still work). While
    stopped, the auto-detection LLM call is skipped too, saving tokens.
 
+**Only the user moves the machine.** The auto-detector advances a stage only
+on an explicit user decision in the dialog: an approved *shown* work plan or
+collected requirements (planning), a requested review of a *finished*
+artefact (execution), or an explicit acceptance of the validation report
+(«принято, завершай»). The model's own reports («проверка пройдена,
+дефектов нет») are never treated as hints — the agent cannot promote itself
+through the pipeline. Machine-generated turns (the CLI auto-turn after a
+stage change) are marked `service_turn=True` and skip the detector entirely,
+so a stage change can never cascade to `done` without the user. If
+`/task next` is issued manually from a stage that produced nothing, the CLI
+warns (`[task] внимание: этап 'execution' не имел результатов`) without
+blocking — a manual command is a deliberate decision.
+
+**Hint semantics: the stage of the requested work.** The detector maps a
+request to the stage whose *work is being requested*, not the user's literal
+word: «дай итоговый/финальный результат» asked from planning means
+*execution* (produce the artefact), not `done` — `done` is reserved for
+explicitly ending the whole task («завершить/закрой задачу»).
+
+**Illegal transitions are impossible — and visibly rejected.** The transition
+table is deterministic: neither the model nor the classifier can skip a stage.
+When the auto-detector hears a request to jump («пропусти проверку, завершай»),
+the machine answers threefold: the attempt is written into the machine's log
+(`reject_transition` — persisted, restored after a restart, rendered into the
+prompt block so the model knows a jump was denied), reported to the user on
+stderr with the legal route (`[task] попытка перейти в 'done' отклонена… путь:
+/task next → validation → done`), and kept in `TaskDetectionEvent.rejected_hint`
+for diagnostics. A premature forward move (no stage-exit artefact in the
+dialog) is marked in the log as «по допущениям». Starting a new task while one
+is active is also guarded: `/task start` tells you to `/task reset` first
+instead of silently clobbering the running lifecycle.
+
+**Stage-exit criteria in the detector** — the prompt of the classifier
+([`_DETECTION_PROMPT`](llm_bot/task_state.py)) distinguishes three cases:
+
+| User says (current stage planning) | Machine behaviour |
+|---|---|
+| «дай план работы», требования обсуждаются | stay in planning |
+| plan shown + «план устраивает, дай итоговый план» | legal `stage_hint: execution` — one step forward |
+| requirements answered + user awaits the result | legal `stage_hint: execution` — collected requirements are a planning exit |
+| «давай сразу итоговый план», no plan, no requirements | stay; step «сбор требований» |
+| «дай финальный этап» (literal «финальный») | `stage_hint: execution` — hint = requested work, not `done` |
+| «пропусти проверку / сразу финал» | honest hint → **rejected** (no edge) |
+
 **Stages change what the model actually does** — each stage injects its own
 behaviour directive ([`_STAGE_DIRECTIVES`](llm_bot/task_state.py)):
-`planning` → "предлагай план, не реализуй"; `execution` → "реализуй текущий
-шаг, результат — артефакт"; `validation` → "проверяй по критериям, ничего
-нового"; `done` → "только итоговая сводка". Advancing a stage also auto-fills
-`expected_action` with a stage-typical default (a user-set action is kept), so
-after `/task next` the model immediately knows what is expected next.
+`planning` → "план работы, не итоговый артефакт; когда требования собраны —
+резюмируй их и предложи /task next, не выдавая результат в этой же реплике;
+если просят результат без собранных требований — доуточни или предложи
+/task next по допущениям"; `execution` → "реализуй текущий шаг, результат —
+артефакт"; `validation` → "проверяй по критериям; дефекты — предлагай
+/task rework"; `done` → "только итоговая сводка". Advancing a stage also
+auto-fills `expected_action` with a stage-typical default (a user-set action
+is kept), so after `/task next` the model immediately knows what is expected
+next.
 
-**Auto-turn on stage change** — `/task start`, `/task next` and `/task resume`
-immediately send the model one service turn («этап задачи изменился на … —
-действуй по состоянию задачи», see
+**Rework loop** — validation may find defects: `/task rework` (or a «переделай»
+phrase recognized by the detector) legally moves `validation → execution`
+without touching the done edge. `/task next` from validation still means
+"проверка пройдена, завершаем" — the two edges are distinct.
+
+**Auto-turn on stage change** — `/task start`, `/task next`, `/task rework`
+and `/task resume` immediately send the model one service turn («этап задачи
+изменился на … — действуй по состоянию задачи», see
 [`_task_auto_turn`](llm_bot/cli.py)), so the stage directive takes effect
-*right away* instead of waiting for the user's next message. The reply is
+*right away* instead of waiting for the user's next message. The same holds
+for **auto-detected** stage changes: when a reply moves the machine (G8,
+[`_auto_turn_after_detection`](llm_bot/cli.py)), the model acts on the new
+stage at once — «дай финальный этап» produces the requirement summary *and*
+the artefact in one go, instead of lagging one user turn behind. The reply is
 printed in the chat; an `LLMError` is reported to stderr without aborting the
 command. `/task pause` deliberately sends **no** auto-turn (the model is never
 prompted while paused).

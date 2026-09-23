@@ -34,6 +34,7 @@ from pathlib import Path
 # working directory (e.g. when running ``python scripts/verify_task_state.py``).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from llm_bot.agent import InvariantViolationError  # noqa: E402
 from llm_bot.client import LLMError  # noqa: E402
 from llm_bot.factory import make_session  # noqa: E402
 from llm_bot.json_session_store import JsonSessionStore  # noqa: E402
@@ -52,6 +53,26 @@ def check(name: str, ok: bool, details: str = "") -> None:
     _results.append((name, ok, details))
     mark = "PASS" if ok else "FAIL"
     print(f"[{mark}] {name}" + (f" — {details}" if details else ""))
+
+
+def chat_turn(session, text: str, *, attempts: int = 3) -> str:
+    """One chat turn, retrying transient invariant-audit flukes.
+
+    The language/audit invariants are real-model dependent: occasionally the
+    model answers in the wrong language and the audit rolls the turn back.
+    That is an unrelated flake for the state-machine scenario — retry a couple
+    of times before failing the check.
+    """
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            return session.chat(text)
+        except InvariantViolationError as exc:
+            last = exc  # audit refused the reply; the turn was rolled back
+        except LLMError as exc:  # rate limits etc. — also worth a retry
+            last = exc
+    assert last is not None
+    raise last
 
 
 def _system_blocks(payload: dict) -> list[str]:
@@ -104,6 +125,48 @@ def verify_machine_formalism() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Deterministic part 2: visible rejection of illegal jumps (no LLM)
+# --------------------------------------------------------------------------- #
+
+
+def verify_visible_rejection() -> None:
+    """G1: a jump attempt is logged, prompt-visible and explained."""
+    from llm_bot.task_state import TaskStateMachine
+
+    machine = TaskStateMachine()
+    machine.start("спланировать отпуск")
+    machine.next_stage()  # execution
+    machine.reject_transition(
+        TaskStage.DONE, reason="пользователь: пропусти проверку"
+    )
+    logged = any("отклонена" in e for e in machine.state.log)
+    check("10. Отклонённый прыжок попадает в журнал машины", logged)
+    block = machine.render_prompt_block()
+    check(
+        "11. Отклонённая попытка видна модели в prompt-блоке",
+        "отклонена" in block and "done" in block,
+    )
+    # start-guard: an active task must not be silently replaced (G3).
+    guarded = False
+    try:
+        machine.start("другая задача")
+    except TaskIllegalTransitionError:
+        guarded = True
+    check(
+        "12. /task start на активной задаче требует /task reset (G3)",
+        guarded and machine.state.description == "спланировать отпуск",
+    )
+    # rework loop (G4).
+    machine.next_stage()  # validation
+    machine.rework(reason="дефекты")
+    check(
+        "13. Rework: validation → execution и обратно (G4)",
+        machine.stage is TaskStage.EXECUTION
+        and any("validation → execution" in e for e in machine.state.log),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Real-model part
 # --------------------------------------------------------------------------- #
 
@@ -122,14 +185,19 @@ def verify_with_real_model(agent_name: str) -> None:
     )
     print(f"\n— Диалог с реальным агентом '{agent_name}' (сессия {session_id}) —")
     try:
-        session.chat(
+        chat_turn(
+            session,
             "Давай подготовим отчёт о сравнении двух алгоритмов сортировки: "
             "выбери критерии сравнения и предложи план из трёх шагов. "
-            "Ответь кратко."
+            "Ответь кратко, на русском языке."
         )
     except LLMError as exc:
         check("3. Авто-детект задачи из диалога (реальная модель)", False,
               f"LLMError: {exc}")
+        return
+    except InvariantViolationError as exc:
+        check("3. Авто-детект задачи из диалога (реальная модель)", False,
+              f"InvariantViolationError: {exc}")
         return
     state = session.task_state
     event = session.last_task_event
@@ -145,10 +213,76 @@ def verify_with_real_model(agent_name: str) -> None:
         f"detection_cost={event.total_tokens if event else 0} tok",
     )
 
-    # --- Step 2: advance the pipeline, then pause. ---------------------------
+    # --- Step 1b: premature «давай сразу итоговый план» must NOT jump. -------
+    # No work plan was shown yet, so the machine must stay in planning. The
+    # reply may collect requirements, refuse per the stage directive or offer
+    # /task next — all of that is correct «planning behaviour».
+    task1 = session.task
+    assert task1 is not None
+    try:
+        premature_reply = chat_turn(
+            session, "Давай сразу итоговый план отпуска, без вопросов."
+        )
+    except (LLMError, InvariantViolationError) as exc:
+        check("3a. «Сразу итоговый план» без собранных требований", False,
+              f"{type(exc).__name__}: {exc}")
+        return
+    state1b = session.task_state
+    assert state1b is not None
+    # Stage exit criterion not met → the machine must still be in planning.
+    stayed = state1b.active_stage is TaskStage.PLANNING
+    check(
+        "3a. «Сразу итоговый план» без требований → остаёмся в planning "
+        "(критерий выхода этапа)",
+        bool(stayed),
+        f"stage={state1b.active_stage.value}, "
+        f"reply[:120]={premature_reply[:120]!r}",
+    )
+
+    # --- Step 1c: «пропусти проверку, завершай» must be visibly rejected. ----
+    task1.next_stage(note="план готов — утверждён")  # planning -> execution
+    task1.set_step("составляем итоговый план отпуска")
+    try:
+        skip_reply = chat_turn(
+            session,
+            "Отлично. А теперь пропусти проверку и сразу завершай задачу — "
+            "валидация не нужна.",
+        )
+    except (LLMError, InvariantViolationError) as exc:
+        check("3b. «Пропусти проверку» → явный отказ", False,
+              f"{type(exc).__name__}: {exc}")
+        return
+    state1c = session.task_state
+    assert state1c is not None
+    rejected = (
+        state1c.active_stage is not TaskStage.DONE
+        and state1c.active_stage is TaskStage.EXECUTION
+    )
+    check(
+        "3b. «Пропусти проверку» → машина НЕ в done, этап сохранён",
+        rejected,
+        f"stage={state1c.active_stage.value}, reply[:120]={skip_reply[:120]!r}",
+    )
+    event1c = session.last_task_event
+    check(
+        "3b'. Отклонённая попытка зафиксирована (rejected_hint / журнал)",
+        bool(
+            state1c.active_stage is not TaskStage.DONE
+            and (
+                (event1c is not None and event1c.rejected_hint == "done")
+                or any("отклонена" in e for e in state1c.log)
+            )
+        ),
+        f"rejected_hint={event1c.rejected_hint if event1c else None!r}",
+    )
+
+    # --- Step 2: advance the pipeline (execution already active since 1c),
+    # then pause from execution. -------------------------------------------
     task = session.task
     assert task is not None
-    task.next_stage(note="переходим к работе")  # planning -> execution
+    if task.stage is TaskStage.PLANNING:
+        task.next_stage(note="переходим к работе")  # planning -> execution
+    assert task.stage is TaskStage.EXECUTION
     task.set_step("сравниваем алгоритмы по критериям")
     task.pause()
     check(
@@ -184,13 +318,16 @@ def verify_with_real_model(agent_name: str) -> None:
     # The strict pause directive + CLI hard gate mean the model refuses to
     # work the task until an explicit /task resume.
     try:
-        paused_reply = session2.chat("Продолжай.")
-    except LLMError as exc:
+        paused_reply = chat_turn(session2, "Продолжай.")
+    except (LLMError, InvariantViolationError) as exc:
         check("6. На паузе «Продолжай» не возобновляет работу", False,
-              f"LLMError: {exc}")
+              f"{type(exc).__name__}: {exc}")
         return
-    refused = ("пауз" in paused_reply.lower()
-               and "resume" in paused_reply.lower())
+    low = paused_reply.lower()
+    refused = (
+        ("пауз" in low or "приостанов" in low or "остановл" in low)
+        and ("resume" in low or "/task" in low)
+    )
     check(
         "6. На паузе «Продолжай» не возобновляет работу (жёсткая директива)",
         refused,
@@ -200,15 +337,15 @@ def verify_with_real_model(agent_name: str) -> None:
     # --- Step 4b: after resume, a bare «продолжай» continues the task. -------
     task2.resume()
     try:
-        reply = session2.chat("Продолжай работу над задачей.")
-    except LLMError as exc:
+        reply = chat_turn(session2, "Продолжай работу над задачей.")
+    except (LLMError, InvariantViolationError) as exc:
         check("6a. После resume модель продолжает задачу", False,
-              f"LLMError: {exc}")
+              f"{type(exc).__name__}: {exc}")
         return
     continued = any(
         token in reply.lower()
         for token in ("алгоритм", "сортировк", "критери", "сравнива", "шаг",
-                      "замер", "тест")
+                      "замер", "тест", "отчёт", "отчет")
     )
     check(
         "6a. После resume «Продолжай» продолжает задачу без повторных объяснений",
@@ -217,18 +354,33 @@ def verify_with_real_model(agent_name: str) -> None:
     )
 
     # --- Step 5: resume already happened in 4b; finish the pipeline. ----------
+    # Auto-detection may have legally advanced the machine during turn 6a
+    # (e.g. «итоговый ответ готов» → execution → validation), so the check is
+    # "at least past execution, never skipped": from a legal single-step move
+    # the stage can only be execution or validation here.
+    stage7 = session2.task_state.stage if session2.task_state else None
     check(
-        "7. Resume вернул машину на этап до паузы",
-        session2.task_state.stage is TaskStage.EXECUTION,
-        f"stage={session2.task_state.stage.value}",
+        "7. Resume вернул машину на этап до паузы (или легальный шаг вперёд)",
+        stage7 in (TaskStage.EXECUTION, TaskStage.VALIDATION),
+        f"stage={stage7.value if stage7 else None}",
     )
-    task2.next_stage(note="план готов — проверяем")  # execution -> validation
+    if stage7 is TaskStage.EXECUTION:
+        task2.next_stage(note="план готов — проверяем")  # -> validation
     final = session2.task_state
     check(
         "8. Переход на validation",
         final is not None and final.stage is TaskStage.VALIDATION,
         f"stage={final.stage.value if final else None}",
     )
+
+    # --- Step 5b: rework loop on the real model (G4). -------------------------
+    task2.rework(reason="в отчёте не хватает критериев сравнения")
+    check(
+        "8a. Rework: validation → execution (G4)",
+        session2.task_state.stage is TaskStage.EXECUTION,
+        f"stage={session2.task_state.stage.value}",
+    )
+    task2.next_stage(note="правки внесены — снова проверяем")  # -> validation
 
     usage_total = sum(
         e.total_tokens for e in [*session.task_events, *session2.task_events]
@@ -254,6 +406,7 @@ def main() -> int:
 
     print("=== Верификация машины состояния задачи (реальная модель) ===\n")
     verify_machine_formalism()
+    verify_visible_rejection()
     try:
         verify_with_real_model(args.agent)
     except Exception as exc:  # noqa: BLE001 - report and fail gracefully

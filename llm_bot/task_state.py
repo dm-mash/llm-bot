@@ -59,13 +59,26 @@ class TaskStage(str, Enum):
     PAUSED = "paused"
 
 
-#: Legal forward transitions of the pipeline. Anything not listed is illegal.
+#: Legal transitions of the pipeline. Anything not listed is illegal.
+#:
+#: Forward edges are strictly linear — no skipping (``planning → done``,
+#: ``execution → done`` are absent, so a final without validation is
+#: impossible even for the model). The single non-forward edge is the
+#: **rework** loop ``validation → execution``: when validation finds defects,
+#: the task legally goes back to production instead of being stuck.
 TRANSITIONS: dict[TaskStage, tuple[TaskStage, ...]] = {
     TaskStage.PLANNING: (TaskStage.EXECUTION,),
     TaskStage.EXECUTION: (TaskStage.VALIDATION,),
-    TaskStage.VALIDATION: (TaskStage.DONE,),
+    TaskStage.VALIDATION: (TaskStage.DONE, TaskStage.EXECUTION),  # rework
     TaskStage.DONE: (),
     TaskStage.PAUSED: (),
+}
+
+#: Backward (rework) edges — legal but *not* "forward", so ``next_stage`` (the
+#: "advance" command) never picks them; only :meth:`TaskStateMachine.rework`
+#: and an explicit hint target do.
+_REWORK: dict[TaskStage, tuple[TaskStage, ...]] = {
+    TaskStage.VALIDATION: (TaskStage.EXECUTION,),
 }
 
 #: Stages from which ``pause`` is legal (any non-terminal, non-paused stage).
@@ -82,9 +95,14 @@ _PROMPT_LOG_TAIL = 3
 #: stages via ``next_stage`` / ``resume`` observably changes behaviour.
 _STAGE_DIRECTIVES: dict[TaskStage, str] = {
     TaskStage.PLANNING: (
-        "Ты на этапе ПЛАНИРОВАНИЯ. Разбивай задачу на шаги, уточняй "
-        "требования и предлагай план. Не реализовывай и не пиши код; жди "
-        "утверждения плана (переход дальше — команда /task next)."
+        "Ты на этапе ПЛАНИРОВАНИЯ. Уточняй требования вопросами или "
+        "формулируй допущения, предлагай ПЛАН РАБОТЫ, а не итоговый "
+        "артефакт задачи. Когда пользователь ответил на твои вопросы или "
+        "подтвердил допущения — кратко резюмируй собранные требования и "
+        "предложи перейти дальше командой /task next; НЕ выдавай итоговый "
+        "результат в этой же реплике. Если пользователь просит результат "
+        "без собранных требований — сначала доуточни их или явно предложи "
+        "/task next по допущениям."
     ),
     TaskStage.EXECUTION: (
         "Ты на этапе ВЫПОЛНЕНИЯ. Реализуй текущий шаг; результат — "
@@ -93,8 +111,9 @@ _STAGE_DIRECTIVES: dict[TaskStage, str] = {
     ),
     TaskStage.VALIDATION: (
         "Ты на этапе ПРОВЕРКИ. Проверь результат по критериям задачи, "
-        "перечисли дефекты и риски. Ничего нового не добавляй; по итогам — "
-        "команда /task next завершает задачу."
+        "перечисли дефекты и риски. Ничего нового не добавляй. По итогам: "
+        "если дефекты есть — предложи /task rework (возврат к выполнению), "
+        "если всё чисто — команда /task next завершает задачу."
     ),
     TaskStage.DONE: (
         "Задача ЗАВЕРШЕНА. Давай только итоговую сводку; новую работу "
@@ -268,12 +287,72 @@ class TaskStateMachine:
     # -- transitions --------------------------------------------------------- #
 
     def start(self, description: str) -> TaskState:
-        """Start a new task: stage becomes ``planning``; clears previous state."""
+        """Start a new task: stage becomes ``planning``; clears previous state.
+
+        Guard: when a task is already active the call is rejected instead of
+        silently clobbering the running lifecycle — the user must ``reset``
+        explicitly (``/task reset``) to abandon the current task.
+        """
+        if self.is_active:
+            raise TaskIllegalTransitionError(
+                "Задача уже активна (этап "
+                f"'{self._state.active_stage.value}'): {self._state.description!r}. "
+                "Сначала /task reset, чтобы начать новую."
+            )
         description = description.strip()
         if not description:
             raise ValueError("Описание задачи не может быть пустым.")
         self._state = TaskState(description=description)
         self._log(f"задача запущена: {description}")
+        self._commit()
+        return self.state
+
+    def reject_transition(self, target: str | TaskStage, reason: str = "") -> TaskState:
+        """Record a rejected (illegal) transition attempt in the log.
+
+        The attempt stays in the machine's history (and in the prompt block,
+        since the log tail is rendered there), so the model knows a jump was
+        tried and denied, and the user sees explicit feedback instead of
+        silence. The state itself never changes.
+        """
+        target_stage = _stage(target)
+        current = self._state.active_stage
+        suffix = f": {reason.strip()}" if reason.strip() else ""
+        self._log(
+            f"попытка перехода '{current.value}' → '{target_stage.value}' "
+            f"отклонена{suffix}"
+        )
+        self._commit()
+        return self.state
+
+    def move_to(self, target: str | TaskStage, *, note: str = "") -> TaskState:
+        """Move the machine to *target* when that edge is legal.
+
+        Unlike :meth:`next_stage` (which always follows the *first* forward
+        successor), this transitions exactly to the requested stage — the only
+        way to take a non-first edge such as the ``validation → execution``
+        rework. With one edge per "direction" the two behave identically, so
+        this is also the method auto-detection uses to apply a hint precisely
+        (never "closest successor").
+        """
+        target_stage = _stage(target)
+        current = self._state.stage
+        if target_stage not in TRANSITIONS.get(current, ()):
+            raise TaskIllegalTransitionError(
+                f"Переход '{current.value}' → '{target_stage.value}' запрещён. "
+                f"Разрешены: {', '.join(s.value for s in TRANSITIONS.get(current, ())) or 'нет'}."
+            )
+        previous = current
+        self._state.stage = target_stage
+        self._state.paused_from = None
+        default = _STAGE_DEFAULT_ACTIONS.get(target_stage)
+        stale = self._state.expected_action in set(
+            _STAGE_DEFAULT_ACTIONS.values()
+        )
+        if default and (not self._state.expected_action or stale):
+            self._state.expected_action = default
+        suffix = f" ({note.strip()})" if note.strip() else ""
+        self._log(f"{previous.value} → {target_stage.value}{suffix}")
         self._commit()
         return self.state
 
@@ -289,19 +368,22 @@ class TaskStateMachine:
         transition. A user-set action (``set_expected_action``) is preserved.
         """
         current = self._state.stage
-        target = next_stage(current)  # raises on illegal jump
-        self._state.stage = target
-        self._state.paused_from = None
-        default = _STAGE_DEFAULT_ACTIONS.get(target)
-        stale = self._state.expected_action in set(
-            _STAGE_DEFAULT_ACTIONS.values()
-        )
-        if default and (not self._state.expected_action or stale):
-            self._state.expected_action = default
-        suffix = f" ({note.strip()})" if note.strip() else ""
-        self._log(f"{current.value} → {target.value}{suffix}")
-        self._commit()
-        return self.state
+        target = next_stage(current)  # raises on illegal jump / terminal
+        return self.move_to(target, note=note)
+
+    def rework(self, *, reason: str = "") -> TaskState:
+        """Return from ``validation`` to ``execution`` (the rework loop).
+
+        Legal only from validation: the task comes back to production when the
+        check found defects. Forward advance stays available via
+        :meth:`next_stage` (validation → done).
+        """
+        if self._state.stage is not TaskStage.VALIDATION:
+            raise TaskIllegalTransitionError(
+                "Доработка возможна только из этапа 'validation' "
+                f"(текущий: '{self._state.stage.value}')."
+            )
+        return self.move_to(TaskStage.EXECUTION, note=reason or "доработка по итогам проверки")
 
     def pause(self) -> TaskState:
         """Pause from any non-terminal stage; remembers where to return.
@@ -447,7 +529,39 @@ _DETECTION_PROMPT = (
     "\"step\"; это самый важный случай.\n"
     "2. Если задача уже идёт — верни JSON-объект с полями:\n"
     "   \"stage_hint\": \"planning\"|\"execution\"|\"validation\"|\"done\"|null "
-    "(null = этап не менялся);\n"
+    "(null = этап не менялся):\n"
+    "     • ОБЩЕЕ ПРАВИЛО: этап меняется только по решению ПОЛЬЗОВАТЕЛЯ. "
+    "Отчёт самой ассистентки («проверка пройдена», «всё чисто», «результат "
+    "готов») подсказкой НЕ считается — сама себя продвигать нельзя;\n"
+    "     • СЕМАНТИКА ПОДСКАЗКИ: \"stage_hint\" — это этап ЗАПРАШИВАЕМОЙ "
+    "работы, а не дословное слово пользователя. Просьба из planning дать "
+    "результат / итоговый вариант / финальный ответ — это \"stage_hint\": "
+    "\"execution\" (просят само исполнение), а НЕ done. \"done\" — ТОЛЬКО "
+    "когда пользователь явно завершает задачу целиком («завершить задачу», "
+    "«закрой задачу», «с задачей закончили»);\n"
+    "     • planning → execution: если (а) план работы уже был показан в "
+    "диалоге И пользователь одобряет ЕГО, ИЛИ (б) требования уже собраны — "
+    "пользователь ответил на уточняющие вопросы либо подтвердил допущения — "
+    "и теперь ждёт результат. Одобрение без показанного плана И без "
+    "собранных требований («давай дальше», «ну давай») — это "
+    "\"stage_hint\": null, \"stage_exit\": \"assumptions\";\n"
+    "     • execution → validation: артефакт готов И пользователь просит "
+    "проверить/принять его;\n"
+    "     • validation → done: ТОЛЬКО явное принятие пользователем результата "
+    "проверки («принято», «ок, завершай», «согласен»). Отчёт «дефектов нет» "
+    "без реплики пользователя — \"stage_hint\": null;\n"
+    "     • если критерий выхода НЕ выполнен (например, просят «сразу итоговый "
+    "результат», но план работы ещё не был показан и требования не собраны) — "
+    "верни \"stage_hint\": null и \"step\": \"сбор требований\";\n"
+    "     • если пользователь просит пересмотреть результат после проверки "
+    "(«есть дефекты, переделай») — верни \"stage_hint\": \"execution\" из "
+    "validation (доработка);\n"
+    "     • если пользователь просит пропустить этап или финализировать сразу "
+    "мимо конвейера — всё равно верни честный \"stage_hint\" желаемого этапа: "
+    "нелегальные подсказки будут отклонены автоматом, это нормально;\n"
+    "   \"stage_exit\": \"done\"|\"assumptions\"|null — \"done\": пользователь "
+    "хочет завершить задачу прямо сейчас; \"assumptions\": переход вперёд "
+    "происходит по непроверенным допущениям;\n"
     "   \"step\": \"<текущий шаг>\"|null;\n"
     "   \"expected_action\": \"<ожидаемое действие>\"|null;\n"
     "   \"paused\": true — пользователь просит паузу/отложить;\n"
@@ -491,9 +605,13 @@ def detect_task_turn(
 
     Makes one small LLM call via *chat* (same technique as
     :func:`llm_bot.memory.extract_memory`): recognizes a task being set, legal
-    stage hints, step/action updates and pause/resume phrases. Only transitions
-    allowed by :data:`TRANSITIONS` are applied — an illegal hint is recorded in
-    the event's ``rejected_hint`` and dropped, keeping the formalism intact.
+    stage hints, step/action updates and pause/resume phrases. A legal hint
+    moves the machine *exactly* to the hinted stage
+    (:meth:`TaskStateMachine.move_to`); an illegal one is **visibly rejected**:
+    recorded in the event's ``rejected_hint`` AND in the machine's log via
+    ``reject_transition`` (persisted, rendered into the prompt block, printed
+    by the CLI) — no silent drops. A premature forward move is marked in the
+    log as done «по допущениям» (the ``stage_exit`` field).
     Never raises on classifier failures: a broken reply yields a
     ``recognized=False`` event and the machine is left untouched.
     """
@@ -553,7 +671,8 @@ def detect_task_turn(
         except TaskIllegalTransitionError:
             pass
     else:
-        # 3. Stage hint — applied only when it is a legal forward transition.
+        # 3. Stage hint — applied exactly to the hinted stage when the edge is
+        # legal; otherwise visibly rejected (log + event), never silently.
         hint = payload.get("stage_hint")
         if isinstance(hint, str) and hint.strip():
             try:
@@ -562,9 +681,23 @@ def detect_task_turn(
                 hinted = None
             current = task.state.active_stage
             if hinted is not None and hinted in TRANSITIONS.get(current, ()):
-                task.next_stage()
+                stage_exit = payload.get("stage_exit")
+                premature = stage_exit == "assumptions"
+                note = (
+                    "по допущениям — требования не проверены"
+                    if premature
+                    else ""
+                )
+                task.move_to(hinted, note=note)
                 event = _replace(event, stage_moved=hinted.value)
             elif hinted is not None and hinted is not current:
+                task.reject_transition(
+                    hinted,
+                    reason="этап пропускается — сначала "
+                           + " → ".join(
+                               s.value for s in _path_to(current, hinted)
+                           ),
+                )
                 event = _replace(event, rejected_hint=hinted.value)
 
     # 4. Free-form axes are updated freely.
@@ -583,6 +716,26 @@ def detect_task_turn(
 def _replace(event: TaskDetectionEvent, **changes: Any) -> TaskDetectionEvent:
     """Return a copy of a frozen event with *changes* applied."""
     return TaskDetectionEvent(**{**event.__dict__, **changes})
+
+
+def _path_to(current: TaskStage, target: TaskStage) -> list[TaskStage]:
+    """The forward path the machine must take to legally reach *target*.
+
+    Follows the *first* successor of each stage per :data:`TRANSITIONS`; used
+    to explain a rejected jump («сначала execution, затем validation»).
+    Returns ``[target]`` when no forward path exists (unknown/terminal).
+    """
+    path: list[TaskStage] = []
+    seen: set[TaskStage] = set()
+    node = current
+    while node is not target and node not in seen:
+        seen.add(node)
+        successors = TRANSITIONS.get(node, ())
+        if not successors:
+            break
+        node = successors[0]
+        path.append(node)
+    return path or [target]
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

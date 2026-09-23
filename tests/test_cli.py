@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from llm_bot.cli import (
+    _auto_turn_after_detection,
     _handle_task_command,
     _interactive_loop,
     _print_history,
@@ -27,7 +28,7 @@ class _FakeSession:
         self.history = list(history)
         self.chat_calls: list[str] = []
 
-    def chat(self, text: str) -> str:
+    def chat(self, text: str, *, service_turn: bool = False) -> str:
         self.chat_calls.append(text)
         self.history.append({"role": "user", "content": text})
         self.history.append({"role": "assistant", "content": "reply-ok"})
@@ -321,9 +322,10 @@ def test_task_resume_sends_auto_turn_but_pause_does_not(capsys):
 
 def test_task_auto_turn_error_is_reported_not_raised(capsys, monkeypatch):
     """An LLM failure during the auto-turn must not crash the command."""
+    # The service-turn signature: the CLI passes service_turn=True.
     session = _TaskSession()
 
-    def boom(text: str) -> str:
+    def boom(text: str, *, service_turn: bool = False) -> str:
         raise LLMError("provider down")
 
     session.chat = boom  # type: ignore[method-assign]
@@ -332,13 +334,237 @@ def test_task_auto_turn_error_is_reported_not_raised(capsys, monkeypatch):
     assert "авто-ход" in err
 
 
-def test_task_status_sends_no_auto_turn(capsys, monkeypatch):
+def test_task_status_sends_no_auto_turn(capsys):
     """/task (status) and unknown subcommands must not touch the model."""
     session = _TaskSession()
     assert _handle_task_command(session, "/task") is True
     assert _handle_task_command(session, "/task белиберда") is True
     assert session.chat_calls == []
+
+
+# -- G1/G3/G4: rejection feedback, rework, start guard ----------------------- #
+
+
+def test_task_rejection_feedback_is_printed(capsys):
+    """A rejected auto-hint must produce an explicit stderr line."""
+    session = _TaskSession()
+    session.task.start("задача")
+    session.task.next_stage()  # execution
+    from llm_bot.cli import _print_task_rejection
+    from llm_bot.task_state import TaskDetectionEvent
+
+    session.last_task_event = TaskDetectionEvent(rejected_hint="done")
+    _print_task_rejection(session)
+    err = capsys.readouterr().err
+    assert "отклонена" in err
+    assert "done" in err
+    # G7-4: the leading "/task next" appears exactly once (no trailing dup).
+    assert err.count("/task next") == 1
+    assert "/task next → validation → done\n" in err
+
+
+def test_task_rejection_feedback_silent_without_rejection(capsys):
+    from llm_bot.cli import _print_task_rejection
+    from llm_bot.task_state import TaskDetectionEvent
+
+    session = _TaskSession()
+    session.task.start("задача")
+    session.last_task_event = TaskDetectionEvent()
+    _print_task_rejection(session)
+    assert capsys.readouterr().err == ""
+
+
+def test_task_rework_command(capsys):
+    """/task rework returns validation -> execution with one auto-turn."""
+    session = _TaskSession()
+    _handle_task_command(session, "/task start демо")
+    _handle_task_command(session, "/task next")
+    _handle_task_command(session, "/task next")
+    assert session.task.stage is TaskStage.VALIDATION
+    session.chat_calls.clear()
+
+    assert _handle_task_command(session, "/task rework дефекты в коде") is True
+    assert session.task.stage is TaskStage.EXECUTION
+    auto_turns = [c for c in session.chat_calls
+                  if "Этап задачи изменился" in c]
+    assert len(auto_turns) == 1
+    err = capsys.readouterr().err
+    assert "доработка" in err
+    assert "execution" in err
+
+
+def test_task_rework_outside_validation_is_rejected(capsys):
+    session = _TaskSession()
+    _handle_task_command(session, "/task start демо")
+    assert _handle_task_command(session, "/task rework") is True
+    err = capsys.readouterr().err
+    assert "validation" in err
+    assert session.task.stage is TaskStage.PLANNING
+
+
+def test_task_start_on_active_task_is_guarded(capsys):
+    """/task start while a task runs must NOT clobber it; reset is required."""
+    session = _TaskSession()
+    _handle_task_command(session, "/task start первая")
+    _handle_task_command(session, "/task next")
+    assert _handle_task_command(session, "/task start вторая") is True
+    err = capsys.readouterr().err
+    assert "уже активна" in err
+    assert "reset" in err
+    assert session.task.state.description == "первая"
+    assert session.task.stage is TaskStage.EXECUTION
+
+    _handle_task_command(session, "/task reset")
+    _handle_task_command(session, "/task start вторая")
+    assert session.task.state.description == "вторая"
+
+
+def test_task_next_accepts_a_note(capsys):
+    """G1: /task next <заметка> lands in the machine's log."""
+    session = _TaskSession()
+    _handle_task_command(session, "/task start демо")
+    session.chat_calls.clear()
+    assert _handle_task_command(session, "/task next план утверждён") is True
+    assert session.task.stage is TaskStage.EXECUTION
+    assert any("план утверждён" in e for e in session.task.state.log)
+    assert len(session.chat_calls) == 1  # auto-turn still fires exactly once
+
+
+# -- G6-3: empty-stage warning on manual /task next -------------------------- #
+
+
+def test_task_next_warns_on_empty_stage(capsys):
+    """G6-3: jumping over a stage that produced nothing warns the user."""
+    session = _TaskSession()
+    _handle_task_command(session, "/task start демо")
+    _handle_task_command(session, "/task next")  # planning -> execution
+    session.chat_calls.clear()
+    capsys.readouterr()
+
+    assert _handle_task_command(session, "/task next") is True
+    err = capsys.readouterr().err
+    assert "не имел результатов" in err
+    assert session.task.stage is TaskStage.VALIDATION
+
+
+def test_task_next_no_warning_when_stage_has_results(capsys):
+    """G6-3: a stage with work done (log entries) does not warn."""
+    session = _TaskSession()
+    _handle_task_command(session, "/task start демо")
+    _handle_task_command(session, "/task next")  # -> execution
+    _handle_task_command(session, "/task step пишу код")
+    session.chat_calls.clear()
+    capsys.readouterr()
+
+    assert _handle_task_command(session, "/task next") is True
+    err = capsys.readouterr().err
+    assert "не имел результатов" not in err
+    assert session.task.stage is TaskStage.VALIDATION
+
+
+def test_task_auto_turn_is_service_turn(capsys):
+    """G6-1: the CLI auto-turn must pass service_turn=True to chat."""
+    session = _TaskSession()
+    calls: list[dict] = []
+
+    def spy_chat(text: str, *, service_turn: bool = False) -> str:
+        calls.append({"text": text, "service_turn": service_turn})
+        return "reply-ok"
+
+    session.chat = spy_chat  # type: ignore[method-assign]
+    _handle_task_command(session, "/task start демо")
+    assert len(calls) == 1
+    assert calls[0]["service_turn"] is True
+    assert "Этап задачи изменился" in calls[0]["text"]
+
+
+# -- G8: service auto-turn after an auto-detected stage change ----------------- #
+
+
+def test_auto_turn_after_detection_fires_on_stage_move(capsys):
+    """G8: a detected stage move is immediately followed by one service turn."""
+    from llm_bot.task_state import TaskDetectionEvent
+
+    session = _TaskSession()
+    session.task.start("подобрать фильмы")  # planning
+    # The detector does both: moves the machine and records the event.
+    session.task.move_to(TaskStage.EXECUTION)
+    session.last_task_event = TaskDetectionEvent(stage_moved="execution")
+    _auto_turn_after_detection(session)
+    assert len(session.chat_calls) == 1
+    assert "Этап задачи изменился" in session.chat_calls[0]
+    assert "execution" in session.chat_calls[0]
+
+
+def test_auto_turn_after_detection_fires_on_start_and_resume(capsys):
+    """G8: started/resumed detections also trigger the immediate auto-turn."""
+    from llm_bot.task_state import TaskDetectionEvent
+
+    session = _TaskSession()
+    session.last_task_event = TaskDetectionEvent(started=True)
+    _auto_turn_after_detection(session)
+    assert len(session.chat_calls) == 1
+    assert "planning" in session.chat_calls[0]
+
+    session2 = _TaskSession()
+    session2.task.start("задача")
+    session2.task.pause()
+    session2.task.resume()  # back on the pre-pause stage (planning)
+    session2.last_task_event = TaskDetectionEvent(resumed=True)
+    _auto_turn_after_detection(session2)
+    assert len(session2.chat_calls) == 1
+    assert "planning" in session2.chat_calls[0]
+
+
+def test_auto_turn_after_detection_silent_without_move(capsys):
+    """G8: a plain reply (no stage change) must not send any extra turn."""
+    from llm_bot.task_state import TaskDetectionEvent
+
+    session = _TaskSession()
+    session.task.start("задача")
+    session.last_task_event = TaskDetectionEvent(recognized=True)
+    _auto_turn_after_detection(session)
+    assert session.chat_calls == []
+    session.last_task_event = TaskDetectionEvent(rejected_hint="done")
+    _auto_turn_after_detection(session)  # a rejection is NOT a move
+    assert session.chat_calls == []
+    session.last_task_event = None
+    _auto_turn_after_detection(session)  # no event at all
+    assert session.chat_calls == []
+
+
+def test_interactive_loop_auto_turns_after_detected_move(capsys, monkeypatch):
+    """G8, end to end: a chat turn that moves the stage triggers one more
+    service turn right away, mirroring a manual ``/task next``."""
+    from llm_bot.task_state import TaskDetectionEvent
+
+    session = _TaskSession()
+    session.task.start("подобрать фильмы")  # planning
+    base_chat = session.chat
+
+    def chat_then_detect(text: str, *, service_turn: bool = False) -> str:
+        result = base_chat(text, service_turn=service_turn)
+        if not service_turn:
+            # Emulate Session.chat: the completed user turn drives the
+            # detector, which moves the machine and records the event.
+            session.task.move_to(TaskStage.EXECUTION)
+            session.last_task_event = TaskDetectionEvent(
+                stage_moved="execution"
+            )
+        return result
+
+    session.chat = chat_then_detect  # type: ignore[method-assign]
+
+    inputs = iter(["давай финальный этап", "exit"])
     monkeypatch.setattr(
-        "builtins.input", lambda prompt: f"echo:{prompt}"
+        "llm_bot.cli._read_input", lambda _prompt, **kwargs: next(inputs)
     )
-    assert _read_input("? ") == "echo:? "
+    code = _interactive_loop(session)
+    assert code == 0
+    err = capsys.readouterr().err
+    # Turn 1 = the user message; turn 2 = the G8 service auto-turn.
+    assert session.chat_calls[0] == "давай финальный этап"
+    assert len(session.chat_calls) == 2
+    assert "Этап задачи изменился" in session.chat_calls[1]
+    assert "авто-ход (этап 'execution')" in err
+    assert session.task.state.stage is TaskStage.EXECUTION

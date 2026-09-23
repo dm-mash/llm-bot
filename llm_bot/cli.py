@@ -668,12 +668,113 @@ def _task_auto_turn(session: Session, stage: TaskStage) -> None:
         "состоянию задачи (см. блок состояния)."
     )
     try:
-        reply = session.chat(service)
+        # service_turn=True: the machine-generated stage report must NOT feed
+        # the task auto-detector, otherwise the classifier could advance the
+        # pipeline (validation → done) on its own, with no user decision.
+        reply = session.chat(service, service_turn=True)
     except LLMError as exc:
         print(f"[task] авто-ход не удался: {exc}", file=sys.stderr)
         return
     print(f"[task] авто-ход (этап '{stage.value}'):", file=sys.stderr)
     print(reply)
+
+
+def _auto_turn_after_detection(session: Session) -> None:
+    """Send the service auto-turn after an auto-detected stage change (G8).
+
+    A manual ``/task next`` calls :func:`_task_auto_turn` immediately, but an
+    auto-detected move used to leave a one-turn lag: the reply that *caused*
+    the move was produced under the OLD stage directive (e.g. «дай финальный
+    этап» moved planning → execution, yet the artefact only appeared after
+    the user's NEXT message). This mirrors the manual path: the model acts on
+    the new stage right away. The turn is marked ``service_turn=True``, so
+    the detector never sees it (G6-1) — no autonomous cascades.
+    """
+    event = getattr(session, "last_task_event", None)
+    if event is None:
+        return
+    if not (event.stage_moved or event.started or event.resumed):
+        return
+    task = getattr(session, "task", None)
+    if task is None:
+        return
+    _task_auto_turn(session, task.state.active_stage)
+
+
+def _warn_empty_stage(session: Session) -> None:
+    """Warn when a manual ``/task next`` leaves a stage that produced nothing.
+
+    A stage is "empty" when the log contains no entries *after* the entry that
+    moved the machine into it (no step updates, no transition notes) — e.g.
+    the user jumps ``execution → validation`` without ever letting the model
+    work. This does not block the transition (a manual command is a deliberate
+    decision), it only makes the cascade visible.
+    """
+    task = getattr(session, "task", None)
+    state = getattr(session, "task_state", None)
+    if task is None or state is None:
+        return
+    stage = state.active_stage
+    log = state.log
+    # Find the entry that moved the machine INTO this stage (scanning from
+    # the end): "… → <stage>[ (note)]". For planning (start) it is the
+    # "задача запущена: …" entry.
+    entered_idx = -1
+    for idx in range(len(log) - 1, -1, -1):
+        entry = log[idx]
+        if f"→ {stage.value}" in entry or entry.startswith(f"{stage.value} →"):
+            entered_idx = idx
+            break
+        if entry.startswith("задача запущена:") and stage is TaskStage.PLANNING:
+            entered_idx = idx
+            break
+    if entered_idx == -1:
+        return  # cannot tell — stay silent rather than nag
+    if len(log) - 1 > entered_idx:
+        return  # there are entries after entering: the stage did work
+    print(
+        f"[task] внимание: этап '{stage.value}' не имел результатов "
+        "(переход по решению пользователя).",
+        file=sys.stderr,
+    )
+
+
+def _print_task_rejection(session: Session) -> None:
+    """Print explicit feedback when auto-detection rejected a stage jump.
+
+    The machine never follows an illegal hint; without this line the attempt
+    would be silent (the user could not tell a rejection from "nothing
+    happened"). The same attempt is already in the machine's log and in the
+    prompt block, so the model knows too.
+    """
+    event = getattr(session, "last_task_event", None)
+    if event is None or not event.rejected_hint:
+        return
+    task = getattr(session, "task", None)
+    current = task.state.active_stage if task is not None else None
+    path = _reject_route(current, event.rejected_hint)
+    print(
+        f"[task] попытка перейти в '{event.rejected_hint}' отклонена: "
+        f"прыжок через этап запрещён. Путь: /task next → {path}",
+        file=sys.stderr,
+    )
+
+
+def _reject_route(current: TaskStage | None, target: str) -> str:
+    """Human-readable legal route from *current* to the hinted *target*.
+
+    The caller already prints the leading ``/task next`` hint, so the
+    route itself must not repeat it.
+    """
+    from llm_bot.task_state import _path_to, _stage
+
+    if current is None:
+        return target
+    try:
+        stages = _path_to(current, _stage(target))
+    except ValueError:
+        return target
+    return " → ".join(s.value for s in stages)
 
 
 def _handle_task_command(session: Session, raw: str) -> bool:
@@ -723,8 +824,14 @@ def _handle_task_command(session: Session, raw: str) -> bool:
                 task.set_expected_action(rest)
                 print(f"[task] ожидаемое действие: {rest}", file=sys.stderr)
         elif name in {"next", "далее"}:
-            state = task.next_stage()
+            _warn_empty_stage(session)
+            state = task.next_stage(note=rest)
             print(f"[task] этап: {state.stage.value}", file=sys.stderr)
+            _task_auto_turn(session, state.stage)
+        elif name in {"rework", "доработка"}:
+            state = task.rework(reason=rest)
+            print(f"[task] доработка: возврат на этап '{state.stage.value}'.",
+                  file=sys.stderr)
             _task_auto_turn(session, state.stage)
         elif name in {"pause", "пауза"}:
             state = task.pause()
@@ -742,7 +849,7 @@ def _handle_task_command(session: Session, raw: str) -> bool:
             print("[task] состояние задачи сброшено.", file=sys.stderr)
         else:
             print("[task] неизвестная подкоманда. Доступны: status, start, step, "
-                  "action, next, pause, resume, reset.", file=sys.stderr)
+                  "action, next, rework, pause, resume, reset.", file=sys.stderr)
     except ValueError as exc:
         print(f"[task] {exc}", file=sys.stderr)
     return True
@@ -823,6 +930,11 @@ def _interactive_loop(session: Session) -> int:
             _print_compression(session)
             _print_memory(session)
             _print_invariant_warnings(session)
+            _print_task_rejection(session)
+            # G8: the reply may have moved the stage (auto-detection). Let the
+            # model act on the new stage NOW, like a manual /task next does,
+            # instead of lagging one user turn behind.
+            _auto_turn_after_detection(session)
     except KeyboardInterrupt:
         pass
     return 0
