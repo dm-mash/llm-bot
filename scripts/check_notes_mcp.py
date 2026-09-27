@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Smoke-check the notes MCP server: list tools and call each one.
 
-Starts ``scripts/notes_mcp_server.py`` as a child process, performs the MCP
+Starts the ``llm_bot.mcp_servers.notes`` module as a child process, performs
+the MCP
 handshake, prints the tool catalog and exercises add/list/find against a
 temporary database. Prints PASS/FAIL per check and exits non-zero on failure.
 
@@ -22,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
-SERVER = ROOT / "scripts" / "notes_mcp_server.py"
+SERVER_MODULE = "llm_bot.mcp_servers.notes"
 
 
 async def main() -> int:
@@ -30,7 +31,8 @@ async def main() -> int:
         env = {**os.environ, "NOTES_DB": str(Path(tmp) / "notes.json")}
         params = StdioServerParameters(
             command=sys.executable,
-            args=[str(SERVER)],
+            args=["-m", SERVER_MODULE],
+            cwd=str(ROOT),
             env=env,
         )
         failures: list[str] = []

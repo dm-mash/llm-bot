@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from llm_bot.notes_api import (
+from llm_bot.api.notes import (
     DuplicateNoteError,
     Note,
     add_note,

@@ -34,7 +34,7 @@ from llm_bot.mcp_tools import MCPToolBridge, MCPRouter
 from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER = ROOT / "scripts" / "notes_mcp_server.py"
+SERVER_MODULE = "llm_bot.mcp_servers.notes"
 DEFAULT_DB = ROOT / "data" / "notes_demo.json"
 DEFAULT_OUT = "results/mcp_notes_demo.md"
 
@@ -46,7 +46,7 @@ def build_router(db_path: Path) -> MCPRouter:
             MCPToolBridge(
                 "notes",
                 command=sys.executable,
-                args=[str(SERVER)],
+                args=["-m", SERVER_MODULE],
                 env={**os.environ, "NOTES_DB": str(db_path)},
             )
         ]

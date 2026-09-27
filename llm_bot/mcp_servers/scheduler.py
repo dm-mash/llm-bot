@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """MCP server: the control panel for scheduled background tasks.
 
 Through these tools the chat agent creates delayed/periodic jobs (reminders,
@@ -20,19 +19,13 @@ Tools (stateless — all state lives in the JSON store):
 Speaks MCP over stdio: ONLY protocol frames go to stdout, diagnostics to
 stderr. Store path comes from ``SCHEDULER_DB`` (default ``data/scheduler.json``).
 
-Run manually for a smoke check (it will wait on stdin):
-    python scripts/scheduler_mcp_server.py
+Run from the project root for a smoke check (it will wait on stdin):
+    python -m llm_bot.mcp_servers.scheduler
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-# Make the project's ``llm_bot`` package importable regardless of CWD.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.server.fastmcp import FastMCP
 
 from llm_bot.scheduler import (  # noqa: E402
     KIND_DAILY,

@@ -6,21 +6,23 @@
 #   stdio server : command (+ optional args / env) spawned as a child process
 #   HTTP server  : url of a Streamable HTTP MCP endpoint
 #
+# Own servers live in llm_bot/mcp_servers/ and are launched as modules from
+# the project root: python -m llm_bot.mcp_servers.<name>.
 servers:
-  # Own mock-CRM server (scripts/notes_mcp_server.py) over a JSON file.
+  # Own mock-CRM server (llm_bot/mcp_servers/notes.py) over a JSON file.
   notes:
     command: python
-    args: [scripts/notes_mcp_server.py]
+    args: [-m, llm_bot.mcp_servers.notes]
     env:
       NOTES_DB: data/notes.json
 
-  # Own scheduler server (scripts/scheduler_mcp_server.py): creates delayed /
+  # Own scheduler server (llm_bot/mcp_servers/scheduler.py): creates delayed /
   # periodic background tasks and reads aggregated results. Execution happens
   # in a separate long-lived process — start it once:
   #     python scripts/scheduler_daemon.py
   scheduler:
     command: python
-    args: [scripts/scheduler_mcp_server.py]
+    args: [-m, llm_bot.mcp_servers.scheduler]
     env:
       SCHEDULER_DB: data/scheduler.json
 

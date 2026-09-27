@@ -9,7 +9,7 @@ on demand. Architecture is two independent processes over one shared store:
 
 Because those processes are separate, the JSON store guards every mutation
 with an inter-process ``fcntl.flock`` (thread locks are not enough), and every
-write is atomic (tmp file + rename), following :mod:`llm_bot.notes_api`.
+write is atomic (tmp file + rename), following :mod:`llm_bot.api.notes`.
 
 All timestamps are stored as UTC ISO strings; a ``daily`` schedule's ``at``
 time (``HH:MM``) is interpreted in the *local* timezone of the process that

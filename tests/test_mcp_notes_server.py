@@ -1,8 +1,8 @@
 """End-to-end tests for the notes MCP server (real stdio child process).
 
-Each test spawns ``scripts/notes_mcp_server.py`` through the same MCP client
-stack the agent uses, so the three task requirements are covered directly:
-tool registration, input-parameter schemas, and result return.
+Each test spawns the ``llm_bot.mcp_servers.notes`` module through the same
+MCP client stack the agent uses, so the three task requirements are covered
+directly: tool registration, input-parameter schemas, and result return.
 """
 
 from __future__ import annotations
@@ -18,9 +18,8 @@ pytest.importorskip("mcp", reason="mcp SDK is not installed")
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
-SERVER = (
-    Path(__file__).resolve().parent.parent / "scripts" / "notes_mcp_server.py"
-)
+ROOT = Path(__file__).resolve().parent.parent
+SERVER_MODULE = "llm_bot.mcp_servers.notes"
 
 pytestmark = pytest.mark.anyio
 
@@ -33,7 +32,8 @@ def anyio_backend():
 def _params(tmp_path: Path) -> StdioServerParameters:
     return StdioServerParameters(
         command=sys.executable,
-        args=[str(SERVER)],
+        args=["-m", SERVER_MODULE],
+        cwd=str(ROOT),
         env={**os.environ, "NOTES_DB": str(tmp_path / "notes.json")},
     )
 

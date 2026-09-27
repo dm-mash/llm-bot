@@ -556,12 +556,12 @@ The project ships its **own MCP server** around a small API — a mock-CRM of
 notes kept in a JSON file — and an agent integration that calls it
 (verification report: [`results/mcp_notes_verification.md`](results/mcp_notes_verification.md)).
 
-- [`llm_bot/notes_api.py`](llm_bot/notes_api.py) — the mock-CRM API
+- [`llm_bot/api/notes.py`](llm_bot/api/notes.py) — the mock-CRM API
   (`add_note` / `list_notes` / `find_notes`) over `NOTES_DB`
   (default `data/notes.json`).
-- [`scripts/notes_mcp_server.py`](scripts/notes_mcp_server.py) — FastMCP
+- [`llm_bot/mcp_servers/notes.py`](llm_bot/mcp_servers/notes.py) — FastMCP
   stdio server registering the three tools with typed parameter schemas and
-  text results.
+  text results (run as `python -m llm_bot.mcp_servers.notes`).
 - [`llm_bot/mcp_tools.py`](llm_bot/mcp_tools.py) — `MCPToolBridge` (one
   connection per server) and `MCPRouter` (aggregated catalog, `server__tool`
   namespacing, per-server failure isolation).

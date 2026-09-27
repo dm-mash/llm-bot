@@ -15,7 +15,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER = ROOT / "scripts" / "scheduler_mcp_server.py"
+SERVER_MODULE = "llm_bot.mcp_servers.scheduler"
 DAEMON = ROOT / "scripts" / "scheduler_daemon.py"
 
 
@@ -27,7 +27,10 @@ async def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="sched_verify_"))
     env = {**os.environ, "SCHEDULER_DB": str(tmp / "scheduler.json")}
     params = StdioServerParameters(
-        command=sys.executable, args=[str(SERVER)], env=env
+        command=sys.executable,
+        args=["-m", SERVER_MODULE],
+        cwd=str(ROOT),
+        env=env,
     )
 
     async with stdio_client(params) as (read, write):

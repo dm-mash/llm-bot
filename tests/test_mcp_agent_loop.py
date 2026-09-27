@@ -26,9 +26,7 @@ from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.mcp_tools import MCPToolBridge, MCPRouter
 from llm_bot.stores import AgentConfig, ModelConfig
 
-SERVER = (
-    Path(__file__).resolve().parent.parent / "scripts" / "notes_mcp_server.py"
-)
+SERVER_MODULE = "llm_bot.mcp_servers.notes"
 
 
 class _StubModelStore:
@@ -100,7 +98,7 @@ def _notes_router(db_path: Path) -> MCPRouter:
             MCPToolBridge(
                 "notes",
                 command=sys.executable,
-                args=[str(SERVER)],
+                args=["-m", SERVER_MODULE],
                 env={**os.environ, "NOTES_DB": str(db_path)},
             )
         ]

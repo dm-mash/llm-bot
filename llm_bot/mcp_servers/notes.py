@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """MCP server exposing the mock-CRM notes API as tools.
 
 Implements the "own MCP server" task: around a small API (a JSON-file CRM)
@@ -13,21 +12,15 @@ process). It must print ONLY protocol frames to stdout: any diagnostics go to
 stderr. The notes database path comes from ``NOTES_DB`` (default
 ``data/notes.json``) — set it in the MCP server config.
 
-Run manually for a smoke check (it will wait on stdin):
-    python scripts/notes_mcp_server.py
+Run from the project root for a smoke check (it will wait on stdin):
+    python -m llm_bot.mcp_servers.notes
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+from mcp.server.fastmcp import FastMCP
 
-# Make the project's ``llm_bot`` package importable regardless of CWD.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from mcp.server.fastmcp import FastMCP  # noqa: E402
-
-from llm_bot import notes_api  # noqa: E402
+from llm_bot.api import notes as notes_api
 
 mcp = FastMCP("notes-crm")
 

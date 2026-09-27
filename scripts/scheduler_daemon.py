@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The scheduler daemon: executes due tasks 24/7.
 
-The MCP control panel (``scripts/scheduler_mcp_server.py``) only creates and
+The MCP control panel (``llm_bot.mcp_servers.scheduler``) only creates and
 inspects tasks; this long-lived process is the executor. Every tick it:
 
 1. atomically claims due tasks (next_run advanced in the same lock, so a task

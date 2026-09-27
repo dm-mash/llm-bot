@@ -1,7 +1,8 @@
 """End-to-end tests for the scheduler MCP server + daemon (real processes).
 
-Each test spawns ``scripts/scheduler_mcp_server.py`` through the same MCP
-client stack the agent uses, covering the task requirements directly: tool
+Each test spawns the ``llm_bot.mcp_servers.scheduler`` module through the
+same MCP client stack the agent uses, covering the task requirements directly:
+tool
 registration with typed schemas, delayed/periodic task creation persisted to
 JSON, and the aggregated-result view (``task_digest``). The daemon smoke test
 runs ``scripts/scheduler_daemon.py --once`` as a subprocess against the same
@@ -25,7 +26,7 @@ from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER = ROOT / "scripts" / "scheduler_mcp_server.py"
+SERVER_MODULE = "llm_bot.mcp_servers.scheduler"
 DAEMON = ROOT / "scripts" / "scheduler_daemon.py"
 
 pytestmark = pytest.mark.anyio
@@ -39,7 +40,8 @@ def anyio_backend():
 def _params(tmp_path: Path) -> StdioServerParameters:
     return StdioServerParameters(
         command=sys.executable,
-        args=[str(SERVER)],
+        args=["-m", SERVER_MODULE],
+        cwd=str(ROOT),
         env={
             **os.environ,
             "SCHEDULER_DB": str(tmp_path / "scheduler.json"),
