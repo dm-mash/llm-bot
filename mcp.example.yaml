@@ -14,6 +14,16 @@ servers:
     env:
       NOTES_DB: data/notes.json
 
+  # Own scheduler server (scripts/scheduler_mcp_server.py): creates delayed /
+  # periodic background tasks and reads aggregated results. Execution happens
+  # in a separate long-lived process — start it once:
+  #     python scripts/scheduler_daemon.py
+  scheduler:
+    command: python
+    args: [scripts/scheduler_mcp_server.py]
+    env:
+      SCHEDULER_DB: data/scheduler.json
+
   # Examples of adding more servers later — just new entries:
   #
   # time:                        # reference server from requirements.txt

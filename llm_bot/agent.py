@@ -209,7 +209,7 @@ class Session:
         invariants: InvariantRegistry | None = None,
         audit_invariants_warn: bool = False,
         mcp: MCPRouter | None = None,
-        mcp_max_rounds: int = 2,
+        mcp_max_rounds: int = 4,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -219,6 +219,9 @@ class Session:
         # its tools block is injected into every request and a model reply in
         # the {"call_tool": ...} directive form triggers a real tool call,
         # whose result is fed back as a service turn (bounded by mcp_max_rounds).
+        # Real-world beta finding: after a creation-time validation error
+        # (e.g. an invented action name) the model needs one extra round to
+        # correct itself, so the budget must leave room for that.
         self._mcp = mcp
         self._mcp_max_rounds = max(1, mcp_max_rounds)
         self._mcp_events: list[MCPEvent] = []
