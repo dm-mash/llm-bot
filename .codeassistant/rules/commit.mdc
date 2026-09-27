@@ -1,0 +1,7 @@
+---
+name: commit
+---
+
+This is rule for Agent (it would be better to give the Agent more context about his work).
+Edit this file to customize Agent behavior.
+Сообщение для коммита в стиле Conventional Commits на английском. Используй краткое сообщение без подробностей реализации.
