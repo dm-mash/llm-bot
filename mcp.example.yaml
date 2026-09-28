@@ -26,6 +26,19 @@ servers:
     env:
       SCHEDULER_DB: data/scheduler.json
 
+  # Own currency_yahoo server (llm_bot/mcp_servers/currency_yahoo.py): rate
+  # tools over Yahoo Finance daily rates (no key) — fetch_rates ->
+  # analyze_rates -> save_report (analysis report) and fetch_rates ->
+  # save_series (raw dump to a JSON file). For offline use set
+  # CURRENCY_FIXTURE to a pre-saved series file.
+  currency_yahoo:
+    command: python
+    args: [-m, llm_bot.mcp_servers.currency_yahoo]
+    env:
+      CURRENCY_REPORTS_DB: data/currency_reports.json
+      CURRENCY_SERIES_DIR: data/currency_series
+      # CURRENCY_FIXTURE: data/cbr_fixture.json
+
   # Examples of adding more servers later — just new entries:
   #
   # time:                        # reference server from requirements.txt
