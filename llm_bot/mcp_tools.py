@@ -18,6 +18,7 @@ then executes the call and feeds the result back as a service turn.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -31,6 +32,23 @@ from mcp.client.streamable_http import streamablehttp_client
 
 # Default config location (project convention: data/ holds runtime YAML).
 DEFAULT_MCP_CONFIG = Path("data") / "mcp.yaml"
+
+# Default tool-loop budget for a session built around a router: max model
+# replies per turn (a batch of calls in ONE reply costs one round). The
+# config's top-level ``max_rounds`` key overrides it for long cross-server
+# chains (see MCPRouter.max_rounds).
+DEFAULT_MAX_ROUNDS = 4
+
+
+def _config_path(path: Path | None = None) -> Path:
+    """Resolve the config location: explicit path > ``$MCP_CONFIG`` > default.
+
+    The env override lets every process of a distributed setup — the CLI,
+    the scheduler MCP server validating ``mcp_call`` targets, and the
+    daemon's bridge factory — point at ONE config (tests and demos use it
+    to stay self-contained without touching ``data/``).
+    """
+    return path or Path(os.environ.get("MCP_CONFIG") or DEFAULT_MCP_CONFIG)
 
 
 class MCPToolError(RuntimeError):
@@ -200,8 +218,18 @@ class MCPRouter:
     * isolates server failures per call.
     """
 
-    def __init__(self, bridges: list[MCPToolBridge]) -> None:
+    def __init__(
+        self,
+        bridges: list[MCPToolBridge],
+        *,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
+    ) -> None:
         self._bridges = {b.name: b for b in bridges}
+        # Tool-loop budget for sessions built around this router: how many
+        # model replies one turn may consume (a batch of calls in ONE reply
+        # costs one round). Long cross-server chains need more than the
+        # default; the config's top-level ``max_rounds`` key overrides it.
+        self.max_rounds = max(1, int(max_rounds))
         # Qualified name -> (bridge, tool); built lazily on first render.
         self._tools: dict[str, tuple[MCPToolBridge, ToolSpec]] = {}
 
@@ -268,6 +296,9 @@ class MCPRouter:
             " верни только JSON-директиву из формата выше.",
             "Никогда не выдумывай результаты и не отвечай, будто действие"
             " выполнено, без реального вызова инструмента.",
+            "Служебные сообщения «Результат инструмента …» пишет ТОЛЬКО"
+            " система после реального вызова — не воспроизводи этот формат"
+            " в своих ответах.",
             "Если подходящего инструмента для запроса нет — честно скажи об"
             " этом обычным текстом. Не подменяй запрос другой задачей:"
             " например, сбор данных нельзя заменять напоминанием или"
@@ -279,44 +310,95 @@ class MCPRouter:
 
     @staticmethod
     def parse_directives(reply: str) -> list[MCPDirective]:
-        """Parse every tool-call directive in the model's reply.
+        """Parse the tool-call directive in the model's reply.
 
         Accepts both forms documented in the prompt block: a single call
         (``{"call_tool": {...}}``) and a batch (``{"call_tool": [...]}``).
         Returns an empty list when the reply is not a directive (a normal
         user-facing answer). Malformed entries inside a batch are skipped.
+
+        The directive is located by scanning for the FIRST *valid* JSON
+        object that carries ``call_tool`` (``json.JSONDecoder.raw_decode``),
+        not by slicing from the first ``{`` to the last ``}``: live models
+        prepend planning text before the directive, and that text can
+        contain brace fragments which break the naive slice.
+
+        When nothing parses but the reply clearly tries to be a directive
+        (it mentions ``call_tool``), a best-effort bracket repair runs: it
+        drops closers with no matching opener and closes the unclosed
+        brackets. Live finding it fixes: ``{"call_tool": {...}}]`` — the
+        model dropped the outer closing brace and left a stray ``]``, the
+        chain stalled and the raw JSON leaked to the user. (A bracket
+        inside a JSON string literal would be dropped too — accepted,
+        because the alternative is losing the whole directive.)
         """
         text = reply.strip()
         fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
         if fence:
             text = fence.group(1).strip()
-        start = text.find("{")
-        if start == -1:
-            return []
-        try:
-            data = json.loads(text[start : text.rfind("}") + 1])
-        except (json.JSONDecodeError, ValueError):
-            return []
-        if not isinstance(data, dict) or "call_tool" not in data:
-            return []
-        call = data["call_tool"]
-        if isinstance(call, dict):
-            call = [call]
-        if not isinstance(call, list):
-            return []
-        directives: list[MCPDirective] = []
-        for entry in call:
-            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
-                arguments = entry.get("arguments")
-                directives.append(
-                    MCPDirective(
-                        name=entry["name"],
-                        arguments=(
-                            arguments if isinstance(arguments, dict) else {}
-                        ),
-                    )
-                )
+        directives = MCPRouter._scan_directive_json(text)
+        if not directives and "call_tool" in text:
+            repaired = MCPRouter._close_unbalanced_brackets(text)
+            if repaired != text:
+                directives = MCPRouter._scan_directive_json(repaired)
         return directives
+
+    @staticmethod
+    def _scan_directive_json(text: str) -> list[MCPDirective]:
+        """Return directives from the first valid call_tool JSON in *text*."""
+        decoder = json.JSONDecoder()
+        idx = text.find("{")
+        while idx != -1:
+            try:
+                data, _end = decoder.raw_decode(text, idx)
+            except json.JSONDecodeError:
+                idx = text.find("{", idx + 1)
+                continue
+            if isinstance(data, dict) and "call_tool" in data:
+                call = data["call_tool"]
+                if isinstance(call, dict):
+                    call = [call]
+                directives: list[MCPDirective] = []
+                if isinstance(call, list):
+                    for entry in call:
+                        if isinstance(entry, dict) and isinstance(
+                            entry.get("name"), str
+                        ):
+                            arguments = entry.get("arguments")
+                            directives.append(
+                                MCPDirective(
+                                    name=entry["name"],
+                                    arguments=(
+                                        arguments
+                                        if isinstance(arguments, dict)
+                                        else {}
+                                    ),
+                                )
+                            )
+                return directives
+            idx = text.find("{", idx + 1)
+        return []
+
+    @staticmethod
+    def _close_unbalanced_brackets(text: str) -> str:
+        """Drop closers with no matching opener; close what stays open."""
+        pairs = {")": "(", "]": "[", "}": "{"}
+        closers = {opener: closer for closer, opener in pairs.items()}
+        stack: list[str] = []
+        out: list[str] = []
+        for ch in text:
+            if ch in "([{":
+                stack.append(ch)
+                out.append(ch)
+            elif ch in ")]}":
+                if stack and stack[-1] == pairs[ch]:
+                    stack.pop()
+                    out.append(ch)
+                # a mismatched closer is dropped (stray ']' and friends)
+            else:
+                out.append(ch)
+        out.extend(closers[c] for c in reversed(stack))
+        return "".join(out)
 
     # -- execution ------------------------------------------------------------
 
@@ -350,17 +432,29 @@ class MCPRouter:
 # -- config loading (project convention: data/*.yaml) -------------------------
 
 
+def load_mcp_settings(path: Path | None = None) -> dict:
+    """Read the whole MCP config document from *path*.
+
+    When *path* is omitted, the location comes from the ``MCP_CONFIG``
+    environment variable (if set), falling back to ``data/mcp.yaml``.
+
+    Returns the raw mapping (top-level keys: ``servers``, ``max_rounds``);
+    a missing file yields ``{}``.
+    """
+    config_path = _config_path(path)
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def load_mcp_config(path: Path | None = None) -> dict[str, dict]:
     """Read the MCP server map from *path* (default ``data/mcp.yaml``).
 
     Returns ``{name: {command|url, args?, env?}}``; missing file -> ``{}``.
     """
-    config_path = path or DEFAULT_MCP_CONFIG
-    try:
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except FileNotFoundError:
-        return {}
-    servers = data.get("servers", {}) if isinstance(data, dict) else {}
+    servers = load_mcp_settings(path).get("servers", {})
     return servers if isinstance(servers, dict) else {}
 
 
@@ -382,7 +476,7 @@ def router_from_config(
       (the user asked for MCP; failing silently would look like the model
       ignoring tools, so the process must not start).
     """
-    config_path = path or DEFAULT_MCP_CONFIG
+    config_path = _config_path(path)
     if names is None:
         return None
     servers = load_mcp_config(config_path)
@@ -416,7 +510,14 @@ def router_from_config(
         )
         for name, cfg in ((n, servers[n]) for n in selected)
     ]
-    router = MCPRouter(bridges)
+    settings = load_mcp_settings(config_path)
+    raw_rounds = settings.get("max_rounds")
+    router = MCPRouter(
+        bridges,
+        max_rounds=(
+            DEFAULT_MAX_ROUNDS if raw_rounds is None else int(raw_rounds)
+        ),
+    )
     router.refresh()
     if not router.tools:
         if names is not None:

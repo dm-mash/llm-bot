@@ -708,6 +708,54 @@ failed-once-must-retry regression) and `tests/test_scheduler_mcp_server.py`
 (real stdio processes, including a schedule → daemon `--once` → digest
 round-trip).
 
+## MCP orchestration: one prompt, several servers
+
+With several servers registered in `data/mcp.yaml`, the router advertises
+them all in one tools block (`server__tool` namespacing) and the agent
+composes **cross-server chains** by itself: analysis tools from
+`currency_yahoo`, note-taking from `notes`, background scheduling from
+`scheduler`. Each round-trip is recorded in `session.mcp_events` with its
+own `server` attribution, so selection, routing and call order are all
+observable.
+
+```bash
+python -m llm_bot --agent assistant --mcp all \
+    "проанализируй курс доллара за 2025 год, сохрани отчёт, добавь заметку \
+     с итогом и поставь ежедневный сбор курса на 09:00"
+python scripts/mcp_orchestration_demo.py   # live: deterministic cross-server chain + agent stage
+```
+
+Long flows need more tool rounds than the default budget allows. The budget
+lives in the MCP config as a top-level key next to `servers:`:
+
+```yaml
+# mcp.yaml — max model replies per turn in the tool loop
+# (each round = one model reply; a batch of calls costs one round).
+# Default: 4 — enough for a 3-call chain plus the final answer.
+max_rounds: 8
+servers:
+  notes:          ...
+  scheduler:      ...
+  currency_yahoo: ...
+```
+
+Two more pieces make multi-server setups self-contained (tests, demos, the
+daemon):
+
+* the config location can be overridden with the `MCP_CONFIG` environment
+  variable — the scheduler server validates `mcp_call` targets against the
+  same file the session uses, without a hardcoded `data/mcp.yaml`;
+* the round budget flows config → `MCPRouter.max_rounds` → the session's
+  tool loop; when the budget runs out mid-chain the loop stops cleanly (the
+  pending directive is left unexecuted).
+
+Tests: `tests/test_mcp_orchestration.py` — a scripted-LLM long flow over
+three REAL stdio servers (`fetch_rates → analyze_rates → save_report →
+notes__add_note → scheduler__schedule_task`: strict order, per-server
+routing, cross-server data passing, side effects in all three stores), a
+batch directive mixing two servers in one round, the round-budget boundary,
+and the config→router wiring.
+
 ## Token accounting and context limits
 
 The agent counts tokens on every turn and can refuse to send a request that would

@@ -31,7 +31,7 @@ from llm_bot.invariants import (
     InvariantViolationError,
     audit_reply,
 )
-from llm_bot.mcp_tools import MCPEvent, MCPRouter
+from llm_bot.mcp_tools import DEFAULT_MAX_ROUNDS, MCPEvent, MCPRouter
 from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.task_state import (
@@ -75,6 +75,34 @@ def _sanitize_messages(messages: list[dict[str, str]]) -> None:
             0xD800 <= ord(ch) <= 0xDFFF for ch in content
         ):
             msg["content"] = _sanitize_text(content)
+
+
+# The service feedback the tool loop appends after every REAL call has the
+# exact form «Результат инструмента <server>__<tool>:\n...». A live model
+# (gpt-oss-120b, 2026-09-28) once MIMICKED that format in a plain reply —
+# it fabricated aggregates for currency_yahoo__analyze_rates without calling
+# it and put the real directive into an inaccessible reasoning field. The
+# loop saw no directive, broke, and the fabricated "result" went to the
+# user as the final answer. This pattern recognizes the impersonation so
+# the loop can push back instead of breaking.
+_FABRICATED_FEEDBACK_RE = re.compile(
+    r"^\s*Результат инструмента\s+`?\*{0,2}"
+    r"([A-Za-z0-9_]+__[A-Za-z0-9_]+)\*{0,2}`?\s*:"
+)
+
+_FABRICATION_CORRECTION = (
+    "Эту строку сгенерировал ты сам: формат «Результат инструмента …» —"
+    " служебный, такие сообщения пишет только система после РЕАЛЬНОГО"
+    " вызова инструмента через директиву call_tool. Выдавать выдуманные"
+    " результаты за вызов нельзя. Верни директиву call_tool для следующего"
+    " невыполненного шага цепочки (или, если все шаги уже выполнены —"
+    " финальный ответ пользователю обычным текстом)."
+)
+
+
+def _looks_like_fabricated_feedback(reply: str) -> bool:
+    """True when the reply impersonates the system's tool-result format."""
+    return _FABRICATED_FEEDBACK_RE.match(reply) is not None
 
 
 def summary_budget_chars(
@@ -209,7 +237,7 @@ class Session:
         invariants: InvariantRegistry | None = None,
         audit_invariants_warn: bool = False,
         mcp: MCPRouter | None = None,
-        mcp_max_rounds: int = 4,
+        mcp_max_rounds: int | None = None,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -223,7 +251,14 @@ class Session:
         # (e.g. an invented action name) the model needs one extra round to
         # correct itself, so the budget must leave room for that.
         self._mcp = mcp
-        self._mcp_max_rounds = max(1, mcp_max_rounds)
+        # Round budget: an explicit value wins; otherwise the router's
+        # ``max_rounds`` (configurable via the ``max_rounds`` key of the MCP
+        # config for long cross-server chains), otherwise the default.
+        if mcp_max_rounds is None:
+            mcp_max_rounds = (
+                mcp.max_rounds if mcp is not None else DEFAULT_MAX_ROUNDS
+            )
+        self._mcp_max_rounds = max(1, int(mcp_max_rounds))
         self._mcp_events: list[MCPEvent] = []
         # When enabled, after each turn the reply is classified via a small LLM
         # call and the extracted facts are written explicitly into the working /
@@ -779,9 +814,31 @@ class Session:
         # so a misbehaving model cannot loop forever; several calls in ONE
         # reply do not consume extra rounds.
         if self._mcp is not None:
-            for _ in range(self._mcp_max_rounds):
+            for round_index in range(self._mcp_max_rounds):
                 directives = self._mcp.parse_directives(reply)
                 if not directives:
+                    # Guard against the impersonation above: instead of
+                    # delivering a fabricated «Результат инструмента …»
+                    # reply, append a corrective service turn and let the
+                    # model redo the missed step — but only while the round
+                    # budget allows (at the budget edge the reply stands,
+                    # same documented boundary as a leftover directive).
+                    if (
+                        round_index < self._mcp_max_rounds - 1
+                        and _looks_like_fabricated_feedback(reply)
+                    ):
+                        messages.append(
+                            {"role": "assistant", "content": reply}
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": _FABRICATION_CORRECTION,
+                            }
+                        )
+                        reply = self.agent.client.chat(messages)
+                        context_tokens = count_messages_tokens(messages)
+                        continue
                     break
                 feedbacks = []
                 for directive in directives:

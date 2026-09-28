@@ -8,6 +8,18 @@
 #
 # Own servers live in llm_bot/mcp_servers/ and are launched as modules from
 # the project root: python -m llm_bot.mcp_servers.<name>.
+#
+# Tool-loop budget: how many model replies ONE user turn may consume in the
+# MCP loop (each round = one model reply; a batch of calls in one reply costs
+# a single round). The default (4) fits a 3-call chain plus the final answer;
+# raise it for long cross-server chains, e.g. the orchestration flow
+# fetch -> analyze -> save_report -> add_note -> schedule_task (6 rounds).
+# max_rounds: 8
+
+# The config file location can be overridden with the MCP_CONFIG environment
+# variable — useful when several processes (CLI, scheduler server, daemon)
+# must share one config outside data/.
+
 servers:
   # Own mock-CRM server (llm_bot/mcp_servers/notes.py) over a JSON file.
   notes:
