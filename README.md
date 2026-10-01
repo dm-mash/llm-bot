@@ -88,6 +88,7 @@ llm-bot/
 ├── scripts/
 │   ├── compare_compression.py       # token/quality experiment: with vs without compression
 │   ├── compare_context_strategies.py# strategies on a shared "ТЗ" scenario
+│   ├── index_documents.py           # local document index: chunking + embeddings + benchmark
 │   └── ...                          # other comparison/demo scripts
 ├── tests/
 │   ├── test_client.py         # LLMClient tests (mocked transport)
@@ -95,12 +96,14 @@ llm-bot/
 │   ├── test_compress.py       # context-compression tests
 │   ├── test_task_state.py     # task state machine tests
 │   ├── test_compare_compression.py
+│   ├── test_index_documents.py # document index (offline, fake embedder)
 │   ├── test_stores.py         # YAML/JSON store tests
 │   └── test_gigachat.py       # GigaChat token provider tests
 ├── results/                   # experiment reports (markdown)
 ├── models.example.yaml        # template -> copy to data/models.yaml
 ├── agents.example.yaml        # template -> copy to data/agents.yaml
 ├── invariants.example.yaml    # template -> copy to data/invariants.yaml
+├── index_queries.example.yaml # template -> hand-written benchmark queries for the index
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -1297,6 +1300,141 @@ The default model ladder is tailored to this project's Groq account
 isn't available on your account you'll get a `404` — pass your own ids with
 `--models`. An example report is in
 [`results/compare_models_analysis.md`](results/compare_models_analysis.md).
+
+## Local document index (chunking + embeddings)
+
+`scripts/index_documents.py` builds a local JSON index over a directory of
+documents: it chunks them two ways, embeds the chunks with a local CPU model
+(`paraphrase-multilingual-MiniLM-L12-v2`, 384 dims, ~470 MB download, 128-token
+window) and reports which chunking strategy retrieves better.
+
+```bash
+# index the markdown of this repo (first run downloads the model)
+python scripts/index_documents.py --input_dir . --extensions .md
+
+# no network: use only the local HuggingFace cache
+python scripts/index_documents.py --input_dir . --extensions .md --local_only
+
+# code as well (.py files are chunked by top-level def/class), custom output
+python scripts/index_documents.py --input_dir . --extensions .md,.py \
+    --index_dir data/emb --out results/index_documents_report.md
+
+# add hand-written questions to the auto-generated benchmark
+python scripts/index_documents.py --input_dir . --extensions .md \
+    --eval index_queries.example.yaml
+```
+
+### Two chunking strategies
+
+|                    | `fixed_size`                                            | `structure`                                                    |
+| ------------------ | ------------------------------------------------------- | -------------------------------------------------------------- |
+| Boundaries         | sliding windows of `--chunk_size` tokens, snapped to word edges | Markdown headings, top-level `def`/`class`, PDF pages, paragraph runs |
+| Size control       | exact: `--chunk_size` tokens, `--chunk_overlap` reused  | `--structure_max_tokens` budget (default: the model window minus `[CLS]`/`[SEP]`); an oversized section is packed on paragraphs and bisected on line boundaries |
+| `section` metadata | empty                                                   | the section path (`"A > B"`), so a hit points at a real section |
+| Weakness           | cuts sections in half — a heading query matches a fragment | short sections stay short (`--structure_min_chars`); a one-line section (a Markdown table row) cannot be split at all |
+
+Sizes are counted in **tokens of the embedding model**, not characters: a
+1200-character Russian chunk is ~320 MiniLM tokens and everything past 256 is
+silently dropped by the model. That is what the report's
+`доля чанков длиннее окна модели` row measures, and why the original
+"1000 characters per chunk" default was wrong.
+
+### Output
+
+- `index_<strategy>.json` — chunks, L2-normalized embeddings, metadata;
+- `comparison.json` — the same numbers for both strategies, machine-readable;
+- a markdown report: corpus summary, metadata sample, size/coverage/duplicate
+  statistics and the retrieval benchmark.
+
+Metadata per chunk: `chunk_id`, `source`, `title`, `section`, `section_title`,
+`document_id`, `chunk_position`, `start_line`, `end_line`, `char_start`,
+`char_end`, `char_count`, `token_count`, `content_hash`, `chunking_strategy`.
+The `char_*` offsets are exact spans of the source file, so a hit can be
+verified by span overlap and a chunk can be re-read straight from disk.
+
+### Asking the index by hand
+
+```bash
+# one-off: build the index and ask it in the same run
+python scripts/index_documents.py --input_dir . --extensions .md \
+    --query "GigaChat OAuth2 token" --top_k 3
+
+# afterwards: ask the stored index, no re-chunking and no re-embedding
+python scripts/index_documents.py --reuse --strategy structure --top_k 3 \
+    --query "rolling summary сжатие истории" --local_only
+```
+
+```
+[structure] GigaChat OAuth2 token
+  0.626  README.md:162-183  llm-bot > Configuration > Example: GigaChat (Sber)
+       ### Example: GigaChat (Sber)
+  0.486  plans/details.md:85-89  ... > Changes > 4. `llm_bot/gigachat.py`
+       ### 4. `llm_bot/gigachat.py`
+```
+
+`--query` is repeatable, `--top_k` sets how many hits are printed, `--strategy`
+picks the index to search. `--reuse` takes the model from the index itself (a
+`--model` that contradicts it is a hard error — vectors of two models are not
+comparable) and refuses to run without `--query`.
+
+The two strategies differ exactly where it matters: for the same question
+`fixed_size` returns the neighbouring "Ollama server" fragment, `structure`
+returns the whole GigaChat section. Every hit carries `file:line`, so verify it
+with `sed -n '162,183p' README.md`.
+
+#### Which model, and why not E5
+
+The default is `paraphrase-multilingual-MiniLM-L12-v2` because it was measured
+against `all-MiniLM-L6-v2` on this corpus at an equal chunk budget
+(`--chunk_size 120`, both strategies, reproduce with `--model all-MiniLM-L6-v2`).
+On the 7 hand-written Russian questions the multilingual model answered 43% at
+rank 1 (`structure`), the English-only MiniLM 0% — while the 117
+heading-derived queries of the full benchmark reported 72% vs 49% and hid the
+gap almost completely. Model choice mattered far more for real questions than
+the average suggested, which is the argument for keeping `--eval` questions in
+the benchmark.
+
+`intfloat/multilingual-e5-*` retrieves better still, but it is only trained to
+work with `query: ` / `passage: ` prefixes. This indexer encodes passages and
+questions through one path, so an E5 model here would either be fed the wrong
+prefix (silently worse numbers) or need prefix plumbing in every call site. Not
+worth it for a local index; keep it in mind if precision becomes the goal.
+
+### Benchmark
+
+Every section heading becomes a query whose gold answer is that section's exact
+character span; a retrieved chunk counts as a hit when it overlaps the span.
+Reported as `recall@1/3/5` and `MRR@10`. `--eval` adds domain questions on top
+(see `index_queries.example.yaml`); an unknown `source` or an ambiguous
+`section` is a hard error, so the file cannot silently rot.
+
+```python
+import json, math
+
+index = json.load(open("data/emb/index_structure.json", encoding="utf-8"))
+query = index["chunks"][0]          # in production: embed a real question
+ranked = sorted(
+    ((math.fsum(a * b for a, b in zip(row["embedding"], query["embedding"])),
+      row["metadata"]) for row in index["chunks"]),
+    key=lambda pair: pair[0],   # key обязателен: при равных score сравниваются
+    reverse=True,               # dict-ы, и сортировка падает с TypeError
+)
+for score, meta in ranked[:3]:
+    print(f"{score:.3f} {meta['source']}:{meta['start_line']}-{meta['end_line']}"
+          f"  {meta['section']}")
+```
+
+Vectors are normalized, so a dot product *is* cosine similarity.
+
+Useful flags: `--index_dir` (default `data/emb`, git-ignored), `--out`
+(empty string disables the report), `--strategy both|fixed_size|structure`,
+`--unit tokens|chars`, `--structure_min_chars`, `--structure_max_chars`
+(secondary cap, off by default), `--query`/`--top_k`/`--reuse`, `--model`,
+`--batch_size`, `--max_docs`, `--dedup`, `--local_only`. `.pdf` is supported with the optional `pypdf`
+dependency; vendored trees (`.venv`, `node_modules`, `data/`, `results/`, …)
+are never indexed.
+
+Tests: `tests/test_index_documents.py` (offline, no model download).
 
 ## Adding a web interface
 

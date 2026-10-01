@@ -1,0 +1,41 @@
+# Hand-written benchmark queries for scripts/index_documents.py
+#
+#   python scripts/index_documents.py --input_dir . --extensions .md \
+#       --eval index_queries.example.yaml
+#
+# `source` is a path relative to --input_dir. `section` is optional and matched
+# against the section paths printed in the report's metadata sample — an exact
+# match, or a unique suffix of the "A > B" path. Omit it and the gold answer
+# becomes the whole document.
+#
+# An unknown source or section is a hard error, not a warning: a benchmark that
+# silently scores against a moved heading is worse than no benchmark.
+
+queries:
+  - text: как подключить GigaChat
+    source: README.md
+    section: "Configuration > Example: GigaChat (Sber)"
+
+  - text: как посмотреть детали запроса и ответа в CLI
+    source: README.md
+    section: Usage > Inspecting request/response details
+
+  - text: как сжать историю диалога и задать лимит summary
+    source: README.md
+    section: Token accounting and context limits > Context compression (rolling summary)
+
+  - text: как задать жёсткие ограничения инвариантов
+    source: README.md
+    section: Token accounting and context limits > Invariants (hard constraints)
+
+  - text: как запустить фоновые задачи 24/7
+    source: README.md
+    section: "Scheduler: background tasks 24/7"
+
+  - text: что нужно изменить в llm_bot для состояния задачи
+    source: plans/task_state.md
+    section: "План: Состояние задачи как конечный автомат (Task State Machine) > Компоненты > 1. Новый модуль `llm_bot/task_state.py`"
+
+  - text: какое решение принято про хранение данных вне репозитория
+    source: plans/agent.md
+    section: "План: выделение Агента как отдельной сущности + много провайдеров > Хранение данных вне репозитория (каталог `data/`)"
