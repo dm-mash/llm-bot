@@ -1,0 +1,735 @@
+"""Tests for scripts/compare_rag.py: loading, scoring, and the two-mode run.
+
+All offline: the LLM is an ``httpx.MockTransport`` and the retrieval is the
+day-21 ``FakeEmbedder``, so no model is downloaded and no network is touched.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import httpx
+import pytest
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location(
+        "compare_rag", ROOT / "scripts" / "compare_rag.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    # Register before executing: dataclasses look up ``cls.__module__`` in
+    # sys.modules while building the class, so an unregistered module breaks.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+cmp_rag = _load_script()
+
+from tests.test_index_documents import FakeEmbedder  # noqa: E402
+from tests.test_rag import make_index  # noqa: E402
+
+
+QUESTIONS_YAML = """
+corpora:
+  kb:
+    index_dir: {index_dir}
+    input_dir: .
+    extensions: .md
+    label: База про тесты
+questions:
+  - text: Часы работы кофейни
+    corpus: kb
+    answerable: true
+    expect: ["9:00"]
+    sources: ["kb/hours.md"]
+  - text: Сколько стоит латте на кокосовом молоке
+    corpus: kb
+    answerable: false
+    expect: []
+    sources: []
+"""
+
+
+@pytest.fixture
+def questions_file(tmp_path: Path) -> Path:
+    index_dir = tmp_path / "kb_emb"
+    make_index(
+        index_dir,
+        [
+            ("kb/hours.md", "Часы работы: с 9:00 до 21:00.", "Часы работы"),
+            ("kb/menu.md", "Крем: 190 ₽.", "Напитки"),
+        ],
+    )
+    payload = QUESTIONS_YAML.format(index_dir=index_dir)
+    path = tmp_path / "questions.yaml"
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
+def _scripted_client(replies: dict[str, str], captured: list[dict]) -> httpx.Client:
+    """A client whose answers depend on whether a RAG block was sent."""
+    state = {"turn": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read().decode())
+        captured.append(payload)
+        state["turn"] += 1
+        text = replies.get(str(state["turn"]), "заглушка")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": text}}
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    return handler  # type: ignore[return-value]
+
+
+# --------------------------------------------------------------------------- #
+# Loading
+# --------------------------------------------------------------------------- #
+
+
+def test_load_questions_reads_corpora_and_questions(questions_file: Path) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    assert set(corpora) == {"kb"}
+    assert corpora["kb"].index_path.name == "index_structure.json"
+    assert corpora["kb"].label == "База про тесты"
+    assert len(questions) == 2
+    assert questions[0].expect == ("9:00",)
+    assert questions[0].answerable is True
+    assert questions[1].answerable is False
+
+
+def test_a_question_defaults_to_answerable() -> None:
+    """A forgotten ``answerable`` flag must fail strict, not land in the
+    lenient refusal bucket and quietly improve the score."""
+    entry = cmp_rag.Question(
+        text="q", corpus="kb", expect=("190 ₽",), sources=(), answerable=True
+    )
+    assert entry.answerable is True
+
+
+def test_load_questions_rejects_a_broken_file(tmp_path: Path) -> None:
+    cases = {
+        "no_corpora": "questions: []\n",
+        "unknown_corpus": (
+            "corpora:\n  kb: {index_dir: d}\nquestions:\n  - {text: q, corpus: zz}\n"
+        ),
+        "no_text": "corpora:\n  kb: {index_dir: d}\nquestions:\n  - {corpus: kb}\n",
+        "empty": "corpora:\n  kb: {index_dir: d}\nquestions: []\n",
+    }
+    for name, payload in cases.items():
+        path = tmp_path / f"{name}.yaml"
+        path.write_text(payload, encoding="utf-8")
+        with pytest.raises(ValueError):
+            cmp_rag.load_questions(path)
+    with pytest.raises(FileNotFoundError):
+        cmp_rag.load_questions(tmp_path / "nope.yaml")
+
+
+# --------------------------------------------------------------------------- #
+# Scoring
+# --------------------------------------------------------------------------- #
+
+
+def test_fact_coverage_counts_expected_strings() -> None:
+    coverage, hit, missed = cmp_rag.fact_coverage(
+        "Мы с 9:00 до 21:00, вход свободный", ("9:00", "21:00")
+    )
+    assert coverage == 1.0
+    assert hit == ["9:00", "21:00"]
+    assert missed == []
+
+
+def test_fact_coverage_is_case_and_whitespace_insensitive() -> None:
+    coverage, _, _ = cmp_rag.fact_coverage("С   9:00", ("с 9:00",))
+    assert coverage == 1.0
+
+
+def test_fact_coverage_reports_what_was_missed() -> None:
+    coverage, hit, missed = cmp_rag.fact_coverage(
+        "Цена 190 рублей", ("190 ₽", "300 мл")
+    )
+    assert coverage == 0.0
+    assert hit == []
+    assert missed == ["190 ₽", "300 мл"]
+
+
+def test_fact_coverage_without_expectations_is_full() -> None:
+    assert cmp_rag.fact_coverage("что угодно", ())[0] == 1.0
+
+
+def test_cited_sources_reads_file_line_ranges() -> None:
+    found = cmp_rag.cited_sources("по [kb/hours.md:11-15], см. kb/menu.md:8-17")
+    assert found == {"kb/hours.md", "kb/menu.md"}
+
+
+def test_refusal_detection() -> None:
+    assert cmp_rag._REFUSAL_RE.search("Я не нашёл это в базе")
+    assert cmp_rag._REFUSAL_RE.search("Информации об этом нет")
+    assert not cmp_rag._REFUSAL_RE.search("Стоит 190 ₽")
+
+
+def _question(**kwargs) -> object:
+    base = {
+        "text": "q",
+        "corpus": "kb",
+        "expect": ("190 ₽",),
+        "sources": ("kb/menu.md",),
+        "answerable": True,
+    }
+    base.update(kwargs)
+    return cmp_rag.Question(**base)
+
+
+def test_scoring_separates_retrieval_from_reading() -> None:
+    question = _question()
+    # The expected source reached the prompt but the answer still lacks the fact:
+    # the reading failed, not the search.
+    case = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="rag", answerable=True,
+        answer="Кофе стоит 180 ₽",
+        retrieved=("kb/menu.md:1-5",),
+    )
+    score = cmp_rag.scored(case, question)
+    assert score["retrieval_hit"] is True
+    assert score["fact_coverage"] == 0.0
+    assert score["passed"] is False
+
+    # Conversely: the model knew the fact but the chunk never arrived.
+    case2 = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="no_rag", answerable=True,
+        answer="Это стоит 190 ₽",
+        retrieved=(),
+    )
+    score2 = cmp_rag.scored(case2, question)
+    assert score2["retrieval_hit"] is False
+    assert score2["fact_coverage"] == 1.0
+
+
+def test_scoring_requires_a_citation_when_a_source_is_known() -> None:
+    question = _question()
+    grounded = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="rag", answerable=True,
+        answer="Стоит 190 ₽ [kb/menu.md:1-5]",
+        retrieved=("kb/menu.md:1-5",),
+    )
+    assert cmp_rag.scored(grounded, question)["citation_hit"] is True
+    ungrounded = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="rag", answerable=True,
+        answer="Стоит 190 ₽",
+        retrieved=("kb/menu.md:1-5",),
+    )
+    assert cmp_rag.scored(ungrounded, question)["citation_hit"] is False
+
+
+def test_an_unanswerable_question_passes_only_on_refusal() -> None:
+    question = _question(answerable=False, expect=(), sources=())
+    refusal = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="rag", answerable=False,
+        answer="Я не нашёл такого напитка в базе",
+    )
+    assert cmp_rag.scored(refusal, question)["passed"] is True
+    fabrication = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="no_rag", answerable=False,
+        answer="Кокосовый латте стоит 280 ₽",
+    )
+    assert cmp_rag.scored(fabrication, question)["passed"] is False
+
+
+def test_an_error_never_passes() -> None:
+    question = _question()
+    failed = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="rag", answerable=True,
+        answer="Стоит 190 ₽", error="429", retrieved=("kb/menu.md:1-5",),
+    )
+    assert cmp_rag.scored(failed, question)["passed"] is False
+
+
+def test_aggregate_keeps_quality_and_honesty_apart() -> None:
+    questions = [
+        _question(),
+        _question(answerable=False, expect=(), sources=()),
+    ]
+    rag = [
+        cmp_rag.Case(index=1, question="q", corpus="kb", mode="rag",
+                     answerable=True, answer="190 ₽ [kb/menu.md:1-5]",
+                     retrieved=("kb/menu.md:1-5",), prompt_tokens=100),
+        cmp_rag.Case(index=2, question="q", corpus="kb", mode="rag",
+                     answerable=False, answer="не нашёл", prompt_tokens=120),
+    ]
+    plain = [
+        cmp_rag.Case(index=1, question="q", corpus="kb", mode="no_rag",
+                     answerable=True, answer="190 ₽", prompt_tokens=20),
+        cmp_rag.Case(index=2, question="q", corpus="kb", mode="no_rag",
+                     answerable=False, answer="280 ₽", prompt_tokens=20),
+    ]
+    summary = cmp_rag.aggregate(rag + plain, questions)
+    assert summary["rag"]["fact_coverage_mean"] == 1.0
+    assert summary["rag"]["refusal_rate"] == 1.0
+    assert summary["rag"]["pass_rate"] == 1.0
+    assert summary["no_rag"]["fact_coverage_mean"] == 1.0
+    # The ungrounded mode got the fact right but invented the second answer.
+    assert summary["no_rag"]["refusal_rate"] == 0.0
+    assert summary["no_rag"]["pass_rate"] == 0.5
+    # RAG costs tokens: that is the price of grounding.
+    assert summary["rag"]["prompt_tokens_mean"] > summary["no_rag"]["prompt_tokens_mean"]
+
+
+# --------------------------------------------------------------------------- #
+# Running both modes
+# --------------------------------------------------------------------------- #
+
+
+def _client(replies: dict[str, str], captured: list[dict]):
+    handler = _scripted_client(replies, captured)
+    from llm_bot.config import LLMConfig
+
+    from llm_bot.client import LLMClient
+
+    config = LLMConfig(
+        base_url="https://example.test/v1", api_key="k", model="m",
+        temperature=0.0, max_tokens=64,
+        default_system_prompt="Отвечай на том же языке, на котором написан вопрос.",
+    )
+    return LLMClient(config, transport=httpx.MockTransport(handler))
+
+
+def test_run_asks_every_question_in_both_modes(
+    questions_file: Path, tmp_path: Path
+) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    index_path = corpora["kb"].index_path
+
+    # Force the fake embedder so nothing is downloaded.
+    original = cmp_rag.Retriever
+    cmp_rag.Retriever = lambda path, **kw: original(
+        path, embedder=FakeEmbedder("fake-mini"), **kw
+    )
+    captured: list[dict] = []
+    client = _client(
+        {
+            "1": "Мы с 9:00 до 21:00 [kb/hours.md:11-15]",
+            "2": "С 9:00 до 21:00",
+            "3": "не нашёл",
+            "4": "250 ₽",
+        },
+        captured,
+    )
+    try:
+        cases = cmp_rag.run(corpora, questions, client)
+    finally:
+        cmp_rag.Retriever = original
+
+    assert len(cases) == 4
+    assert [c.mode for c in cases] == ["rag", "no_rag", "rag", "no_rag"]
+    summary = cmp_rag.aggregate(cases, questions)
+    assert summary["rag"]["pass_rate"] == 1.0
+    # The baseline knows the opening hours (fact coverage 1.0) but invents a
+    # price for the drink that is not on the menu — exactly the asymmetry the
+    # control set is built to expose.
+    assert summary["no_rag"]["fact_coverage_mean"] == 1.0
+    assert summary["no_rag"]["refusal_rate"] == 0.0
+    assert summary["no_rag"]["pass_rate"] == 0.5
+
+    # The RAG request carries a grounding prefix; the plain one does not.
+    rag_payloads = [p for p in captured if any(
+        m["role"] == "system" and "локальной базы" in m["content"] for m in p["messages"]
+    )]
+    plain_payloads = [p for p in captured if not any(
+        m["role"] == "system" and "локальной базы" in m["content"] for m in p["messages"]
+    )]
+    assert len(rag_payloads) == 2
+    assert len(plain_payloads) == 2
+    # The user's question reaches the model unchanged in both modes.
+    for payload in captured:
+        assert payload["messages"][-1]["role"] == "user"
+
+
+def test_run_records_a_retrieval_failure_instead_of_crashing(
+    questions_file: Path,
+) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+
+    class Broken:
+        def render(self, question):
+            raise RuntimeError("index unreadable")
+
+    captured: list[dict] = []
+    client = _client({"1": "ок"}, captured)
+    case = cmp_rag.run_case(client, questions[0], "rag", 1, Broken())
+    assert case.error.startswith("retrieval:")
+    assert case.answer == ""
+
+
+def test_run_can_filter_by_corpus(questions_file: Path) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    captured: list[dict] = []
+    client = _client({}, captured)
+    cases = cmp_rag.run(corpora, questions, client, corpus_filter=["kb"])
+    assert cases  # kb is the only corpus, so nothing is filtered out
+    assert all(c.corpus == "kb" for c in cases)
+    cases = cmp_rag.run(corpora, questions, client, corpus_filter=["repo"])
+    assert cases == []
+
+
+# --------------------------------------------------------------------------- #
+# Report
+# --------------------------------------------------------------------------- #
+
+
+def test_report_mentions_both_modes_and_the_honesty_axis(
+    questions_file: Path,
+) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    cases = [
+        cmp_rag.Case(index=1, question=questions[0].text, corpus="kb", mode="rag",
+                     answerable=True, answer="С 9:00 [kb/hours.md:11-15]",
+                     retrieved=("kb/hours.md:11-15",), prompt_tokens=90,
+                     context_tokens=40),
+        cmp_rag.Case(index=1, question=questions[0].text, corpus="kb", mode="no_rag",
+                     answerable=True, answer="С 9:00", prompt_tokens=10),
+        cmp_rag.Case(index=2, question=questions[1].text, corpus="kb", mode="rag",
+                     answerable=False, answer="не нашёл", prompt_tokens=70),
+        cmp_rag.Case(index=2, question=questions[1].text, corpus="kb", mode="no_rag",
+                     answerable=False, answer="250 ₽", prompt_tokens=10),
+    ]
+    summary = cmp_rag.aggregate(cases, questions)
+    report = cmp_rag.render_report(
+        corpora, questions, cases, summary,
+        model_name="fake", top_k=4, max_context_tokens=None,
+    )
+    assert "RAG против модели без RAG" in report
+    assert "с RAG" in report and "без RAG" in report
+    # The two axes stay separate in the table.
+    assert "Покрытие фактов" in report and "Отказов" in report
+    assert "fake" in report
+    # Per-question rows for all four cases.
+    assert report.count("| rag |") + report.count("| no_rag |") == 4
+    # An error row is reported rather than hidden.
+    assert "Ошибки" in report
+
+
+def test_report_flags_errors(questions_file: Path) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    cases = [
+        cmp_rag.Case(index=1, question=questions[0].text, corpus="kb", mode="rag",
+                     answerable=True, answer="", error="429 rate limited"),
+    ]
+    summary = cmp_rag.aggregate(cases, questions[:1])
+    report = cmp_rag.render_report(
+        corpora, questions[:1], cases, summary, model_name="fake",
+        top_k=None, max_context_tokens=None,
+    )
+    assert "429 rate limited" in report
+    assert "Не удалось получить ответ" in report
+
+
+def test_every_declared_source_span_actually_contains_its_facts() -> None:
+    """The control set must not drift away from the documents it grades.
+
+    Each answerable question declares ``file:start-end`` and the substrings that
+    have to appear there. If an edit shifts the lines, the span goes stale and
+    the question silently starts failing for the wrong reason — which is exactly
+    the confusion the retrieval fix is meant to remove.
+    """
+    config = yaml.safe_load(
+        (ROOT / "rag_questions.example.yaml").read_text(encoding="utf-8")
+    )
+    roots = {
+        name: ROOT / spec["input_dir"]
+        for name, spec in config["corpora"].items()
+    }
+    checked = 0
+    for index, question in enumerate(config["questions"], start=1):
+        if not question.get("expect") or not question.get("sources"):
+            continue
+        for source in question["sources"]:
+            name, _, span = source.partition(":")
+            start, _, end = span.partition("-")
+            path = roots[question["corpus"]] / name
+            assert path.is_file(), f"#{index}: нет файла {path}"
+            lines = path.read_text(encoding="utf-8").splitlines()
+            text = "\n".join(lines[int(start) - 1 : int(end)])
+            plain = text.lower().replace("*", "")
+            for fact in question["expect"]:
+                assert fact.lower().replace("*", "") in plain, (
+                    f"#{index}: факт {fact!r} не лежит в {source}"
+                )
+            checked += 1
+    assert checked == 8
+
+
+def test_citation_check_ignores_the_line_range_in_sources() -> None:
+    """``sources`` carries lines now; a citation names only the file."""
+    assert cmp_rag.source_files(["README.md:1304-1310", "kb/menu.md"]) == {
+        "README.md", "kb/menu.md"
+    }
+    question = cmp_rag.Question(
+        text="q", corpus="repo", expect=("128",),
+        sources=("README.md:1304-1310",), answerable=True,
+    )
+    case = cmp_rag.Case(
+        index=1, question="q", corpus="repo", mode="rag", answerable=True,
+        answer="окно 128 токенов [README.md:1304-1310]",
+        retrieved=("README.md:1304-1310",),
+    )
+    score = cmp_rag.scored(case, question)
+    assert score["citation_hit"] is True
+    assert score["cited_files"] == ["README.md"]
+    # A citation to some other file is still not a hit.
+    other = cmp_rag.Case(
+        index=1, question="q", corpus="repo", mode="rag", answerable=True,
+        answer="окно 128 токенов [kb/menu.md:1-9]",
+        retrieved=("README.md:1304-1310",),
+    )
+    assert cmp_rag.scored(other, question)["citation_hit"] is False
+
+
+def test_retrieval_hit_demands_the_chunk_not_just_the_file() -> None:
+    """Three unrelated chunks of the right file must not count as a hit.
+
+    Question 1 scored "выдача: да" because ``sources`` was checked at file level:
+    the retriever returned three unrelated ``README.md`` chunks while the chunk
+    holding the answer was never in the prompt. A metric that flatters a
+    retrieval failure is worse than a visible miss.
+    """
+    right_file = ("README.md:949-951", "README.md:995-1000", "tasks/day22.md:22-22")
+    assert cmp_rag.source_reached(["README.md"], right_file) is True
+    assert cmp_rag.source_reached(["README.md:1304-1310"], right_file) is False
+    assert cmp_rag.source_reached(["README.md:1304-1310"],
+                                  ["README.md:1304-1310"]) is True
+    # Overlap, not equality: a neighbouring chunk that shares the span counts.
+    assert cmp_rag.source_reached(["README.md:1304-1310"],
+                                  ["README.md:1300-1306"]) is True
+    assert cmp_rag.source_reached(["README.md:1304-1310"],
+                                  ["README.md:1305-1311"]) is True
+    assert cmp_rag.source_reached(["README.md:1304-1310"],
+                                  ["README.md:1311-1318"]) is False
+    assert cmp_rag.source_reached(["README.md"], []) is False
+    # Same file, different document entirely.
+    assert cmp_rag.source_reached(["plans/compression.md:69-77"],
+                                  ["README.md:69-77"]) is False
+
+
+def test_a_wrong_chunk_fails_the_question_even_when_the_facts_are_right() -> None:
+    """Coverage and retrieval are separate verdicts; both must hold to pass."""
+    question = cmp_rag.Question(
+        text="q", corpus="repo", expect=("paraphrase-multilingual",),
+        sources=("README.md:1304-1310",), answerable=True,
+    )
+    with_answer = cmp_rag.Case(
+        index=1, question="q", corpus="repo", mode="rag", answerable=True,
+        answer="paraphrase-multilingual-MiniLM-L12-v2 [README.md:1304-1310]",
+        retrieved=("README.md:1304-1310",),
+    )
+    without_answer = cmp_rag.Case(
+        index=1, question="q", corpus="repo", mode="rag", answerable=True,
+        answer="paraphrase-multilingual-MiniLM-L12-v2",
+        retrieved=("README.md:949-951",),
+    )
+    assert cmp_rag.scored(with_answer, question)["retrieval_hit"] is True
+    assert cmp_rag.scored(with_answer, question)["passed"] is True
+
+    score = cmp_rag.scored(without_answer, question)
+    assert score["fact_coverage"] == 1.0   # the fact is there
+    assert score["retrieval_hit"] is False  # but not from the retrieved chunk
+    assert score["passed"] is False
+
+
+def test_markdown_emphasis_does_not_break_expectation_matching() -> None:
+    """A model that quotes the source formatting must not be scored as a miss.
+
+    The document says ``**до** приготовления`` and the model reproduces the bold
+    markers, so the expected substring ``до приготовления`` is split by ``**``.
+    That is a formatting difference, not a wrong fact.
+    """
+    coverage, hit, missed = cmp_rag.fact_coverage(
+        "Бариста предупреждает **до** приготовления, а не после.", ("до приготовления",)
+    )
+    assert coverage == 1.0
+    assert hit == ["до приготовления"]
+    assert missed == []
+    # ...and the strip must not make a genuinely absent fact present.
+    assert cmp_rag.fact_coverage("после приготовления", ("до приготовления",))[0] == 0.0
+
+
+def test_report_states_the_temperature_actually_used(questions_file: Path) -> None:
+    """A hardcoded "temperature=0.0" would misreport a run that used 0.1."""
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    cases = [cmp_rag.Case(index=1, question=questions[0].text, corpus="kb",
+                          mode="rag", answerable=True, answer="С 9:00")]
+    report = cmp_rag.render_report(
+        corpora, questions[:1], cases, cmp_rag.aggregate(cases, questions[:1]),
+        model_name="leanstral", top_k=None, max_context_tokens=None,
+        temperature=0.1,
+    )
+    assert "temperature=0.1" in report
+    assert "temperature=0.0" not in report
+
+
+def test_saved_json_can_be_rescored_offline(tmp_path: Path, questions_file: Path) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    cases = [
+        cmp_rag.Case(index=1, question=questions[0].text, corpus="kb", mode="rag",
+                     answerable=True, answer="С 9:00 [kb/hours.md:11-15]",
+                     retrieved=("kb/hours.md:11-15",)),
+        cmp_rag.Case(index=2, question=questions[1].text, corpus="kb", mode="rag",
+                     answerable=False, answer="не нашёл"),
+    ]
+    summary = cmp_rag.aggregate(cases, questions)
+    path = tmp_path / "run.json"
+    cmp_rag.save_json(path, corpora, questions, cases, summary, model="fake")
+    assert path.is_file()
+
+    reloaded_questions, reloaded_cases = cmp_rag.load_saved_cases(path)
+    assert len(reloaded_questions) == len(questions)
+    assert len(reloaded_cases) == len(cases)
+    # Re-scoring a saved run reproduces the numbers: no API, same verdict.
+    again = cmp_rag.aggregate(reloaded_cases, reloaded_questions)
+    assert again["rag"]["pass_rate"] == summary["rag"]["pass_rate"]
+
+
+def test_saved_json_contains_the_answers_and_scores(
+    tmp_path: Path, questions_file: Path
+) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    cases = [
+        cmp_rag.Case(index=1, question=questions[0].text, corpus="kb", mode="rag",
+                     answerable=True, answer="С 9:00 [kb/hours.md:11-15]",
+                     retrieved=("kb/hours.md:11-15",)),
+    ]
+    path = tmp_path / "run.json"
+    cmp_rag.save_json(path, corpora, questions, cases,
+                      cmp_rag.aggregate(cases, questions[:1]), model="fake")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["model"] == "fake"
+    assert payload["cases"][0]["answer"] == "С 9:00 [kb/hours.md:11-15]"
+    assert payload["cases"][0]["retrieved"] == ["kb/hours.md:11-15"]
+    assert payload["cases"][0]["score"]["citation_hit"] is True
+    assert payload["questions"][0]["expect"] == ["9:00"]
+
+
+def test_main_rescores_from_json_without_any_client(
+    tmp_path: Path, questions_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    cases = [
+        cmp_rag.Case(index=1, question=questions[0].text, corpus="kb", mode="rag",
+                     answerable=True, answer="С 9:00 [kb/hours.md:11-15]",
+                     retrieved=("kb/hours.md:11-15,")),
+        cmp_rag.Case(index=2, question=questions[1].text, corpus="kb", mode="rag",
+                     answerable=False, answer="не нашёл"),
+    ]
+    saved = tmp_path / "run.json"
+    cmp_rag.save_json(saved, corpora, questions, cases,
+                      cmp_rag.aggregate(cases, questions), model="fake")
+    out = tmp_path / "rescored.md"
+
+    def explode(*args, **kwargs):
+        raise AssertionError("--from_json must not touch the provider")
+
+    monkeypatch.setattr(cmp_rag, "load_model", explode)
+    code = cmp_rag.main([
+        "--questions", str(questions_file), "--from_json", str(saved),
+        "--out", str(out),
+    ])
+    assert code == 0
+    assert "RAG против модели без RAG" in out.read_text(encoding="utf-8")
+
+
+def test_rescoring_uses_the_edited_yaml_not_the_copy_inside_the_json(
+    tmp_path: Path, questions_file: Path
+) -> None:
+    """Editing ``sources`` must change the verdict on the next rescore.
+
+    The JSON stores the questions it ran with. Grading with those copies means a
+    corrected control set looks unchanged: the old file-level ``sources`` were
+    restored silently and question 1 kept reporting a retrieval hit for three
+    unrelated chunks.
+    """
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    loose = cmp_rag.Question(
+        text=questions[0].text, corpus="kb", expect=questions[0].expect,
+        sources=("kb/menu.md",), answerable=True,
+    )
+    strict = cmp_rag.Question(
+        text=questions[0].text, corpus="kb", expect=questions[0].expect,
+        sources=("kb/menu.md:40-44",), answerable=True,
+    )
+    retrieved = ("kb/menu.md:1-3", "kb/other.md:9-11")
+    cases = [
+        cmp_rag.Case(index=1, question=loose.text, corpus="kb", mode="rag",
+                     answerable=True, answer="С 9:00 до 21:00",
+                     retrieved=retrieved)
+    ]
+    saved = tmp_path / "run.json"
+    cmp_rag.save_json(saved, corpora, [loose], cases,
+                      cmp_rag.aggregate(cases, [loose]), model="fake")
+
+    relaxed_yaml = questions_file.read_text(encoding="utf-8").replace(
+        "sources: [\"kb/hours.md\"]", 'sources: ["kb/menu.md:40-44"]'
+    )
+    questions_file.write_text(relaxed_yaml, encoding="utf-8")
+    try:
+        reloaded_questions, reloaded_cases = cmp_rag.load_saved_cases(saved)
+        assert cmp_rag.scored(reloaded_cases[0], reloaded_questions[0])[
+            "retrieval_hit"
+        ] is True
+        fresh = cmp_rag.load_questions(questions_file)[1]
+        assert cmp_rag.scored(reloaded_cases[0], fresh[0])["retrieval_hit"] is False
+        assert cmp_rag.scored(cases[0], strict)["retrieval_hit"] is False
+    finally:
+        questions_file.write_text(relaxed_yaml.replace(
+            'sources: ["kb/menu.md:40-44"]', 'sources: ["kb/hours.md"]'
+        ), encoding="utf-8")
+
+
+def test_main_reports_a_missing_index_without_calling_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A missing index is a configuration error, not a 0% score."""
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the model must not be built without an index")
+
+    monkeypatch.setattr(cmp_rag, "load_model", explode)
+    broken = tmp_path / "broken.yaml"
+    broken.write_text(
+        QUESTIONS_YAML.format(index_dir=tmp_path / "does_not_exist"),
+        encoding="utf-8",
+    )
+    code = cmp_rag.main([
+        "--questions", str(broken), "--model", "fake",
+        "--out", str(tmp_path / "x.md"),
+    ])
+    assert code == 2
+    assert "индекс не найден" in capsys.readouterr().err
+    assert not (tmp_path / "x.md").exists()
+
+
+def test_main_rejects_an_unknown_corpus_filter(
+    tmp_path: Path, questions_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(*args, **kwargs):
+        raise AssertionError("the model must not be built for an unknown corpus")
+
+    monkeypatch.setattr(cmp_rag, "load_model", explode)
+    code = cmp_rag.main([
+        "--questions", str(questions_file), "--corpus", "nope",
+        "--out", str(tmp_path / "x.md"),
+    ])
+    assert code == 2

@@ -1436,6 +1436,77 @@ are never indexed.
 
 Tests: `tests/test_index_documents.py` (offline, no model download).
 
+## RAG: ответы по локальному индексу
+
+The index above is a library. `llm_bot/rag.py` makes it answer questions:
+`Retriever` searches a prebuilt `index_*.json` with cosine similarity, formats
+the best chunks as a `file:line`-traceable context block, and hands it to the
+model as an extra per-request prefix.
+
+```bash
+# answer from the repo index (build it first, see above)
+python -m llm_bot --agent researcher --rag \
+    --rag-index data/emb/index_structure.json \
+    "Что такое RAG и как он устроен в этом проекте?"
+```
+
+`--rag` works with **any** agent — `--agent researcher` above is a ready-made
+low-temperature agent from `data/agents.yaml`, not a requirement. The grounding
+rule is carried by the block itself, identically for every agent.
+
+| flag | default | meaning |
+| ---- | ------- | ------- |
+| `--rag` | off | enable retrieval for this run; without it the bot behaves exactly as before |
+| `--rag-index` | `data/emb/index_structure.json` | which index to search; the embedding model is taken from the index itself, and a `--model` contradicting it is a hard error |
+| `--rag-top-k` | `4` | how many chunks to retrieve |
+| `--rag-max-tokens` | unset | hard cap on the context block; unset means "derive it from the context window" |
+
+The embedding model (~470 MB) is downloaded on the first `--rag` run and cached
+afterwards; `--local_only` belongs to `scripts/index_documents.py`, not here.
+
+The block is placed **after** the MCP/tool context and **before** the strategy
+prefix, so tool output stays closest to the question and the retrieval block
+reads as part of the same evidence. Its budget is `min(--rag-max-tokens, 25% of
+the agent's context window)`. Chunks are added worst-score-first and dropped
+again if the next one would overflow the budget; a chunk is only included if at
+least one whole word of it fits, so the model never sees a fragment cut mid
+sentence.
+
+Grounding is enforced by instruction, not by code: the block tells the model to
+answer **only** from the context, to cite `[file:lines]` after every fact, and
+to say it did not find an answer rather than invent one. That rule lives in the
+block (`_RAG_PROTOCOL` in `llm_bot/rag.py`) and nowhere else — not in
+`data/invariants.yaml`, and not in any agent's `system_prompt`. Two reasons:
+
+- an invariant would be global, so it would force the agent to refuse everything
+  in `--no-rag` mode, when there is no context to ground in;
+- a copy inside an agent would be a third source of truth. It already drifted
+  once, which is why the agent configs no longer restate the rule.
+
+`researcher` therefore carries only a persona and `temperature: 0.1`. Nothing
+about grounding depends on it.
+
+Two properties are deliberate:
+
+- **The block is not persisted.** It is rebuilt per request from the current
+  index, so editing a document is visible immediately and the history never
+  accumulates stale quotes.
+- **Retrieval never breaks the bot.** A missing or corrupt index, a model that
+  cannot be loaded, a query the embedder chokes on — all of it is logged to
+  stderr and the turn proceeds without context. `--rag` is an enhancement, not
+  a new failure mode.
+
+`Session` exposes what actually happened: `rag_events` (all queries) and
+`last_rag_event` (the last one) with hits, scores, dropped chunks and the
+token accounting. The CLI prints the last event under the answer.
+
+`knowledge_base/` holds a second, deliberately boring corpus (a coffee shop
+menu, delivery terms) to check that grounding generalizes outside the repo's own
+prose. It is added to the indexer's `DEFAULT_EXCLUDES`, so building the repo
+index stays at 12 documents and does not silently mix the two corpora.
+
+Tests: `tests/test_rag.py`, `tests/test_compare_rag.py` (offline).
+
 ## Adding a web interface
 
 Because the request logic is isolated in `LLMClient`, adding a web UI is mostly

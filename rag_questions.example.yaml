@@ -1,0 +1,107 @@
+# Контрольные вопросы для сравнения «с RAG» и «без RAG».
+#
+# Для каждого вопроса зафиксировано, что должно быть в ответе (expect), из каких
+# источников модель должна была взять факт (sources) и отвечаем ли мы вообще
+# на этот вопрос из нашей базы (answerable: false — в базе ответа нет, и
+# правильное поведение RAG — честно сказать «не нашёл», а не выдумать).
+#
+# Схема:
+#   corpora:  имя корпуса -> откуда брать индекс (index_dir) и документы
+#   questions: text / corpus / expect / sources / answerable
+#
+# Запуск:
+#   # одна модель, оба режима, оба корпуса
+#   python scripts/compare_rag.py --questions rag_questions.yaml --model leanstral
+#
+#   # только kb-корпус, другая модель, больше контекста
+#   python scripts/compare_rag.py --questions rag_questions.yaml --model groq-qwen \
+#       --corpus kb --top_k 6
+#
+# Слова в expect пишутся так, как они реально лежат в документе: проверка
+# ожиданий — подстрочный поиск без учёта регистра, поэтому «190» найдёт и
+# «190 ₽», а «19 рублей» не найдёт ничего.
+#
+# sources указывает НЕ файл, а диапазон строк, где лежит ответ
+# ("файл:начало-конец"): попадание в правильный файл ничего не значит, если
+# нужный чанк в промпт не попал. Именно так вопрос про модель эмбеддингов
+# раньше проходил как успешная выдача — три посторонних чанка README.md
+# оказались достаточны, чтобы метрика соврала.
+
+corpora:
+  repo:
+    index_dir: data/emb
+    input_dir: .
+    extensions: .md
+    label: Документы репозитория
+  kb:
+    index_dir: data/kb_emb
+    input_dir: knowledge_base
+    extensions: .md
+    label: База знаний кофейни «Зёрна»
+
+questions:
+  # --- Документы репозитория: ответы точно есть в корпусе -------------------
+  - text: Какая модель эмбеддингов используется по умолчанию и какое у неё окно в токенах?
+    corpus: repo
+    answerable: true
+    expect: ["paraphrase-multilingual-MiniLM-L12-v2", "128"]
+    sources: ["README.md:1304-1310"]
+
+  - text: Какой дефолт у max_summary_ratio и что он ограничивает?
+    corpus: repo
+    answerable: true
+    expect: ["0.3", "summary"]
+    sources: ["plans/compression.md:69-77"]
+
+  - text: Что за G5 в плане переходов состояния задачи?
+    corpus: repo
+    answerable: true
+    expect: ["вне скоупа", "429"]
+    sources: ["plans/task_state_transitions.md:188-195"]
+
+  - text: Почему Groq начинает отдавать 429?
+    corpus: repo
+    answerable: true
+    expect: ["8000", "TPM"]
+    sources: ["README.md:634-637"]
+
+  # --- Ловушка: число есть в репозитории, но НЕ в корпусе -------------------
+  # data/models.yaml исключён из корпуса, поэтому RAG не должен доставать 8000
+  # из памяти модели: правильный ответ — «в базе этого нет».
+  - text: Какой max_request_tokens у модели groq/openai/gpt-oss-120b?
+    corpus: repo
+    answerable: false
+    expect: []
+    sources: []
+
+  # --- База знаний кофейни: заведомо не в обучающих данных модели -----------
+  - text: Сколько стоит фирменный напиток «Тростниковый крем»?
+    corpus: kb
+    answerable: true
+    expect: ["190", "300"]
+    sources: ["kofeinya_zerna.md:10-16"]
+
+  - text: До какого времени кофейня работает в воскресенье?
+    corpus: kb
+    answerable: true
+    expect: ["9:00", "21:00"]
+    sources: ["kofeinya_zerna.md:39-43"]
+
+  - text: Что нужно сделать гостю с аллергией на орехи и когда?
+    corpus: kb
+    answerable: true
+    expect: ["орех", "до приготовления"]
+    sources: ["kofeinya_zerna.md:50-59"]
+
+  - text: Какая минимальная сумма заказа для доставки и когда доставка бесплатна?
+    corpus: kb
+    answerable: true
+    expect: ["700", "1500", "150"]
+    sources: ["delivery.md:5-7"]
+
+  # --- Ловушка: такого напитка в базе нет ------------------------------------
+  - text: Сколько стоит латте на кокосовом молоке?
+    corpus: kb
+    answerable: false
+    expect: []
+    sources: []

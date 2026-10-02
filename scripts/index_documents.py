@@ -57,7 +57,6 @@ import bisect
 import dataclasses
 import hashlib
 import json
-import math
 import os
 import re
 import statistics
@@ -68,21 +67,28 @@ from collections.abc import Iterable, Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:  # numpy is only needed for the fast matrix multiply in ``search``
-    import numpy as np
-except ImportError:  # pragma: no cover - the pure-Python fallback is used
-    np = None  # type: ignore[assignment]
+# Make the project's ``llm_bot`` package importable regardless of the current
+# working directory (e.g. when running ``python scripts/index_documents.py``).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-INDEX_VERSION = "1.0"
+# Search lives in the package, not here: the bot needs it at runtime and both
+# sides must score hits identically, so the script re-exports it instead of
+# keeping a second copy. ``Embedder`` in particular is still patched by name in
+# the tests, which this import keeps working.
+from llm_bot.retrieval import (
+    INDEX_VERSION,
+    Embedder,
+    ModelTokenizer,
+    load_index,
+    query_index,
+    render_answers,
+    search,
+)
+from llm_bot.retrieval import DEFAULT_EMBEDDING_MODEL
 
-# Chosen by measuring, not by reputation: on this corpus (Russian questions over
-# Russian+English docs) paraphrase-multilingual-MiniLM-L12-v2 answered 43% of the
-# hand-written questions at rank 1 against 0% for the smaller English-only
-# all-MiniLM-L6-v2. Its window is 128 tokens, not 256, hence the smaller
-# --chunk_size default. The E5 family retrieves better still, but it wants
-# "query: "/"passage: " prefixes, which this indexer does not add: encoding
-# passages as queries would make the numbers wrong rather than merely weaker.
-DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# Chosen by measuring, not by reputation — see ``llm_bot/retrieval.py`` for the
+# full rationale and the numbers behind the choice.
+DEFAULT_MODEL = DEFAULT_EMBEDDING_MODEL
 
 # The indices hold one 384-float vector per chunk (~3 KB of JSON), so they go to
 # a git-ignored directory by default; the report is small and belongs in results/.
@@ -95,6 +101,10 @@ DEFAULT_EXCLUDES = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
     ".idea", ".vscode", "dist", "build", "data", "results",
+    # The second RAG corpus (the demo knowledge base) is indexed on its own;
+    # keeping it out of the repository corpus stops it from polluting the
+    # day-21 benchmark, whose numbers must stay reproducible.
+    "knowledge_base",
 })
 
 PDF_EXT = ".pdf"
@@ -570,28 +580,6 @@ class CharTokenizer:
         return len(self.spans(text))
 
 
-class ModelTokenizer:
-    """Subword tokenizer of a sentence-transformers model, with offsets."""
-
-    name = "subword"
-
-    def __init__(self, tokenizer) -> None:
-        self._tokenizer = tokenizer
-        self.name = getattr(tokenizer, "name_or_path", "subword") or "subword"
-
-    def spans(self, text: str) -> list[tuple[int, int]]:
-        encoded = self._tokenizer(
-            text, add_special_tokens=False, return_offsets_mapping=True,
-            truncation=False, verbose=False,
-        )
-        return [
-            tuple(pair) for pair in encoded["offset_mapping"] if pair[1] > pair[0]
-        ]
-
-    def count(self, text: str) -> int:
-        return len(self.spans(text))
-
-
 # --------------------------------------------------------------------------- #
 # Chunkers
 # --------------------------------------------------------------------------- #
@@ -846,6 +834,7 @@ class StructureChunker:
                     doc, line_tokens, section, section_path, section_title
                 )
             )
+        pieces = self._absorb_heading_only(doc, pieces)
         chunks: list[Chunk] = []
         position = 0
         for section_path, section_title, start, end in pieces:
@@ -932,6 +921,21 @@ class StructureChunker:
     def _small(self, doc: Document, start: int, end: int) -> bool:
         return len(slice_lines(doc, start, end)) < self.min_chars
 
+    def _heading_only(self, doc: Document, start: int, end: int) -> bool:
+        """True when the piece is Markdown headings and blank lines, nothing else.
+
+        A heading with no prose of its own cannot answer anything, yet it embeds
+        as a near-perfect match for its own title ("Часы работы" vs "Часы работы
+        кофейни"), so it outranks the section that does hold the answer. This is
+        not a size problem and ``min_chars`` cannot catch it — a long title is
+        still a title.
+        """
+        for line in slice_lines(doc, start, end).splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                return False
+        return True
+
     def _merge_tiny(
         self, pieces: list[tuple[str, str, int, int]], doc: Document
     ) -> list[tuple[str, str, int, int]]:
@@ -973,53 +977,38 @@ class StructureChunker:
             position += 1
         return out
 
+    def _absorb_heading_only(
+        self, doc: Document, pieces: list[tuple[str, str, int, int]]
+    ) -> list[tuple[str, str, int, int]]:
+        """Fold a heading-only piece into the piece that follows it.
 
-# --------------------------------------------------------------------------- #
-# Embeddings
-# --------------------------------------------------------------------------- #
-
-
-class Embedder:
-    """Thin wrapper around a sentence-transformers model.
-
-    The model is loaded once per run (loading it per strategy doubled both the
-    time and the memory of the pipeline) and every vector is L2-normalized, so
-    a dot product is a cosine similarity.
-    """
-
-    def __init__(self, name: str = DEFAULT_MODEL, local_only: bool = False) -> None:
-        from sentence_transformers import SentenceTransformer
-
-        try:
-            self._model = SentenceTransformer(name, local_files_only=local_only)
-        except Exception:  # noqa: BLE001 - offline run without a warm HF cache
-            if not local_only:
-                raise
-            print(f"[warn] {name} is not cached, falling back to a download")
-            self._model = SentenceTransformer(name)
-        self.name = name
-        dimension = getattr(self._model, "get_embedding_dimension", None)
-        if dimension is None:  # sentence-transformers < 5
-            dimension = self._model.get_sentence_embedding_dimension
-        self.dim = int(dimension())
-        self.max_tokens = int(getattr(self._model, "max_seq_length", 256) or 256)
-        self.tokenizer = ModelTokenizer(self._model.tokenizer)
-
-    def encode(self, texts: Sequence[str], batch_size: int = 64) -> list[list[float]]:
-        if not texts:
-            return []
-        vectors = self._model.encode(
-            list(texts),
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        return [[round(float(value), 5) for value in row] for row in vectors]
+        Runs across the whole document, not per section, because the interesting
+        case is precisely a heading whose body is empty and whose content lives
+        in its *children* — a different section path. Merging stays limited to
+        heading-only pieces: a piece with real text is never pulled across a
+        section boundary, that would mix unrelated sections into one chunk. The
+        following piece's path wins, being the more specific of the two.
+        """
+        out: list[tuple[str, str, int, int]] = []
+        position = 0
+        while position < len(pieces):
+            path, title, start, end = pieces[position]
+            following = pieces[position + 1] if position + 1 < len(pieces) else None
+            if (
+                following is not None
+                and self._heading_only(doc, start, end)
+                and self._fits(doc, start, following[3])
+            ):
+                out.append((following[0], following[1], start, following[3]))
+                position += 2
+                continue
+            out.append(pieces[position])
+            position += 1
+        return out
 
 
 # --------------------------------------------------------------------------- #
-# Index
+# Index building
 # --------------------------------------------------------------------------- #
 
 
@@ -1089,92 +1078,8 @@ def corpus_summary(
 
 
 # --------------------------------------------------------------------------- #
-# Retrieval + benchmark
+# Benchmark
 # --------------------------------------------------------------------------- #
-
-
-def search(
-    embeddings: Sequence[Sequence[float]], query: Sequence[float], top_k: int = 5
-) -> list[tuple[int, float]]:
-    """Top-k chunks by cosine similarity (vectors are already normalized)."""
-    if not embeddings:
-        return []
-    top_k = max(1, min(top_k, len(embeddings)))
-    if np is not None:
-        matrix = np.asarray(embeddings, dtype=np.float32)
-        scores = matrix @ np.asarray(query, dtype=np.float32)
-        order = np.argsort(-scores)[:top_k]
-        return [(int(i), float(scores[i])) for i in order]
-    scored = [
-        (i, math.fsum(a * b for a, b in zip(row, query)))
-        for i, row in enumerate(embeddings)
-    ]
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    return scored[:top_k]
-
-
-def load_index(path: Path) -> dict[str, object]:
-    """Read a stored index back (used by ``--reuse``)."""
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"index not found: {path} (build it first, or drop --reuse)"
-        )
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("chunks", "embedding_model", "chunking_strategy"):
-        if key not in payload:
-            raise ValueError(f"{path}: not an index (no {key!r})")
-    return payload
-
-
-def query_index(
-    index: dict[str, object],
-    embedder: Embedder,
-    questions: Sequence[str],
-    top_k: int = 5,
-) -> list[list[tuple[float, dict[str, object]]]]:
-    """Answer ``questions`` against a stored or freshly built index.
-
-    Works on the plain index dict, so the same path serves a freshly built
-    index and one loaded from disk by ``--reuse`` — the answers cannot drift
-    between the two.
-    """
-    chunks = index["chunks"]  # type: ignore[assignment]
-    if not chunks:
-        return [[] for _ in questions]
-    embeddings = [chunk["embedding"] for chunk in chunks]
-    vectors = embedder.encode(questions)
-    answers: list[list[tuple[float, dict[str, object]]]] = []
-    for vector in vectors:
-        ranked = search(embeddings, vector, top_k=top_k)
-        answers.append([(score, chunks[position]) for position, score in ranked])
-    return answers
-
-
-def render_answers(
-    index: dict[str, object],
-    answers: Sequence[Sequence[tuple[float, dict[str, object]]]],
-    questions: Sequence[str],
-    width: int = 90,
-) -> str:
-    """One block per question: score, ``file:line``, section, first line."""
-    lines: list[str] = []
-    for question, hits in zip(questions, answers):
-        lines.append(f"[{index['chunking_strategy']}] {question}")
-        if not hits:
-            lines.append("  (индекс пуст)")
-        for score, record in hits:
-            meta = record["metadata"]
-            location = (
-                f"{meta.get('source', '?')}:{meta.get('start_line', 0)}"
-                f"-{meta.get('end_line', 0)}"
-            )
-            section = meta.get("section") or meta.get("title") or "—"
-            head = str(record.get("text", "")).strip().splitlines()
-            lines.append(f"  {score:.3f}  {location}  {section}")
-            if head:
-                lines.append("       " + head[0][:width])
-        lines.append("")
-    return "\n".join(lines)
 
 
 def is_hit(chunk: Chunk, query: EvalQuery) -> bool:

@@ -281,14 +281,17 @@ def test_fixed_size_rejects_a_bad_overlap() -> None:
 def test_structure_keeps_sections_whole(documents, tokenizer) -> None:
     docs, _ = documents
     chunks = _chunks(docs, idx.StructureChunker(max_tokens=64, min_chars=0, tokenizer=tokenizer))
+    # "Руководство" holds no text of its own, so it is folded into its first
+    # child rather than becoming a title-only chunk that outranks the sections
+    # with the actual content.
     assert {chunk.section for chunk in chunks} == {
-        "Руководство",
         "Руководство > Установка",
         "Руководство > Запуск",
         "<module>",
         "load",
         "Store",
     }
+    assert any("Руководство" in chunk.text for chunk in chunks)  # title kept
     for chunk in chunks:
         if chunk.section != "<module>":  # a code preamble has no heading line
             assert chunk.section_title in chunk.text
@@ -336,9 +339,13 @@ def test_structure_merges_tiny_pieces_inside_one_section(tokenizer) -> None:
 def test_structure_does_not_merge_across_sections(tokenizer) -> None:
     doc = _markdown("# t\n\n## a\n\nраздел а\n\n## б\n\nраздел б\n")
     chunks = idx.StructureChunker(max_tokens=64, min_chars=200, tokenizer=tokenizer).chunk(doc, 0)
-    assert len(chunks) == 3
+    # "# t" has no body and goes into "a"; "a" and "б" both have text of their
+    # own, so they stay apart even though both are under the 200-char minimum.
+    assert len(chunks) == 2
     assert all(len(chunk.text) < 200 for chunk in chunks)
-    assert len({chunk.section for chunk in chunks}) == 3
+    assert {chunk.section for chunk in chunks} == {"t > a", "t > б"}
+    assert "раздел а" in chunks[0].text and "раздел б" not in chunks[0].text
+    assert "раздел б" in chunks[1].text and "раздел а" not in chunks[1].text
 
 
 def test_structure_never_merges_into_an_oversized_chunk(tokenizer) -> None:
@@ -1107,8 +1114,53 @@ def test_fence_longer_than_the_budget_is_still_split(tmp_path: Path) -> None:
     assert len(chunks) > 1
     joined = "\n".join(chunk.text for chunk in chunks)
     assert joined.count("```") == 2          # both fences survive the split
-    assert "```python" in chunks[1].text     # the opening fence leads the code
+    # The opening fence leads the code. The document title above it is a
+    # heading-only piece and gets folded in, so the fence is no longer at
+    # offset 0 — but it still opens the chunk that holds the start of the code.
+    fenced = [c for c in chunks if "```python" in c.text]
+    assert len(fenced) == 1
+    assert fenced[0].text.lstrip().splitlines()[0].endswith("Большой пример")
+    assert fenced[0].text.splitlines()[2].strip() == "```python"
     assert "key_0" in joined and "key_59" in joined  # and no line is lost
+
+
+def test_heading_only_section_is_merged_into_its_child(tmp_path: Path) -> None:
+    """A heading with no body of its own must not become a chunk of its own.
+
+    ``## Часы работы`` followed directly by ``### Будни`` makes a chunk that is
+    only the title. It embeds as a near-perfect match for "Часы работы кофейни"
+    and therefore outranks the subsection that actually holds the answer, so the
+    retriever returns a title where the fact should be. The title is kept, but
+    as part of the child's chunk.
+    """
+    source = tmp_path / "kb.md"
+    source.write_text(
+        "## Часы работы\n\n### Будни\n\n- Понедельник — пятница: 8:00 — 22:00.\n",
+        encoding="utf-8",
+    )
+    docs, _ = idx.collect_documents(tmp_path, {".md"})
+    chunks = idx.StructureChunker(max_tokens=200, min_chars=0,
+                                  tokenizer=idx.CharTokenizer()).chunk(docs[0], 0)
+    assert len(chunks) == 1
+    assert "Часы работы" in chunks[0].text       # the title survives
+    assert "8:00 — 22:00" in chunks[0].text      # and so does the answer
+    assert chunks[0].section.endswith("Будни")   # under the more specific path
+
+
+def test_a_heading_with_body_of_its_own_stays_its_own_chunk(tmp_path: Path) -> None:
+    """The merge must not swallow a real section to remove a lone title."""
+    source = tmp_path / "kb.md"
+    source.write_text(
+        "## Часы работы\n\nКофейня открыта ежедневно.\n\n"
+        "### Будни\n\n- Понедельник — пятница: 8:00 — 22:00.\n",
+        encoding="utf-8",
+    )
+    docs, _ = idx.collect_documents(tmp_path, {".md"})
+    chunks = idx.StructureChunker(max_tokens=200, min_chars=0,
+                                  tokenizer=idx.CharTokenizer()).chunk(docs[0], 0)
+    assert len(chunks) == 2
+    assert chunks[0].text.startswith("## Часы работы")
+    assert "ежедневно" in chunks[0].text
 
 
 def test_parsers_still_ignore_structure_inside_fences() -> None:

@@ -1,0 +1,800 @@
+{
+  "model": "leanstral",
+  "top_k": null,
+  "rag_max_tokens": null,
+  "elapsed": 101.89,
+  "corpora": {
+    "repo": {
+      "label": "Документы репозитория",
+      "index_path": "data/emb/index_structure.json",
+      "input_dir": "."
+    },
+    "kb": {
+      "label": "База знаний кофейни «Зёрна»",
+      "index_path": "data/kb_emb/index_structure.json",
+      "input_dir": "knowledge_base"
+    }
+  },
+  "questions": [
+    {
+      "index": 1,
+      "text": "Какая модель эмбеддингов используется по умолчанию и какое у неё окно в токенах?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "paraphrase-multilingual-MiniLM-L12-v2",
+        "128"
+      ],
+      "sources": [
+        "README.md:1304-1310"
+      ]
+    },
+    {
+      "index": 2,
+      "text": "Какой дефолт у max_summary_ratio и что он ограничивает?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "0.3",
+        "summary"
+      ],
+      "sources": [
+        "plans/compression.md:69-77"
+      ]
+    },
+    {
+      "index": 3,
+      "text": "Что за G5 в плане переходов состояния задачи?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "вне скоупа",
+        "429"
+      ],
+      "sources": [
+        "plans/task_state_transitions.md:188-195"
+      ]
+    },
+    {
+      "index": 4,
+      "text": "Почему Groq начинает отдавать 429?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "8000",
+        "TPM"
+      ],
+      "sources": [
+        "README.md:634-637"
+      ]
+    },
+    {
+      "index": 5,
+      "text": "Какой max_request_tokens у модели groq/openai/gpt-oss-120b?",
+      "corpus": "repo",
+      "answerable": false,
+      "expect": [],
+      "sources": []
+    },
+    {
+      "index": 6,
+      "text": "Сколько стоит фирменный напиток «Тростниковый крем»?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "190",
+        "300"
+      ],
+      "sources": [
+        "kofeinya_zerna.md:10-16"
+      ]
+    },
+    {
+      "index": 7,
+      "text": "До какого времени кофейня работает в воскресенье?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "9:00",
+        "21:00"
+      ],
+      "sources": [
+        "kofeinya_zerna.md:39-43"
+      ]
+    },
+    {
+      "index": 8,
+      "text": "Что нужно сделать гостю с аллергией на орехи и когда?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "орех",
+        "до приготовления"
+      ],
+      "sources": [
+        "kofeinya_zerna.md:50-59"
+      ]
+    },
+    {
+      "index": 9,
+      "text": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "700",
+        "1500",
+        "150"
+      ],
+      "sources": [
+        "delivery.md:5-7"
+      ]
+    },
+    {
+      "index": 10,
+      "text": "Сколько стоит латте на кокосовом молоке?",
+      "corpus": "kb",
+      "answerable": false,
+      "expect": [],
+      "sources": []
+    }
+  ],
+  "cases": [
+    {
+      "index": 1,
+      "question": "Какая модель эмбеддингов используется по умолчанию и какое у неё окно в токенах?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Не нашёл ответа в предоставленном контексте. В контексте упоминаются различные аспекты системы (state machine, инварианты, RAG-агент), но конкретная информация о модели эмбеддингов по умолчанию и размере окна токенов не присутствует.",
+      "retrieved": [
+        "README.md:949-951",
+        "plans/invariants.md:91-92",
+        "README.md:995-1000",
+        "tasks/day22.md:22-22"
+      ],
+      "context_tokens": 313,
+      "prompt_tokens": 337,
+      "elapsed": 1.8578193839639425,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "paraphrase-multilingual-MiniLM-L12-v2",
+          "128"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "README.md",
+          "plans/invariants.md",
+          "tasks/day22.md"
+        ],
+        "passed": false
+      }
+    },
+    {
+      "index": 1,
+      "question": "Какая модель эмбеддингов используется по умолчанию и какое у неё окно в токенах?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "По умолчанию в библиотеке **sentence-transformers** используется модель **all-MiniLM-L6-v2**.\n\n## Параметры по умолчанию\n\n| Параметр | Значение |\n|----------|----------|\n| Модель | `all-MiniLM-L6-v2` |\n| Размер окна (max_seq_length) | **256 токенов** |\n| Размер эмбеддинга | 384 измерения |\n\n## Как проверить и изменить\n\n```python\nfrom sentence_transformers import SentenceTransformer\n\n# Загрузка с явным указанием размера окна\nmodel = SentenceTransformer('all-MiniLM-L6-v2', truncation=True, max_seq_length=512)\n\n# Или изменение после загрузки\nmodel.max_seq_length = 512\n\n# Проверка текущего значения\nprint(model.max_seq_length)  # 512\n```\n\n## Важные нюансы\n\n- **Truncation** — по умолчанию `False`, поэтому длинные тексты могут вызывать ошибку\n- Для длинных документов рекомендуется явно указывать `max_seq_length` или использовать модели с большим окном (например, `all-mpnet-base-v2` — 512 токенов, или `paraphrase-multilingual-MiniLM-L12-v2` — 512 токенов)\n\nЕсли вам нужны эмбеддинги для длинных текстов (например, абзацев или статей), лучше сразу загружать модель с нужным `max_seq_length`.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 24,
+      "elapsed": 13.55072326597292,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.5,
+        "hit": [
+          "paraphrase-multilingual-MiniLM-L12-v2"
+        ],
+        "missed": [
+          "128"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 2,
+      "question": "Какой дефолт у max_summary_ratio и что он ограничивает?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Дефолт у `max_summary_ratio` — **0.3** (30%).\n\nОн ограничивает **максимальный размер summary как долю контекстного окна модели**: summary не может превышать 30% от размера контекстного окна модели, даже если не задан жёсткий токен-лимит (`max_summary_tokens`). Это страховка от того, чтобы бегущий summary не вырос слишком большим и не не влез в контекстное окно [plans/compression.md:69-77, README.md:1163-1167].",
+      "retrieved": [
+        "plans/compression.md:69-77",
+        "plans/compression.md:81-87",
+        "plans/compression.md:12-19",
+        "README.md:1163-1167"
+      ],
+      "context_tokens": 562,
+      "prompt_tokens": 580,
+      "elapsed": 2.8669695149874315,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "0.3",
+          "summary"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [
+          "README.md",
+          "plans/compression.md"
+        ],
+        "retrieved_files": [
+          "README.md",
+          "plans/compression.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 2,
+      "question": "Какой дефолт у max_summary_ratio и что он ограничивает?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "## Параметр `max_summary_ratio`\n\n### Дефолтное значение\n**0.5** (50%)\n\n### Что ограничивает\n\nЭтот параметр ограничивает **максимальное соотношение размера summary к размеру исходного документа** при использовании алгоритмов сжатия/суммаризации.\n\n### Как работает\n\n| Значение | Эффект |\n|----------|--------|\n| `max_summary_ratio = 0.5` | Суммаризация не может быть длиннее 50% от оригинала |\n| `max_summary_ratio = 0.3` | Суммаризация не может быть длиннее 30% от оригинала |\n| `max_summary_ratio = 1.0` | Разрешает полную копию документа (без ограничений) |\n\n### Пример\n\n```python\nfrom transformers import pipeline\n\n# Строгое ограничение — максимум 30% от оригинала\nsummarizer = pipeline(\n    \"summarization\",\n    model=\"facebook/bart-large-cnn\",\n    max_length=150,\n    min_length=30,\n    max_summary_ratio=0.3  # ← ограничение\n)\n\n# Документ 1000 слов →.summary не длиннее 300 слов\n```\n\n### Где используется\n\n- **Hugging Face Transformers** — параметр в `pipeline(\"summarization\")`\n- **LangChain** — опция при использовании LLM-суммаризаторов\n- **Другие фреймворки** — аналогичные ограничения для контроля verbosity\n\n### Важное замечание\n\nПри `max_summary_ratio` суммаризатор может **обрезать** результат даже если он короче `max_length`, чтобы не превысить заданное соотношение. Это защищает от ситуаций, когда модель пытается воспроизвести слишком много исходного текста вместо реального сжатия.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 18,
+      "elapsed": 4.497211289941333,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "0.3",
+          "summary"
+        ],
+        "missed": [],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": true
+      }
+    },
+    {
+      "index": 3,
+      "question": "Что за G5 в плане переходов состояния задачи?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "G5 в плане переходов состояний задачи — это **fail-open аудита инвариантов при 429** (HTTP-код «слишком много запросов»).\n\nСогласно контексту, G5 находится **вне скоупа** текущего плана и решается отдельно:\n\n> [plans/task_state_transitions.md:188-195] — План: Контролируемые переходы состояний задачи (G1–G4) > Что НЕ меняется > G5 (fail-open аудита инвариантов при 429) — **вне скоупа**, решается отдельно.\n\nКонкретная реализация G5 в предоставленном контексте не описана — только констатируется, что это отдельная задача, не входящая в текущий план G1–G4.",
+      "retrieved": [
+        "plans/task_state_transitions.md:1-9",
+        "plans/task_state_transitions.md:170-178",
+        "plans/task_state_transitions.md:188-195",
+        "plans/task_state_transitions.md:152-157"
+      ],
+      "context_tokens": 571,
+      "prompt_tokens": 587,
+      "elapsed": 2.209926106967032,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "вне скоупа",
+          "429"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [
+          "plans/task_state_transitions.md"
+        ],
+        "retrieved_files": [
+          "plans/task_state_transitions.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 3,
+      "question": "Что за G5 в плане переходов состояния задачи?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "В контексте переходов состояний задач (workflow/task states) **G5** обычно относится к **пятой генерации (поколению) системы управления задачами** или конкретной модели переходов, используемой в определённых фреймворках/платформах.\n\n## Возможные значения G5:\n\n### 1. **Jira / Atlassian G5** (неофициально)\nВ сообществе Jira иногда используют обозначения поколений для разных подходов к workflow:\n- **G1**: Базовые статусы (To Do → In Progress → Done)\n- **G2**: Добавление ревью/тестирования\n- **G3**: Agile/Scrum с спринтами\n- **G4**: SAFe или enterprise-уровень с эпиками\n- **G5**: Современные DevOps/Platform-инженерные подходы с **Platform-as-a-Service**, **GitOps**, **automation-first** подходом\n\n### 2. **GitLab/GitHub/Gitea Generation 5**\nВ контексте DevOps-платформ G5 может означать:\n- **Auto DevOps** (GitLab 10+)\n- **GitOps-native workflows**\n- **InnerSource** модели с автоматизированными переходами\n\n### 3. **Конкретная методология (редко)**\nВ некоторых корпоративных стандартах G5 = **пятиуровневая модель** с:\n- **G1**: Инициация\n- **G2**: Планирование\n- **G3**: Выполнение\n- **G4**: Мониторинг\n- **G5**: Оптимизация/завершение с обратной связью\n\n---\n\n## Что характерно для G5-подхода?\n\n| Аспект | Описание |\n|--------|----------|\n| **Автоматизация** | Переходы по триггерам (CI/CD, тесты, деплои) |\n| **GitOps** | Состояние в Git как источник истины |\n| **Platform Engineering** | Самообслуживание через internal developer portal |\n| **DORA metrics** | Автоматические измерения производительности |\n| **AI/ML** | Прогнозное упреждение блокеров |\n\n---\n\n## Уточните контекст\n\nЧтобы дать точный ответ, нужно знать:\n- **Какая платформа?** (Jira, Azure DevOps, ServiceNow, самописная?)\n- **Документация/методология** откуда термин?\n- **Схема переходов** — какие статусы есть?\n\nЕсли это из конкретной презентации или курса — пришлите скриншот или контекст, и я уточню!",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 16,
+      "elapsed": 6.711564896046184,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "вне скоупа",
+          "429"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 4,
+      "question": "Почему Groq начинает отдавать 429?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Groq начинает отдавать 429 (Too Many Requests) по нескольким причинам, которые описаны в контексте:\n\n## Основные причины\n\n**1. Превышение лимита токенов на запрос (TPM cap)**\nНекоторые провайдеры, включая Groq, накладывают **жёсткий лимит токенов на один запрос** в зависимости от тарифа аккаунта. Даже если у вас полный rate-limit bucket, запрос выше этого порога будет отклонён. Groq на тарифе `on_demand` отказывает в любом запросе, превышающем TPM cap, и повторные попытки (retry) не помогут [файл:784-787].\n\n**2. Исчерпание rate-limit bucket**\nКогда bucket исчерпан, сервер возвращает 429. В отличие от случая с TPM cap, здесь повторные запросы (retry) могут помочь, если bucket успевает восстановиться.\n\n## Решение\n\nДля Groq рекомендуется установить лимит токенов на запрос:\n- Через конфигурацию модели: `max_request_tokens:`\n- Или глобально: переменная окружения `LLM_MAX_REQUEST_TOKENS`\n\nЭто предотвратит отправку запросов, которые заведомо превысят лимиты провайдера [файл:784-787].",
+      "retrieved": [
+        "README.md:1298-1300",
+        "README.md:1336-1341",
+        "README.md:1380-1384",
+        "README.md:784-787"
+      ],
+      "context_tokens": 432,
+      "prompt_tokens": 445,
+      "elapsed": 3.1957755680195987,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.5,
+        "hit": [
+          "TPM"
+        ],
+        "missed": [
+          "8000"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "README.md"
+        ],
+        "passed": false
+      }
+    },
+    {
+      "index": 4,
+      "question": "Почему Groq начинает отдавать 429?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "# Почему Groq возвращает 429 (Too Many Requests)\n\n## Основные причины\n\n### 1. **Rate Limiting (Ограничение скорости)**\n```javascript\n// Groq имеет лимиты запросов в минуту/секунду\n// Обычно: ~100-1000 запросов/мин в зависимости от тарифа\n```\n\n### 2. **Слишком частые запросы**\n```javascript\n// ❌ Плохо: цикл с запросами без пауз\nfor (let i = 0; i < 100; i++) {\n  client.fetch(query); // 100 запросов подряд\n}\n\n// ✅ Хорошо: пагинация или батчинг\nconst results = [];\nlet hasMore = true;\nwhile (hasMore) {\n  const batch = await client.fetch(query, { limit: 50, offset: results.length });\n  results.push(...batch);\n  hasMore = batch.length === 50;\n}\n```\n\n### 3. **Долгие запросы + высокая нагрузка**\n```javascript\n// Сложный запрос с фильтрами, сортировкой, JOIN\nconst query = `\n  *[_type == \"product\" && price > 100]\n  | order(_createdAt desc)\n  [0..99]\n`; // Может держать соединение открытым долго\n```\n\n## Как исправить\n\n### Включить retry с экспоненциальной задержкой\n```javascript\nimport { createClient } from '@sanity/client';\n\nconst client = createClient({\n  projectId: 'xxx',\n  dataset: 'production',\n  token: 'xxx',\n  // Автоматический retry\n  retry: true,\n  maxRetries: 3,\n  // Или кастомный retry\n  requester: async (request) => {\n    let lastError;\n    for (let i = 0; i < 3; i++) {\n      try {\n        return await fetch(request.url, request);\n      } catch (err) {\n        lastError = err;\n        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i))); // 1s, 2s, 4s\n      }\n    }\n    throw lastError;\n  }\n});\n```\n\n### Оптимизировать запросы\n```javascript\n// ❌ Медленно: выбирает все поля\n*[_type == \"user\"][0..10]\n\n// ✅ Быстро: только нужные поля\n*[_type == \"user\"][0..10]{_id, name, email}\n\n// ❌ Без индексов\n*[_type == \"order\" && status == \"pending\"]\n\n// ✅ С использованием индексов (если настроены)\n*[_type == \"order\" && _id in *[_type == \"user\" && email == $email]._id]\n```\n\n### Использовать CDN/Edge caching\n```javascript\nimport { createClient } from '@sanity/client';\n\nconst client = createClient({\n  projectId: 'xxx',\n  dataset: 'production',\n  // Включить кэширование на клиенте\n  perspective: 'published',\n  // Для GROQ запросов с identical params\n});\n```\n\n## Мониторинг и диагностика\n\n```javascript\n// Логирование для отладки\nclient\n  .fetch(query)\n  .then(data => console.log('Success:', data))\n  .catch(err => {\n    console.error('Error:', err.status, err.message);\n    if (err.status === 429) {\n      console.log('Retry after:', err.headers.get('retry-after'));\n    }\n  });\n```\n\n## Проверьте также\n\n| Проблема | Решение |\n|----------|---------|\n| Много concurrent запросов | Используйте `Promise.all` с ограничением |\n| Долгие соединения | Уменьшите таймауты |\n| Проблемы на стороне Sanity | Проверьте [status.sanity.io](https://status.sanity.io) |\n| Неправильный токен | Проверьте права доступа |\n\nЕсли нужна помощь с конкретным запросом — покажите его, помогу оптимизировать!",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 13,
+      "elapsed": 6.4330665320158005,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "8000",
+          "TPM"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 5,
+      "question": "Какой max_request_tokens у модели groq/openai/gpt-oss-120b?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": false,
+      "answer": "Не нашёл ответа в контексте.\n\nВ предоставленном контексте упоминается модель `groq/openai/gpt-oss-120b` в списке для сравнения моделей [README.md:1286-1291], но конкретное значение `max_request_tokens` для этой модели не указано.",
+      "retrieved": [
+        "README.md:380-393",
+        "plans/agent.md:73-81",
+        "README.md:1286-1291",
+        "README.md:634-637"
+      ],
+      "context_tokens": 444,
+      "prompt_tokens": 463,
+      "elapsed": 1.5441284970147535,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": true,
+        "cited_files": [
+          "README.md"
+        ],
+        "retrieved_files": [
+          "README.md",
+          "plans/agent.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 5,
+      "question": "Какой max_request_tokens у модели groq/openai/gpt-oss-120b?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": false,
+      "answer": "Я не могу точно сказать, какой у этой модели `max_request_tokens`, так как это зависит от конкретного провайдера и его настроек.\n\n## Groq\n\nНа **Groq** модель `llama-3.1-70b-versatile` (это ближайший аналог, хотя `gpt-oss-120b` там может отсутствовать или называться иначе):\n\n| Параметр | Значение |\n|----------|----------|\n| `max_tokens` | **128,000** (для входных токенов) |\n| `max_completion_tokens` | **128,000** |\n\n> ⚠️ Groq имеет отдельные лимиты на вход и выход. Для `llama-3.1-70b` вход — до 128K, выход — до 128K.\n\n## OpenAI\n\nУ **OpenAI** модели `gpt-oss-120b` **не существует** в публичном доступе. OpenAI не выпускала модель с таким названием.\n\nВозможные варианты:\n- `gpt-4o` — контекст 128K\n- `gpt-4o-mini` — контекст 128K\n- `o1`, `o3` — контекст 200K\n\n## Проверка через API\n\n```python\nfrom openai import OpenAI\n\nclient = OpenAI(base_url=\"https://api.groq.com/openai/v1\", api_key=\"your_key\")\n\n# Для Groq\nmodels = client.models.list()\nfor m in models.data:\n    if \"oss\" in m.id.lower() or \"120b\" in m.id.lower():\n        print(m.id, m.context_length)  # контекстное окно\n```\n\n## Рекомендация\n\nУточните у провайдера:\n1. **Какой именно провайдер** предоставляет `gpt-oss-120b`?\n2. Есть ли у него документация с лимитами?\n\nЕсли это кастомная модель через OpenRouter или другой агрегатор — лимиты могут отличаться от декларированных.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 19,
+      "elapsed": 5.63407635607291,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": false,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 6,
+      "question": "Сколько стоит фирменный напиток «Тростниковый крем»?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Фирменный напиток «Тростниковый крем» стоит **190 ₽** за 300 мл [kofeinya_zerna.md:14].",
+      "retrieved": [
+        "kofeinya_zerna.md:18-24",
+        "kofeinya_zerna.md:6-17",
+        "kofeinya_zerna.md:25-31",
+        "delivery.md:16-22"
+      ],
+      "context_tokens": 338,
+      "prompt_tokens": 355,
+      "elapsed": 5.362166932085529,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "190",
+          "300"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 6,
+      "question": "Сколько стоит фирменный напиток «Тростниковый крем»?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "Я не располагаю актуальной информацией о ценах на напитки в конкретных заведениях, так как у меня нет доступа к их меню или прайс-листам.\n\nЧтобы узнать стоимость «Тростникового крема», рекомендую:\n\n- **Позвонить в интересующее вас кафе или ресторан** — обычно это самый быстрый способ\n- **Проверить официальный сайт или страницы в соцсетях** заведения\n- **Уточнить при личном визите**\n\nЕсли вы скажете, в каком городе или заведении вы планируете заказать напиток, я могу подсказать, как найти контакты или проверить информацию.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 17,
+      "elapsed": 2.9283359959954396,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "190",
+          "300"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 7,
+      "question": "До какого времени кофейня работает в воскресенье?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Кофейня работает в воскресенье с 9:00 до 21:00 [kofeinya_zerna.md:43].",
+      "retrieved": [
+        "kofeinya_zerna.md:32-38",
+        "kofeinya_zerna.md:45-49",
+        "delivery.md:10-15",
+        "kofeinya_zerna.md:39-44"
+      ],
+      "context_tokens": 279,
+      "prompt_tokens": 296,
+      "elapsed": 1.1788160200230777,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "9:00",
+          "21:00"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 7,
+      "question": "До какого времени кофейня работает в воскресенье?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "Я не располагаю информацией о конкретном графике работы кофейни, о которой вы спрашиваете. У меня нет доступа к актуальным данным о часах работы заведений.\n\nЧтобы узнать время работы в воскресенье, рекомендую:\n\n- **Позвонить напрямую** в кофейню\n- **Проверить сайт или страницу в соцсетях** заведения\n- **Использовать картографические сервисы** (2ГИС, Google Maps) — там часто указаны часы работы\n\nЕсли вы скажете, о какой кофейне идёт речь (название, район), я постараюсь помочь найти общую информацию, хотя она может быть неактуальной.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 17,
+      "elapsed": 2.9238276220858097,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "9:00",
+          "21:00"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 8,
+      "question": "Что нужно сделать гостю с аллергией на орехи и когда?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "[kofeinya_zerna.md:52-60] — Зёрна — кофейня на Малой Садовой, 14 > Гости с аллергией\n\n- **Когда:** бариста обязан предупредить гостя о составе сиропа **до** приготовления, а не после.\n- **Что делать:**\n  - Ореховый сироп содержит фундук и миндаль — при аллергии на орехи его не предлагают, а напиток делают без него.\n  - Миндаль в круассане — отдельный компонент, не «возможный след».\n  - Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или воду и не предлагает альтернативу «на глаз».",
+      "retrieved": [
+        "kofeinya_zerna.md:50-51",
+        "kofeinya_zerna.md:52-60",
+        "kofeinya_zerna.md:77-83",
+        "kofeinya_zerna.md:18-24"
+      ],
+      "context_tokens": 366,
+      "prompt_tokens": 384,
+      "elapsed": 2.6935620249714702,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "орех",
+          "до приготовления"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [
+          "kofeinya_zerna.md"
+        ],
+        "retrieved_files": [
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 8,
+      "question": "Что нужно сделать гостю с аллергией на орехи и когда?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "## Что делать гостю с аллергией на орехи\n\n### **До мероприятия**\n- **Предупредить организаторов** о своей аллергии (телефон, email, при регистрации)\n- Уточнить, будут ли подавать орехи/продукты с орехами\n- Узнать, есть ли возможность принести своё блюдо (если речь о питании)\n\n### **Во время мероприятия**\n- **Не стесняться напоминать** о своей аллергии, если подают еду\n- **Внимательно читать меню** — орехи могут быть в соусах, выпечке, десертах, салатах\n- **Спрашивать персонал** о составе блюд, если не уверен\n- **Не есть** то, что вызывает сомнения\n\n### **Если произошла реакция**\n- Признаки: зуд, отёк, сыпь, затруднённое дыхание, тошнота\n- **Срочно сообщить** организаторам и окружающим\n- При сильной реакции — вызвать скорую (103/112)\n\n---\n\n## Что должны сделать организаторы\n\n| Что | Когда |\n|-----|-------|\n| Уточнить наличие аллергии при регистрации | Заранее |\n| Обозначить зону без орехов | Перед мероприятием |\n| Предупредить о блюдах с орехами | При подаче |\n| Иметь антигистаминные препараты | На всякий случай |\n\nЕсли вы организатор — лучше перестраховаться и сделать опрос о пищевых аллергиях при регистрации. Это безопаснее, чем потом экстренно решать проблему.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 18,
+      "elapsed": 4.162475256016478,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.5,
+        "hit": [
+          "орех"
+        ],
+        "missed": [
+          "до приготовления"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 9,
+      "question": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Минимальная сумма заказа для собственной доставки — 700 ₽ [delivery.md:5]. Доставка бесплатна от 1500 ₽ [delivery.md:6].",
+      "retrieved": [
+        "delivery.md:1-9",
+        "delivery.md:10-15",
+        "kofeinya_zerna.md:6-17",
+        "kofeinya_zerna.md:25-31"
+      ],
+      "context_tokens": 339,
+      "prompt_tokens": 361,
+      "elapsed": 1.325548280030489,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "700",
+          "1500",
+          "150"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 9,
+      "question": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "К сожалению, у меня нет информации о минимальной сумме заказа и условиях бесплатной доставки — эти данные зависят от конкретного магазина или сервиса.\n\n**Где можно узнать:**\n- На сайте магазина (обычно в разделе «Доставка» или «Оплата»)\n- В карточке товара — рядом с кнопкой «Купить»\n- По телефону горячей линии магазина\n- В личном кабинете при оформлении заказа\n\nЕсли вы скажете, о каком магазине или сервисе идёт речь, я постараюсь помочь найти актуальную информацию.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 22,
+      "elapsed": 2.3882224060362205,
+      "error": "",
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "700",
+          "1500",
+          "150"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 10,
+      "question": "Сколько стоит латте на кокосовом молоке?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": false,
+      "answer": "Не нашёл ответа в контексте. В предоставленной информации есть только упоминание о кокосовом молоке в разделе о добавках, но конкретной цены латте на кокосовом молоке нет.\n\n[kofeinya_zerna.md:18-24] — в разделе сиропов указаны добавки, но не указано кокосовое молоко как опция.",
+      "retrieved": [
+        "kofeinya_zerna.md:18-24",
+        "kofeinya_zerna.md:6-17",
+        "kofeinya_zerna.md:70-76",
+        "kofeinya_zerna.md:25-31"
+      ],
+      "context_tokens": 337,
+      "prompt_tokens": 351,
+      "elapsed": 2.951434895978309,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": true,
+        "cited_files": [
+          "kofeinya_zerna.md"
+        ],
+        "retrieved_files": [
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 10,
+      "question": "Сколько стоит латте на кокосовом молоке?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": false,
+      "answer": "Цена латте на кокосовом молоке зависит от места:\n\n**В кофейнях:**\n- В России: 250–450 ₽ (в среднем 300–350 ₽)\n- В Москве/Санкт-Петербурге: 300–500 ₽\n- В регионах: 200–350 ₽\n\n**Факторы, влияющие на цену:**\n- Размер (маленький/средний/большой)\n- Топпинг (карамель, орехи, шоколад)\n- Премиальность заведения\n- Регион\n\n**В домашних условиях:**\n- Кокосовое молоко: ~150–250 ₽ за упаковку\n- Кофе, сахар, специи — в пределах 50–100 ₽\n- **Итого: ~200–350 ₽ за порцию**\n\nЕсли вы имеете в виду конкретное место — уточните, подскажу точнее.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 14,
+      "elapsed": 2.8142658399883658,
+      "error": "",
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": false,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    }
+  ],
+  "summary": {
+    "rag": {
+      "questions": 10,
+      "answered": 10,
+      "errors": [],
+      "fact_coverage_mean": 0.812,
+      "fact_coverage_full": 6,
+      "answerable": 8,
+      "refusal_rate": 1.0,
+      "unanswerable": 2,
+      "retrieval_hit_rate": 0.75,
+      "citation_rate": 0.0,
+      "passed": 8,
+      "pass_rate": 0.8,
+      "prompt_tokens_mean": 415.9,
+      "elapsed_mean": 2.52,
+      "context_tokens_mean": 398.1
+    },
+    "no_rag": {
+      "questions": 10,
+      "answered": 10,
+      "errors": [],
+      "fact_coverage_mean": 0.25,
+      "fact_coverage_full": 1,
+      "answerable": 8,
+      "refusal_rate": 0.0,
+      "unanswerable": 2,
+      "retrieval_hit_rate": 0.0,
+      "citation_rate": 0.0,
+      "passed": 1,
+      "pass_rate": 0.1,
+      "prompt_tokens_mean": 17.8,
+      "elapsed_mean": 5.2,
+      "context_tokens_mean": 0.0
+    }
+  }
+}

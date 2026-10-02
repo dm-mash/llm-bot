@@ -38,6 +38,7 @@ from llm_bot.gigachat import build_gigachat_client
 from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.memory_store import JsonMemoryStore
 from llm_bot.profiles import profile_prompt_block
+from llm_bot.rag import DEFAULT_MAX_CONTEXT_RATIO, DEFAULT_TOP_K
 from llm_bot.task_state import TaskStage
 from llm_bot.yaml_stores import (
     YamlAgentStore,
@@ -199,6 +200,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--list-invariants",
         action="store_true",
         help="List global invariants from the invariants YAML and exit.",
+    )
+
+    # --- RAG (retrieval-augmented generation) --------------------------------
+    group = parser.add_argument_group("RAG")
+    group.add_argument(
+        "--rag",
+        action="store_true",
+        help=(
+            "Answer from a local document index: the top chunks matching each "
+            "question are injected as context and the model must cite them. "
+            "Off by default — without --rag the bot answers from the model only."
+        ),
+    )
+    group.add_argument(
+        "--rag-index",
+        default="data/emb/index_structure.json",
+        help=(
+            "JSON index to search (built by scripts/index_documents.py). "
+            "Default: %(default)s"
+        ),
+    )
+    group.add_argument(
+        "--rag-top-k",
+        type=int,
+        default=None,
+        help="Chunks to retrieve per question (default: %d)." % DEFAULT_TOP_K,
+    )
+    group.add_argument(
+        "--rag-max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Hard cap on the retrieved context, in tokens. By default the "
+            "block may use this share of the model's context window "
+            "({ratio}), whichever of the two is smaller."
+        ).format(ratio=DEFAULT_MAX_CONTEXT_RATIO),
     )
 
     # Legacy direct-call options (used only without --agent).
@@ -429,6 +466,9 @@ def _run_agent_chat(
     audit_invariants_warn: bool = False,
     mcp_servers: list[str] | None = None,
     mcp_config: str | None = None,
+    rag_index: str | None = None,
+    rag_top_k: int | None = None,
+    rag_max_tokens: int | None = None,
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
@@ -457,6 +497,9 @@ def _run_agent_chat(
             audit_invariants_warn=audit_invariants_warn,
             mcp_servers=mcp_servers,
             mcp_config_file=mcp_config,
+            rag_index=rag_index,
+            rag_top_k=rag_top_k,
+            rag_max_context_tokens=rag_max_tokens,
         )
     except ValueError as exc:
         # Configuration mistakes (bad --mcp name, missing config file, ...)
@@ -488,11 +531,38 @@ def _run_agent_chat(
         _print_usage(session)
         _print_compression(session)
         _print_memory(session)
+        _print_rag(session)
         _print_mcp_events(session)
         _print_invariant_warnings(session)
         return 0
 
     return _interactive_loop(session)
+
+
+def _print_rag(session: Session) -> None:
+    """Print how the last question was grounded, on stderr.
+
+    Only the newest event: in an interactive loop the earlier retrievals are
+    already reported, and repeating them would bury the current turn.
+    """
+    event = getattr(session, "last_rag_event", None)
+    if event is None:
+        return
+    if not event.retrieved:
+        if event.candidates:
+            print("[rag] контекст не поместился в бюджет — ответ без опоры "
+                  "на базу", file=sys.stderr)
+        else:
+            print("[rag] ничего не найдено — ответ без опоры на базу",
+                  file=sys.stderr)
+        return
+    shown = ", ".join(event.retrieved[:4])
+    extra = f" (+{len(event.retrieved) - 4})" if len(event.retrieved) > 4 else ""
+    parts = [f"{len(event.retrieved)} чанк(ов): {shown}{extra}"]
+    if event.dropped:
+        parts.append(f"отброшено по бюджету: {event.dropped}")
+    parts.append(f"токены контекста: {event.context_tokens}")
+    print("[rag] " + ", ".join(parts), file=sys.stderr)
 
 
 def _print_mcp_events(session: Session) -> None:
@@ -1380,6 +1450,9 @@ def main(argv: list[str] | None = None) -> int:
             audit_invariants_warn=args.audit_invariants_warn,
             mcp_servers=mcp_servers,
             mcp_config=args.mcp_config,
+            rag_index=args.rag_index if args.rag else None,
+            rag_top_k=args.rag_top_k,
+            rag_max_tokens=args.rag_max_tokens,
         )
 
     # Legacy path.

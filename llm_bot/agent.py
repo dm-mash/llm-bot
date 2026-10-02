@@ -33,6 +33,7 @@ from llm_bot.invariants import (
 )
 from llm_bot.mcp_tools import DEFAULT_MAX_ROUNDS, MCPEvent, MCPRouter
 from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
+from llm_bot.rag import RagEvent, Retriever
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.task_state import (
     TaskDetectionEvent,
@@ -238,6 +239,7 @@ class Session:
         audit_invariants_warn: bool = False,
         mcp: MCPRouter | None = None,
         mcp_max_rounds: int | None = None,
+        retriever: Retriever | None = None,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -251,6 +253,14 @@ class Session:
         # (e.g. an invented action name) the model needs one extra round to
         # correct itself, so the budget must leave room for that.
         self._mcp = mcp
+        # RAG: an optional retriever over a local document index. When set,
+        # every user question is answered *also* by the top chunks of that
+        # index, and the rendered block is injected as a prefix system
+        # message. It is deliberately not history: the block is rebuilt per
+        # question and never persisted, so the dialog never accumulates
+        # yesterday's evidence (same rule as tool results under ARCH-2).
+        self._retriever = retriever
+        self._rag_events: list[RagEvent] = []
         # Round budget: an explicit value wins; otherwise the router's
         # ``max_rounds`` (configurable via the ``max_rounds`` key of the MCP
         # config for long cross-server chains), otherwise the default.
@@ -422,6 +432,16 @@ class Session:
     def last_mcp_event(self) -> MCPEvent | None:
         """The most recent MCP tool event, or ``None``."""
         return self._mcp_events[-1] if self._mcp_events else None
+
+    @property
+    def rag_events(self) -> list[RagEvent]:
+        """Every retrieval recorded in this session (one per question)."""
+        return list(self._rag_events)
+
+    @property
+    def last_rag_event(self) -> RagEvent | None:
+        """The most recent retrieval event, or ``None``."""
+        return self._rag_events[-1] if self._rag_events else None
 
     @property
     def invariant_events(self) -> list[InvariantAuditEvent]:
@@ -698,6 +718,25 @@ class Session:
             if block:
                 mcp_prefix = [{"role": "system", "content": block}]
 
+        # RAG: the top chunks of the local index for THIS question. Placed
+        # after the tools block and before the role prompt: the model already
+        # knows what it can call, and the evidence sits immediately ahead of the
+        # request it has to answer. Because it is a prefix message it counts
+        # towards the budget checks below like any other part of the request,
+        # so a big index cannot silently blow the context window.
+        rag_prefix = []
+        if self._retriever is not None:
+            try:
+                rag_block, rag_event = self._retriever.render(user_message)
+            except Exception as exc:  # noqa: BLE001 - retrieval must never
+                # take the turn down: the bot answers without grounding rather
+                # than failing (same policy as memory/task extraction below).
+                logger.warning("RAG retrieval failed, answering without it: %s", exc)
+            else:
+                if rag_block:
+                    rag_prefix = [{"role": "system", "content": rag_block}]
+                self._rag_events.append(rag_event)
+
         prepared = None
         if self._strategy is not None:
             prepared = self._strategy.prepare(user_msg)
@@ -709,6 +748,7 @@ class Session:
                 *memory_prefix,
                 *task_prefix,
                 *mcp_prefix,
+                *rag_prefix,
                 *prepared.prefix,
             ]
             messages = self.agent.build_messages(
@@ -734,6 +774,7 @@ class Session:
                     *memory_prefix,
                     *task_prefix,
                     *mcp_prefix,
+                    *rag_prefix,
                 ]
                 or None,
             )

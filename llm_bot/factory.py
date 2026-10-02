@@ -38,6 +38,8 @@ from llm_bot.memory import (
 )
 from llm_bot.memory_store import JsonMemoryStore, MemoryStore
 from llm_bot.profiles import apply_profile
+from llm_bot.rag import DEFAULT_TOP_K as DEFAULT_RAG_TOP_K
+from llm_bot.rag import Retriever
 from llm_bot.stores import (
     AgentConfig,
     AgentStore,
@@ -209,6 +211,10 @@ def make_session(
     mcp_servers: list[str] | None = None,
     mcp_config_file: str | None = None,
     mcp_router: MCPRouter | None = None,
+    rag_index: str | Path | None = None,
+    rag_top_k: int | None = None,
+    rag_max_context_tokens: int | None = None,
+    retriever: Retriever | None = None,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
 
@@ -242,6 +248,15 @@ def make_session(
     after a pause or a process restart. When auto-detection is on (default),
     the machine also drives itself from the dialog after each turn via a small
     LLM call (see :func:`llm_bot.task_state.detect_task_turn`).
+
+    RAG: passing *rag_index* (a JSON index built by
+    ``scripts/index_documents.py``) attaches a
+    :class:`~llm_bot.rag.Retriever`, so every question is answered against the
+    top chunks of that index and the model is told to cite them. *rag_top_k* and
+    *rag_max_context_tokens* tune how much of it gets into the prompt; the
+    block's ceiling also falls back to a share of the model's context window
+    (see :func:`llm_bot.rag.rag_budget_tokens`). Pass a ready-made *retriever*
+    instead to skip construction (tests, custom retrieval).
     """
     agent_config = agent_store.get(agent_name)
     if profile is not None:
@@ -334,6 +349,18 @@ def make_session(
         # every turn. Session-scoped invariants added via /invariant add
         # will still work because Session loads them from the store.
 
+    # RAG: the index is read (and validated) here, so a missing or foreign file
+    # fails at startup rather than on the user's first question. The embedding
+    # model itself is still loaded lazily on the first query.
+    effective_retriever = retriever
+    if effective_retriever is None and rag_index is not None:
+        effective_retriever = Retriever(
+            rag_index,
+            top_k=rag_top_k if rag_top_k is not None else DEFAULT_RAG_TOP_K,
+            max_context_tokens=rag_max_context_tokens,
+            context_window=agent.context_window,
+        )
+
     return Session(
         session_id,
         agent,
@@ -362,4 +389,5 @@ def make_session(
                 Path(mcp_config_file) if mcp_config_file else None,
             )
         ),
+        retriever=effective_retriever,
     )
