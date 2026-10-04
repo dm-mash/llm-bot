@@ -111,7 +111,21 @@ PDF_EXT = ".pdf"
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 PY_BLOCK_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<kind>def|class|async def)\s+(?P<name>\w+)")
+#: Page separator between extracted PDF pages. ``splitlines()`` treats ``\f`` as
+#: a line boundary and would silently drop it, so the text is split on ``\n``
+#: instead — see :func:`split_lines`.
 PAGE_BREAK = "\f"
+
+
+def split_lines(text: str) -> list[str]:
+    """Split on newlines only, keeping ``\\f`` inside the lines.
+
+    ``str.splitlines`` breaks on ``\\f`` (and on \\x1c-\\x1e, \\x85, \\u2028,
+    \\u2029), which erases the page marker before any page-aware parsing can see
+    it: every PDF then arrives as one unlabelled section and ``page_of_line``
+    always returns "". Only ``\\n`` is a line separator for this corpus.
+    """
+    return text.split("\n")
 
 #: One «token» for the pure-Python fallback tokenizer: a run of non-space chars.
 WORD_RE = re.compile(r"\S+")
@@ -155,6 +169,9 @@ class Document:
     # Line ranges a chunker must not cut at a blank line (fenced code). Filled by
     # the parsers that have such a notion; prose documents legitimately have none.
     verbatim: tuple[tuple[int, int], ...] = ()
+    #: PDF pages left out by ``--pdf_max_pages``. Non-zero means the index holds
+    #: a prefix of the file, which the report must disclose.
+    pages_dropped: int = 0
 
     @property
     def text(self) -> str:
@@ -305,8 +322,15 @@ def iter_files(
                 yield path
 
 
-def extract_pdf_text(path: Path) -> str:
-    """Extract PDF text, keeping ``\\f`` page breaks for page-aware chunking."""
+def extract_pdf_text(path: Path, max_pages: int = 0) -> tuple[str, int]:
+    """Extract PDF text, keeping ``\\f`` page breaks for page-aware chunking.
+
+    ``max_pages`` keeps only the leading pages (0 = all) and returns the number
+    of pages actually dropped, so the report can say plainly that the index is
+    not the whole file. Silently indexing a prefix is the kind of quiet gap that
+    makes a later "the fact is not in the corpus" verdict wrong: the answer sat
+    on page 3 of a 4-page PDF and the corpus claim was never checked.
+    """
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -314,8 +338,12 @@ def extract_pdf_text(path: Path) -> str:
             "PDF support needs pypdf: pip install pypdf"
         ) from exc
     reader = PdfReader(str(path))
-    pages = [(page.extract_text() or "").rstrip() for page in reader.pages]
-    return PAGE_BREAK.join(pages)
+    kept = reader.pages if max_pages <= 0 else reader.pages[:max_pages]
+    pages = [(page.extract_text() or "").rstrip() for page in kept]
+    # The marker gets a line of its own: page text is rstripped, so a bare join
+    # would weld the last line of page N to the first line of page N+1 and hand
+    # the chunker a section boundary in the middle of a line.
+    return f"\n{PAGE_BREAK}\n".join(pages), len(reader.pages) - len(kept)
 
 
 def document_title(rel_path: str, ext: str, lines: Sequence[str]) -> str:
@@ -330,15 +358,22 @@ def document_title(rel_path: str, ext: str, lines: Sequence[str]) -> str:
     return Path(rel_path).stem
 
 
-def load_document(path: Path, root: Path, ext: str) -> Document | None:
+def load_document(
+    path: Path,
+    root: Path,
+    ext: str,
+    pdf_max_pages: int = 0,
+) -> Document | None:
     """Read one file into a :class:`Document`; ``None`` if it is unusable."""
+    pages_dropped = 0
     try:
-        raw = extract_pdf_text(path) if ext == PDF_EXT else path.read_text(
-            encoding="utf-8", errors="replace"
-        )
+        if ext == PDF_EXT:
+            raw, pages_dropped = extract_pdf_text(path, pdf_max_pages)
+        else:
+            raw = path.read_text(encoding="utf-8", errors="replace")
     except (OSError, RuntimeError):
         return None
-    lines = tuple(raw.splitlines())
+    lines = tuple(split_lines(raw))
     if not any(line.strip() for line in lines):
         return None
     rel_path = path.resolve().relative_to(root.resolve()).as_posix()
@@ -349,9 +384,7 @@ def load_document(path: Path, root: Path, ext: str) -> Document | None:
         sections = parse_code_blocks(lines)
     else:
         sections = parse_generic_blocks(lines)
-    page_starts = tuple(
-        i + 1 for i, line in enumerate(lines) if PAGE_BREAK in line
-    )
+    page_starts = tuple(start for start, _ in page_spans(lines))
     return Document(
         verbatim=tuple(fenced_ranges(lines)),
         path=path,
@@ -361,6 +394,7 @@ def load_document(path: Path, root: Path, ext: str) -> Document | None:
         lines=lines,
         sections=sections,
         page_starts=page_starts,
+        pages_dropped=pages_dropped,
     )
 
 
@@ -369,20 +403,26 @@ def collect_documents(
     extensions: Sequence[str],
     excludes: frozenset[str] = DEFAULT_EXCLUDES,
     max_docs: int = 0,
+    pdf_max_pages: int = 0,
 ) -> tuple[list[Document], list[str]]:
     """Load every corpus file. Returns ``(documents, notes)`` with skip reasons.
 
     ``notes`` groups repeated skip reasons (one empty ``__init__.py`` per
     package is not worth a report line each), and PDF files are skipped with a
     hint when the optional ``pypdf`` dependency is missing.
+
+    ``pdf_max_pages`` is surfaced as a note of its own: a truncated corpus has to
+    declare itself, otherwise "the fact is not in the index" and "the fact was
+    never indexed" look identical in the report.
     """
     if not input_dir.is_dir():
         raise FileNotFoundError(f"input_dir does not exist: {input_dir}")
     documents: list[Document] = []
     skipped: Counter[str] = Counter()
+    dropped_pages = 0
     for path in iter_files(input_dir, extensions, excludes):
         ext = path.suffix.lower()
-        doc = load_document(path, input_dir, ext)
+        doc = load_document(path, input_dir, ext, pdf_max_pages)
         if doc is None:
             reason = "no text layer (install pypdf for PDF)" if ext == PDF_EXT else (
                 "empty or unreadable"
@@ -390,8 +430,12 @@ def collect_documents(
             skipped[f"{path.suffix or path.name}: {reason}"] += 1
             continue
         documents.append(doc)
+        dropped_pages += doc.pages_dropped
         if max_docs and len(documents) >= max_docs:
             break
+    if dropped_pages:
+        skipped[f"PDF: {dropped_pages} страниц не попали в индекс "
+                f"(--pdf_max_pages {pdf_max_pages})"] += 1
     notes = [
         f"{count} × {reason}" if count > 1 else reason
         for reason, count in sorted(skipped.items())
@@ -474,16 +518,43 @@ def parse_code_blocks(lines: Sequence[str]) -> tuple[Section, ...]:
     return tuple(sections)
 
 
+def page_spans(lines: Sequence[str]) -> tuple[tuple[int, int], ...]:
+    """1-based inclusive line spans of the ``\\f``-separated pages.
+
+    The marker normally sits on a line of its own (see
+    :func:`extract_pdf_text`) and belongs to no page, so it is skipped. A marker
+    found inside a line instead closes the page at that line: the text after it
+    is the next page's, and dropping the tail would lose content.
+    """
+    spans: list[tuple[int, int]] = []
+    start = 1
+    for number, line in enumerate(lines, 1):
+        if PAGE_BREAK not in line:
+            continue
+        # ``str.strip()`` eats ``\f`` too (it is whitespace), so the line is
+        # emptied first and only ``\f`` is left over.
+        if line.replace(PAGE_BREAK, "").strip() == "":
+            if number - 1 >= start:
+                spans.append((start, number - 1))
+            start = number + 1
+        else:
+            spans.append((start, number))
+            start = number
+    if start <= len(lines):
+        spans.append((start, len(lines)))
+    return tuple(spans)
+
+
 def parse_generic_blocks(lines: Sequence[str]) -> tuple[Section, ...]:
     """Plain text / YAML: pages (``\\f``) if present, otherwise the whole file."""
-    page_lines = [i for i, line in enumerate(lines, 1) if PAGE_BREAK in line]
-    if not page_lines:
+    spans = page_spans(lines)
+    whole = (1, len(lines))
+    if not spans or spans == (whole,):
         return (Section("", "", 1, len(lines)),)
-    sections: list[Section] = []
-    for index, start in enumerate(page_lines):
-        end = page_lines[index + 1] - 1 if index + 1 < len(page_lines) else len(lines)
-        sections.append(Section(f"page {index + 1}", f"page {index + 1}", start, end))
-    return tuple(sections)
+    return tuple(
+        Section(f"page {index}", f"page {index}", start, end)
+        for index, (start, end) in enumerate(spans, 1)
+    )
 
 
 def fenced_ranges(lines: Sequence[str]) -> list[tuple[int, int]]:
@@ -552,11 +623,16 @@ def blank_line_runs(
 
 
 def page_of_line(doc: Document, line: int) -> str:
-    """PDF page label for a 1-based line, if the document has page breaks."""
+    """PDF page label for a 1-based line, if the document has page breaks.
+
+    ``bisect_right`` on the first line of each page maps every line of that page
+    to its own number, including the last one, because the next page's first
+    line is strictly greater.
+    """
     if not doc.page_starts:
         return ""
     index = bisect.bisect_right(doc.page_starts, line)
-    return f"page {index}"
+    return f"page {index}" if index else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -761,6 +837,13 @@ class FixedSizeChunker:
         return chunks
 
 
+#: «Количество человек: 1», «Длительность: 20 минут», «Место проведения: зал» —
+#: a labelled value, the shape a service form or an invoice puts its facts in.
+#: A capital letter starts the label so that prose with a colon mid-sentence
+#: does not qualify.
+_FIELD_LINE = re.compile(r"^\s*[А-ЯЁA-Z][^:.\n]{2,38}:\s*\S")
+
+
 class StructureChunker:
     """Strategy 2: chunks follow headings / symbols / pages / blank lines.
 
@@ -835,6 +918,7 @@ class StructureChunker:
                 )
             )
         pieces = self._absorb_heading_only(doc, pieces)
+        pieces = self._absorb_field_lines(doc, pieces)
         chunks: list[Chunk] = []
         position = 0
         for section_path, section_title, start, end in pieces:
@@ -861,6 +945,46 @@ class StructureChunker:
             ))
             position += 1
         return chunks
+
+    def _absorb_field_lines(
+        self, doc: Document, pieces: list[tuple[str, str, int, int]]
+    ) -> list[tuple[str, str, int, int]]:
+        """Extend the opening chunk so it also carries the «label: value» lines.
+
+        A vague question — «а ещё есть занятия какие-то?» — matches the chunk
+        with the product title, and on these documents that chunk is the
+        marketing intro: no headcount, no duration, no venue. Those sit two lines
+        further down and were split into the *next* chunk, so the block held four
+        product titles and not one fact, and the model filled the gap from its
+        neighbours. That is how one service came back with another one's
+        duration and venue — both plausible, both from the corpus, and both
+        attached to the wrong product.
+
+        Extending the line range keeps the chunk a verbatim slice of the document
+        (``char_span`` stays exact), and only when the result still fits the
+        budget. It stops at the next section so ``section`` metadata stays true.
+        """
+        if not pieces:
+            return pieces
+        section_path, section_title, start, end = pieces[0]
+        last = max(
+            (number for number, line in enumerate(doc.lines, 1)
+             if _FIELD_LINE.match(line)),
+            default=0,
+        )
+        # The field lines may sit in the next *window* of the same section; stop
+        # only where a different section begins, so ``section`` stays truthful.
+        run_end = end
+        for path, _window_title, _start, window_end in pieces[1:]:
+            if path != section_path:
+                break
+            run_end = max(run_end, window_end)
+        last = min(last, run_end)
+        if last <= end or not (start <= last):
+            return pieces
+        if not self._fits(doc, start, last):
+            return pieces
+        return [(section_path, section_title, start, last), *pieces[1:]]
 
     def _fits(self, doc: Document, start: int, end: int) -> bool:
         """Exact check: does the assembled line range respect both budgets?"""
@@ -930,7 +1054,7 @@ class StructureChunker:
         not a size problem and ``min_chars`` cannot catch it — a long title is
         still a title.
         """
-        for line in slice_lines(doc, start, end).splitlines():
+        for line in split_lines(slice_lines(doc, start, end)):
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
                 return False
@@ -1010,7 +1134,6 @@ class StructureChunker:
 # --------------------------------------------------------------------------- #
 # Index building
 # --------------------------------------------------------------------------- #
-
 
 def build_index(
     chunks: Sequence[Chunk],
@@ -1777,6 +1900,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Embedding batch size (default: %(default)s).")
     parser.add_argument("--max_docs", type=int, default=0,
                         help="Stop after N documents (0 = no limit).")
+    parser.add_argument("--pdf_max_pages", type=int, default=0,
+                        help="Keep only the first N pages of each PDF "
+                             "(0 = all pages). The report states how many "
+                             "pages were left out.")
     parser.add_argument("--dedup", action="store_true",
                         help="Drop chunks whose text duplicates an earlier chunk.")
     parser.add_argument("--local_only", action="store_true",
@@ -1807,7 +1934,10 @@ def main(argv: list[str] | None = None) -> int:
     extensions = normalize_extensions(args.extensions)
     try:
         documents, notes = collect_documents(
-            input_dir=args.input_dir, extensions=extensions, max_docs=args.max_docs
+            input_dir=args.input_dir,
+            extensions=extensions,
+            max_docs=args.max_docs,
+            pdf_max_pages=args.pdf_max_pages,
         )
     except FileNotFoundError as error:
         print(f"[error] {error}")

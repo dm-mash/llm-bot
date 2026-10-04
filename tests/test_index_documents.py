@@ -192,6 +192,162 @@ def test_max_docs_stops_the_walk(corpus: Path) -> None:
     assert len(docs) == 1
 
 
+# --------------------------------------------------------------------------- #
+# PDF page limits
+# --------------------------------------------------------------------------- #
+
+
+def _fake_pdf(monkeypatch: pytest.MonkeyPatch, path: Path, pages: list[str]) -> None:
+    """Give ``path`` a PDF text layer of ``pages`` without writing a real PDF.
+
+    A four-page document carries a description on page 1 and the *same* terms
+    on pages 2-4, so the truncation test must not depend on real PDF bytes; only
+    the page slicing under test matters.
+    """
+    class Page:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def extract_text(self) -> str:
+            return self._text
+
+    class Reader:
+        def __init__(self, _path: str) -> None:
+            self.pages = [Page(text) for text in pages]
+
+    module = type(sys)("pypdf")
+    module.PdfReader = Reader
+    monkeypatch.setitem(sys.modules, "pypdf", module)
+
+
+@pytest.fixture()
+def pdf_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    root = tmp_path / "docs"
+    root.mkdir()
+    first = root / "ID-250-248-463-709 Отчёт Б.pdf"
+    first.write_bytes(b"%PDF-1.7 stub")
+    _fake_pdf(monkeypatch, first, [
+        "Занятие\nКоличество человек: 1\nДлительность: 5-6 часов",
+        "Общие условия\nдля всех документов",
+        "Общие условия\nдля всех документов",
+        "Общие условия\nдля всех документов",
+    ])
+    return root
+
+
+def test_pdf_max_pages_keeps_the_leading_pages(pdf_corpus: Path) -> None:
+    """The document description must survive while the shared terms go.
+
+    Indexing a prefix silently turns "the fact is not in the corpus" and "the
+    fact was never indexed" into the same report line, so the cut has to be
+    exact and declared.
+    """
+    docs, notes = idx.collect_documents(
+        pdf_corpus, {".pdf"}, pdf_max_pages=1
+    )
+    assert len(docs) == 1
+    text = docs[0].text
+    assert "Длительность: 5-6 часов" in text
+    assert "Общие условия" not in text
+    assert docs[0].pages_dropped == 3
+
+
+def test_pdf_max_pages_reports_the_pages_it_dropped(pdf_corpus: Path) -> None:
+    docs, notes = idx.collect_documents(pdf_corpus, {".pdf"}, pdf_max_pages=1)
+    assert any("страниц не попали в индекс" in note for note in notes)
+
+
+def test_pdf_without_a_page_limit_keeps_everything(pdf_corpus: Path) -> None:
+    docs, notes = idx.collect_documents(pdf_corpus, {".pdf"})
+    assert "Общие условия" in docs[0].text
+    assert docs[0].pages_dropped == 0
+    assert not any("страниц не попали" in note for note in notes)
+
+
+def test_pdf_page_limit_larger_than_the_file_is_not_an_error(
+    pdf_corpus: Path,
+) -> None:
+    docs, _ = idx.collect_documents(pdf_corpus, {".pdf"}, pdf_max_pages=99)
+    assert "Общие условия" in docs[0].text
+    assert docs[0].pages_dropped == 0
+
+
+def test_a_truncated_pdf_is_one_section(pdf_corpus: Path) -> None:
+    """One kept page carries no page break, so it chunks as a single section.
+
+    ``page_of_line`` stays empty here: with one page there is nothing to count.
+    """
+    docs, _ = idx.collect_documents(pdf_corpus, {".pdf"}, pdf_max_pages=1)
+    doc = docs[0]
+    assert len(doc.sections) == 1
+    assert doc.sections[0].start_line == 1
+    # A single-page PDF still knows it is page 1, which is what the chunk
+    # metadata reports.
+    assert idx.page_of_line(doc, 1) == "page 1"
+
+
+def test_a_whole_pdf_is_split_into_page_sections(pdf_corpus: Path) -> None:
+    """Without the limit every page keeps its own label."""
+    docs, _ = idx.collect_documents(pdf_corpus, {".pdf"})
+    assert [section.title for section in docs[0].sections] == [
+        "page 1", "page 2", "page 3", "page 4"
+    ]
+
+
+def test_a_page_break_does_not_hide_the_page_starts(
+    pdf_corpus: Path,
+) -> None:
+    """The marker must survive line splitting or every PDF loses its pages.
+
+    ``str.splitlines()`` treats ``\\f`` as a line boundary, which would drop the
+    marker before parsing sees it: the document would come back as one
+    unlabelled section and ``page_of_line`` would always answer "".
+    """
+    docs, _ = idx.collect_documents(pdf_corpus, {".pdf"})
+    doc = docs[0]
+    # Pages are 3, 2, 2, 2 lines each; the marker line starts no page.
+    assert doc.page_starts == (1, 5, 8, 11)
+    assert [(s.start_line, s.end_line) for s in doc.sections] == [
+        (1, 3), (5, 6), (8, 9), (11, 12)
+    ]
+    for start, end in zip(doc.sections, doc.sections[1:]):
+        assert start.end_line < end.start_line
+    assert idx.page_of_line(doc, 1) == "page 1"
+    assert idx.page_of_line(doc, doc.sections[1].start_line) == "page 2"
+    assert idx.page_of_line(doc, doc.sections[-1].end_line) == "page 4"
+
+
+def test_page_spans_skip_the_marker_line() -> None:
+    """A marker on its own line belongs to no page."""
+    lines = ("a", "b", idx.PAGE_BREAK, "c", idx.PAGE_BREAK, "d")
+    assert idx.page_spans(lines) == ((1, 2), (4, 4), (6, 6))
+
+
+def test_page_spans_cover_every_line_once() -> None:
+    """No content line may fall between two pages."""
+    lines = ("a", "b", idx.PAGE_BREAK, "c", idx.PAGE_BREAK, "d")
+    spans = idx.page_spans(lines)
+    covered = [n for start, end in spans for n in range(start, end + 1)]
+    assert covered == [1, 2, 4, 6]
+
+
+def test_an_inline_marker_closes_the_page_without_losing_the_tail() -> None:
+    """Text after a marker in the same line is the next page, so it must stay."""
+    lines = ("a", f"b{idx.PAGE_BREAK}c", "d")
+    assert idx.page_spans(lines) == ((1, 2), (2, 3))
+
+
+def test_split_lines_keeps_the_page_marker() -> None:
+    assert idx.split_lines("a\fb\nc") == ["a\fb", "c"]
+    # The plain-Python behaviour that hid the marker in the first place.
+    assert "a\fb\nc".splitlines() == ["a", "b", "c"]
+
+
+def test_pdf_max_pages_zero_means_no_limit(pdf_corpus: Path) -> None:
+    docs, _ = idx.collect_documents(pdf_corpus, {".pdf"}, pdf_max_pages=0)
+    assert docs[0].pages_dropped == 0
+
+
 def test_normalize_extensions_accepts_a_comma_separated_string() -> None:
     assert idx.normalize_extensions(".md,.py") == (".md", ".py")
     assert idx.normalize_extensions([".MD", "py"]) == (".md", ".py")

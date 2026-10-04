@@ -12,8 +12,10 @@ numpy>=1.24
 mcp>=1.0.0
 mcp-server-time>=0.6.0
 
-# Optional: PDF sources for the document index
-# pypdf>=4.0
+# Optional: PDF sources for the document index (scripts/index_documents.py).
+# Needed only when a corpus contains .pdf — index_documents skips such files with
+# a hint instead of failing, so the rest of the index works without it.
+pypdf>=4.0
 
 # Development / testing
 pytest>=8.0.0
