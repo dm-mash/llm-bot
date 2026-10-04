@@ -4,6 +4,10 @@
 !.env.example
 data/
 
+# Reports over a customer corpus go to data/results/, already covered by the
+# data/ rule above. results/ stays tracked: it holds the repo and coffee-shop
+# reports that document the project.
+
 # Python
 __pycache__/
 *.py[cod]

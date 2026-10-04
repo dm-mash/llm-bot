@@ -35,6 +35,11 @@ Examples:
     python scripts/compare_rag.py --questions rag_questions.yaml --model groq-qwen \
         --corpus kb --top_k 6 --out results/rag_kb.md
 
+    # third arm: dense shortlist of 20 re-scored by a cross-encoder down to 4.
+    # The plain `rag` arm runs too, so the before/after is inside one run.
+    python scripts/compare_rag.py --questions rag_questions.yaml \
+        --corpus kb --rerank --out results/rag_rerank.md
+
     # no provider calls at all: score a saved run again (e.g. after editing
     # the scoring)
     python scripts/compare_rag.py --questions rag_questions.yaml \
@@ -63,11 +68,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from llm_bot.client import LLMClient, LLMError
 from llm_bot.factory import build_client
 from llm_bot.rag import Retriever
+from llm_bot.rerank import (
+    DEFAULT_RERANK_CANDIDATES,
+    DEFAULT_RERANK_MODEL,
+    Reranker,
+)
 from llm_bot.stores import AgentConfig, ModelConfig
 from llm_bot.tokens import MESSAGE_OVERHEAD_TOKENS, estimate_tokens
 from llm_bot.yaml_stores import YamlModelStore
 
 MODES = ("rag", "no_rag")
+
+#: Third arm: the same dense retriever, but with a cross-encoder re-scoring a
+#: 20-chunk shortlist first. It is reported *next to* the plain ``rag`` arm
+#: rather than instead of it, so the run itself contains the before/after.
+RERANK_MODE = "rag_rerank"
+
+#: Canonical row order for every table, so modes never appear in a
+#: data-dependent order.
+MODE_ORDER = ("rag", RERANK_MODE, "no_rag")
+
+_MODE_LABELS = {
+    "rag": "с RAG",
+    RERANK_MODE: "с RAG + реранкер",
+    "no_rag": "без RAG",
+}
+
+
+def modes_for(rerank: bool) -> tuple[str, ...]:
+    """Modes to run. The plain two-arm run is unchanged unless asked for."""
+    if rerank:
+        return ("rag", RERANK_MODE, "no_rag")
+    return MODES
 
 #: Phrases that count as "I did not find it". Deliberately broad: the point is
 #: to detect a confident fabrication, and a refusal rarely uses one fixed wording
@@ -77,7 +109,7 @@ MODES = ("rag", "no_rag")
 _REFUSAL_RE = re.compile(
     r"(не наш[её]л|не нахожу|не могу найти|не смог найти|не удалось найти"
     r"|информаци\w*[^.\n]{0,24}?нет\b|нет информации|не содержит"
-    r"|не упоминается|не указано|не знаю|не в базе|не в документах"
+    r"|не упоминается|не указан\w*|не знаю|не в базе|не в документах"
     r"|отсутствует|не встречается|за рамками (?:этой |моей )?базы)",
     re.IGNORECASE,
 )
@@ -125,6 +157,12 @@ class Case:
     prompt_tokens: int = 0
     elapsed: float = 0.0
     error: str = ""
+    #: Re-ranking diagnostics, mirrored from :class:`~llm_bot.rag.RagEvent`.
+    #: ``scored`` is the whole shortlist with cross-encoder scores, which is
+    #: what the threshold sweep replays instead of re-running the model.
+    reranked: int = 0
+    filtered: int = 0
+    scored: tuple[tuple[str, float], ...] = ()
 
     @property
     def retrieved_files(self) -> tuple[str, ...]:
@@ -283,12 +321,45 @@ def source_files(sources: Sequence[str]) -> set[str]:
     return {source.split(":", 1)[0] for source in sources}
 
 
+#: A citation is a file name plus a line range, and the name may hold any
+#: character a real file can: one corpus is Cyrillic with spaces and dots
+#: (``ID-250-248-463-709 Отчёт.pdf``). A pattern limited to ``[\w./-]`` or to a
+#: literal ``.md`` silently scored 0.000 citations for every PDF answer while the
+#: retrieval itself was fine.
+#:
+#: Two patterns, because spaces cannot be told apart from prose: the bracketed
+#: form is what ``rag._hit_source_line`` actually emits and is unambiguous, and
+#: the bare form only matches names without spaces so that "in hours.md:11-15"
+#: cannot drag in the words before it.
+_BRACKETED_CITATION_RE = re.compile(
+    r"[\[(«\"](?P<file>[^\[\]()«»\"]+?):(?P<start>\d+)-(?P<end>\d+)[\])»\"]?"
+)
+_BARE_CITATION_RE = re.compile(
+    r"(?P<file>[^\s\[\]()«»,]+?\.[A-Za-zА-Яа-яЁё][\w.]*):(?P<start>\d+)-(?P<end>\d+)"
+)
+
+#: Extensions a citation may end in. ``index_documents`` indexes exactly these,
+#: and an index containing other extensions would fail validation first, so the
+#: list bounds the match instead of guessing at "anything word-like".
+CITED_EXTENSIONS = (".md", ".pdf", ".py", ".txt", ".yaml", ".yml", ".rst", ".json")
+
+
 def cited_sources(answer: str) -> set[str]:
-    """Files the answer cites, from any ``path/to/file.md:12-34`` reference."""
+    """Files the answer cites, from any ``path/to/file:12-34`` reference."""
     found: set[str] = set()
-    for match in re.finditer(r"[\w./-]+\.md:(\d+)-(\d+)", answer):
-        found.add(match.group(0).rsplit(":", 1)[0])
-    return found
+    for pattern in (_BRACKETED_CITATION_RE, _BARE_CITATION_RE):
+        for match in pattern.finditer(answer):
+            name = match.group("file").strip()
+            if name.lower().endswith(CITED_EXTENSIONS):
+                found.add(name)
+    # ``ID-250-248-463-709 Отчёт Б.pdf`` also matches the bare
+    # pattern as ``Б.pdf``. ``source_files`` holds the full name, so the tail
+    # would never intersect it and would score a correct citation 0.
+    return {
+        name
+        for name in found
+        if not any(name != other and name in other for other in found)
+    }
 
 
 def scored(case: Case, question: Question) -> dict[str, object]:
@@ -307,11 +378,11 @@ def scored(case: Case, question: Question) -> dict[str, object]:
     refused = bool(_REFUSAL_RE.search(case.answer)) if not question.answerable else None
     if question.answerable:
         # The answer must carry every expected fact. The retrieval check applies
-        # to the RAG mode only: in ``no_rag`` nothing is retrieved by
+        # to the retrieval arms only: in ``no_rag`` nothing is retrieved by
         # construction, so requiring a hit there would score the baseline as
         # broken instead of measuring what it actually is.
         passed = not case.error and coverage == 1.0
-        if case.mode == "rag":
+        if case.mode != "no_rag":
             passed = passed and retrieval_hit is not False
     else:
         # Nothing to confirm, so grounding means not inventing: no facts, no
@@ -331,10 +402,18 @@ def scored(case: Case, question: Question) -> dict[str, object]:
 
 
 def aggregate(cases: list[Case], questions: list[Question]) -> dict[str, object]:
-    """Per-mode totals. Rates are per-mode means; ``overall_pass_rate`` mixes both."""
+    """Per-mode totals. Rates are per-mode means; ``overall_pass_rate`` mixes both.
+
+    Modes come from the cases actually present, in the canonical order, so the
+    two-arm and three-arm runs share this code and neither prints an empty row.
+    """
     by_index = {q_index: q for q_index, q in enumerate(questions, start=1)}
+    present = {case.mode for case in cases}
+    ordered = [m for m in MODE_ORDER if m in present] + sorted(
+        present - set(MODE_ORDER)
+    )
     summary: dict[str, dict[str, object]] = {}
-    for mode in MODES:
+    for mode in ordered:
         mode_cases = [(c, by_index[c.index]) for c in cases if c.mode == mode]
         if not mode_cases:
             continue
@@ -399,6 +478,77 @@ def _rate(values: list[bool]) -> float | None:
 
 
 # --------------------------------------------------------------------------- #
+# Threshold sweep
+# --------------------------------------------------------------------------- #
+
+#: Cross-encoder logits to try. Chosen to straddle the measured range on the
+#: near-duplicate corpus (-4.0 for the worst correct chunk, +0.7 for the worst
+#: unanswerable one), plus the "no filter" row, which is the default.
+SWEEP_THRESHOLDS = (None, -4.0, -2.0, 0.0, 2.0)
+
+
+def threshold_sweep(
+    cases: list[Case], questions: list[Question], top_k: int
+) -> list[dict[str, object]]:
+    """Replay the saved shortlist under several score thresholds.
+
+    A sweep needs no model calls: every case carries the re-ranked shortlist with
+    its scores (``Case.scored``), so re-cutting it at a different threshold is
+    arithmetic. This matters because the question "is a threshold worth it?" has
+    no fixed answer without numbers on both sides, and the numbers move with the
+    corpus — so the report shows the whole curve instead of one chosen point.
+
+    Only retrieval is replayed. What the model then *does* with a shorter block
+    cannot be derived from a saved run, so this table is deliberately not a
+    PASS-rate column.
+    """
+    by_index = {i: q for i, q in enumerate(questions, start=1)}
+    rows: list[dict[str, object]] = []
+    for threshold in SWEEP_THRESHOLDS:
+        kept_total = 0
+        covered = 0
+        checked = 0
+        traps_armed = 0
+        traps = 0
+        for case in cases:
+            if case.mode != RERANK_MODE or not case.scored:
+                continue
+            question = by_index[case.index]
+            kept = [
+                location
+                for location, score in case.scored
+                if threshold is None or score >= threshold
+            ][:top_k]
+            kept_total += len(kept)
+            if question.answerable:
+                if not question.sources:
+                    continue
+                checked += 1
+                covered += int(source_reached(question.sources, kept))
+            else:
+                traps += 1
+                traps_armed += int(bool(kept))
+        rows.append(
+            {
+                "threshold": threshold,
+                # A trap is "armed" when the filter let something through for a
+                # question the corpus cannot answer.
+                "hits": covered,
+                "checked": checked,
+                "rate": round(covered / checked, 3) if checked else None,
+                "traps_armed": traps_armed if traps else None,
+                "traps": traps or None,
+                "chunks_mean": round(kept_total / max(1, _case_count(cases)), 2),
+            }
+        )
+    return rows
+
+
+def _case_count(cases: list[Case]) -> int:
+    return sum(1 for case in cases if case.mode == RERANK_MODE and case.scored)
+
+
+# --------------------------------------------------------------------------- #
 # Running
 # --------------------------------------------------------------------------- #
 
@@ -443,12 +593,18 @@ def run_case(
     prefix = ""
     retrieved: tuple[str, ...] = ()
     context_tokens = 0
-    if mode == "rag":
+    reranked = 0
+    filtered = 0
+    scored_shortlist: tuple[tuple[str, float], ...] = ()
+    if mode != "no_rag":
         assert retriever is not None
         try:
             prefix, event = retriever.render(question.text)
             retrieved = event.retrieved
             context_tokens = event.context_tokens
+            reranked = event.reranked
+            filtered = event.filtered
+            scored_shortlist = event.scored
         except Exception as exc:  # noqa: BLE001 - record, compare, do not crash
             return Case(
                 index=index,
@@ -496,6 +652,9 @@ def run_case(
         context_tokens=context_tokens,
         prompt_tokens=prompt_tokens,
         elapsed=elapsed,
+        reranked=reranked,
+        filtered=filtered,
+        scored=scored_shortlist,
     )
 
 
@@ -518,28 +677,52 @@ def run(
     top_k: int | None = None,
     max_context_tokens: int | None = None,
     on_case: Callable[[Case], None] | None = None,
+    reranker: Reranker | None = None,
+    candidate_k: int | None = None,
+    min_rerank_score: float | None = None,
+    modes: Sequence[str] = MODES,
 ) -> list[Case]:
-    """Ask every question in both modes, one retriever per corpus (loaded once)."""
-    retrievers: dict[str, Retriever | None] = {}
+    """Ask every question in every mode, one retriever per corpus (loaded once).
+
+    ``rag`` and ``rag_rerank`` get *separate* retrievers built from the same
+    index. Sharing one would leak state between the arms and quietly turn the
+    comparison into a self-fulfilling one.
+    """
+    retrievers: dict[tuple[str, str], Retriever | None] = {}
     cases: list[Case] = []
     for index, question in enumerate(questions, start=1):
         if corpus_filter and question.corpus not in corpus_filter:
             continue
-        if question.corpus not in retrievers:
-            corpus = corpora[question.corpus]
-            kwargs: dict[str, object] = {}
-            if top_k is not None:
-                kwargs["top_k"] = top_k
-            if max_context_tokens is not None:
-                kwargs["max_context_tokens"] = max_context_tokens
-            retrievers[question.corpus] = Retriever(corpus.index_path, **kwargs)
-        for mode in MODES:
+        for mode in modes:
+            if mode == "no_rag":
+                continue
+            key = (question.corpus, mode)
+            if key not in retrievers:
+                corpus = corpora[question.corpus]
+                kwargs: dict[str, object] = {}
+                if top_k is not None:
+                    kwargs["top_k"] = top_k
+                if max_context_tokens is not None:
+                    kwargs["max_context_tokens"] = max_context_tokens
+                if mode == RERANK_MODE:
+                    if reranker is None:
+                        raise ValueError(
+                            f"режим {RERANK_MODE!r} требует reranker, "
+                            "передайте Reranker(...) в run()"
+                        )
+                    kwargs["reranker"] = reranker
+                    if candidate_k is not None:
+                        kwargs["candidate_k"] = candidate_k
+                    if min_rerank_score is not None:
+                        kwargs["min_rerank_score"] = min_rerank_score
+                retrievers[key] = Retriever(corpus.index_path, **kwargs)
+        for mode in modes:
             case = run_case(
                 client,
                 question,
                 mode,
                 index,
-                retrievers[question.corpus] if mode == "rag" else None,
+                retrievers.get((question.corpus, mode)),
             )
             cases.append(case)
             if on_case is not None:
@@ -572,30 +755,50 @@ def render_report(
     top_k: int | None,
     max_context_tokens: int | None,
     temperature: float | None = None,
+    rerank_model: str | None = None,
+    candidate_k: int | None = None,
+    min_rerank_score: float | None = None,
+    sweep: Sequence[dict[str, object]] = (),
 ) -> str:
     by_index = {q_index: q for q_index, q in enumerate(questions, start=1)}
+    present = {case.mode for case in cases}
+    ordered = [m for m in MODE_ORDER if m in present]
+    reranking = RERANK_MODE in present
     sampling = (
         f"temperature={temperature:g}"
         if temperature is not None
         else "детерминированная оценка по сохранённым ответам"
     )
+    arms = " и ".join(_MODE_LABELS[m] for m in ordered) or "—"
     lines: list[str] = [
         "# RAG против модели без RAG",
         "",
-        "Каждый контрольный вопрос задан дважды: с найденным контекстом "
-        "(`rag`) и без него (`no_rag`). Оценки детерминированные — подстрочный "
-        "поиск ожиданий в сохранённых ответах, поэтому повторный прогон по JSON "
-        "даёт те же числа.",
+        f"Каждый контрольный вопрос задан в режимах: {arms}. Оценки "
+        "детерминированные — подстрочный поиск ожиданий в сохранённых ответах, "
+        "поэтому повторный прогон по JSON даёт те же числа.",
         "",
         "## Настройки",
         "",
         f"- Модель: `{model_name}`",
-        f"- Режим: оба, {sampling}",
+        f"- Режимы: {len(ordered)}, {sampling}",
     ]
     if top_k is not None:
         lines.append(f"- Чанков на вопрос (top_k): {top_k}")
     if max_context_tokens is not None:
         lines.append(f"- Бюджет контекста, токенов: {max_context_tokens}")
+    if reranking:
+        lines += [
+            f"- Реранкер: `{rerank_model or DEFAULT_RERANK_MODEL}`",
+            f"- Кандидатов на реранкер: {candidate_k or 'по умолчанию 20'} "
+            "(шире, чем top_k: в промпт попадает только отобранное)",
+        ]
+        if min_rerank_score is None:
+            lines.append(
+                "- Порог отсечения: выключен (оценки реранкера пересекаются, "
+                "порог ломает ответы — см. таблицу ниже)"
+            )
+        else:
+            lines.append(f"- Порог отсечения: {min_rerank_score}")
     for corpus in corpora.values():
         lines.append(
             f"- Корпус `{corpus.name}`: индекс `{corpus.index_path}`, "
@@ -610,12 +813,12 @@ def render_report(
         "Попадание в выдачу | Цитации | PASS | prompt-токенов | с/вопрос |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-    for mode in MODES:
+    for mode in ordered:
         row = summary.get(mode)
         if not row:
             continue
         lines.append(
-            f"| {'с RAG' if mode == 'rag' else 'без RAG'} "
+            f"| {_MODE_LABELS[mode]} "
             f"| {row['questions']} "
             f"| {_pct(row['fact_coverage_mean'])} "
             f"| {row['fact_coverage_full']}/{row['answerable']} "
@@ -633,6 +836,42 @@ def render_report(
         "вопросам с ответом. «Отказы» — доля честных «не нашёл» по вопросам, "
         "которых в базе нет. Они считаются раздельно: усреднять их в одно "
         "число нельзя, сильный отказ легко спрятал бы слабые ответы.",
+    ]
+
+    if sweep:
+        lines += [
+            "",
+            "## Порог отсечения: стоит ли",
+            "",
+            "Таблица переигрывает один и тот же пересортированный список "
+            "кандидатов с разным порогом — новых запросов к модели здесь нет. "
+            "«Попадание» — сколько ответимых вопросов сохранили нужный чанк, "
+            "«ловушки под нож» — сколько неответимых вопросов всё ещё получили "
+            "хоть что-то в промпт (на них модель может нафантазировать).",
+            "",
+            "| Порог | Попадание | Ловушки под нож | Чанков на вопрос |",
+            "| --- | --- | --- | --- |",
+        ]
+        for row in sweep:
+            threshold = row["threshold"]
+            label = "выключен" if threshold is None else f"{float(threshold):+g}"
+            checked = int(row["checked"] or 0)
+            traps = int(row["traps"] or 0)
+            hits_cell = f"{row['hits']}/{checked}" if checked else "—"
+            traps_cell = f"{row['traps_armed']}/{traps}" if traps else "—"
+            lines.append(
+                f"| {label} | {hits_cell} | {traps_cell} "
+                f"| {row['chunks_mean']} |"
+            )
+        lines += [
+            "",
+            "Порог убирает ловушки ценой верных ответов, а не наоборот: "
+            "оценка у неответимого вопроса про *тот же* документ оказывается "
+            "выше, чем у части верных ответов. Поэтому порог выключен по "
+            "умолчанию, а не «забыт».",
+        ]
+
+    lines += [
         "",
         "## По вопросам",
         "",
@@ -646,7 +885,7 @@ def render_report(
         lines.append(
             f"| {case.index} "
             f"| {question.text[:60]}{'…' if len(question.text) > 60 else ''} "
-            f"| {'rag' if case.mode == 'rag' else 'no_rag'} "
+            f"| {case.mode} "
             f"| {_pct(float(score['fact_coverage']))} "
             f"| {_tick(score['retrieval_hit'] if isinstance(score['retrieval_hit'], bool) else None)} ({files}) "
             f"| {_tick(score['citation_hit'] if isinstance(score['citation_hit'], bool) else None)} "
@@ -718,6 +957,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Бюджет блока контекста в токенах.",
+    )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="Добавить третий режим `rag_rerank`: dense берёт 20 кандидатов, "
+        "кросс-энкодер отбирает 4.",
+    )
+    parser.add_argument(
+        "--rerank-model",
+        default=None,
+        help=f"Модель реранкера (default: {DEFAULT_RERANK_MODEL}).",
+    )
+    parser.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=None,
+        help="Сколько кандидатов отдать реранкеру (default: 20).",
+    )
+    parser.add_argument(
+        "--rerank-min-score",
+        type=float,
+        default=None,
+        help="Порог отсечения по оценке реранкера. По умолчанию выключен: на "
+        "измеренном корпусе порог убирает ловушки ценой верных ответов.",
     )
     parser.add_argument(
         "--out",
@@ -824,10 +1087,27 @@ def load_saved_cases(path: Path) -> tuple[list[Question], list[Case]]:
             prompt_tokens=int(entry.get("prompt_tokens", 0)),
             elapsed=float(entry.get("elapsed", 0.0)),
             error=str(entry.get("error", "")),
+            reranked=int(entry.get("reranked", 0)),
+            filtered=int(entry.get("filtered", 0)),
+            scored=tuple(
+                (str(location), float(score))
+                for location, score in entry.get("scored") or ()
+            ),
         )
         for entry in payload["cases"]
     ]
     return questions, cases
+
+
+def load_saved_meta(path: Path) -> dict[str, object]:
+    """Run settings saved next to the cases, for a faithful ``--from_json`` report."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {
+        key: payload[key]
+        for key in ("model", "top_k", "rag_max_tokens", "rerank_model",
+                    "rerank_candidates", "rerank_min_score")
+        if key in payload
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -862,14 +1142,22 @@ def main(argv: list[str] | None = None) -> int:
             "kb": Corpus("kb", "База знаний кофейни «Зёрна»", Path(), Path(), (".md",)),
         }
         summary = aggregate(cases, questions)
+        saved_meta = load_saved_meta(Path(args.from_json))
+        saved_top_k = saved_meta.get("top_k")
         report = render_report(
             corpora,
             questions,
             cases,
             summary,
-            model_name="(из сохранённого прогона)",
-            top_k=None,
-            max_context_tokens=None,
+            model_name=str(saved_meta.get("model") or "(из сохранённого прогона)"),
+            top_k=int(saved_top_k) if saved_top_k is not None else None,
+            max_context_tokens=saved_meta.get("rag_max_tokens"),  # type: ignore[arg-type]
+            rerank_model=str(saved_meta.get("rerank_model") or "") or None,
+            candidate_k=saved_meta.get("rerank_candidates"),  # type: ignore[arg-type]
+            min_rerank_score=saved_meta.get("rerank_min_score"),  # type: ignore[arg-type]
+            sweep=threshold_sweep(
+                cases, questions, int(saved_top_k or 4)
+            ),
         )
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -921,7 +1209,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    print(f"Модель: {model_name} | вопросов: {len(questions)} | режимов: 2")
+    reranker: Reranker | None = None
+    rerank_model = args.rerank_model or DEFAULT_RERANK_MODEL
+    # Recorded explicitly rather than left as None: ``None`` means "the
+    # measured default", and a JSON that says null cannot show what ran.
+    effective_candidates = (
+        args.rerank_candidates or DEFAULT_RERANK_CANDIDATES if args.rerank else None
+    )
+    if args.rerank:
+        print(f"Реранкер: {rerank_model} | кандидатов: {effective_candidates}")
+        try:
+            reranker = Reranker(rerank_model)
+        except Exception as exc:  # noqa: BLE001 - configuration, not a provider
+            print(
+                f"error: не удалось загрузить реранкер {rerank_model!r}: {exc}\n"
+                "  он скачивается при первом запуске (~130 МБ) и кэшируется",
+                file=sys.stderr,
+            )
+            return 2
+    modes = modes_for(bool(args.rerank))
+
+    print(f"Модель: {model_name} | вопросов: {len(questions)} | режимов: {len(modes)}")
     started = time.perf_counter()
     cases = run(
         corpora,
@@ -930,8 +1238,12 @@ def main(argv: list[str] | None = None) -> int:
         corpus_filter=args.corpora,
         top_k=args.top_k,
         max_context_tokens=args.rag_max_tokens,
+        reranker=reranker,
+        candidate_k=effective_candidates,
+        min_rerank_score=args.rerank_min_score,
+        modes=modes,
         on_case=lambda case: print(
-            f"  #{case.index} [{case.mode:>6}] "
+            f"  #{case.index} [{case.mode:>10}] "
             f"{'ошибка: ' + case.error if case.error else 'ок'}"
         ),
     )
@@ -948,6 +1260,9 @@ def main(argv: list[str] | None = None) -> int:
         model=model_name,
         top_k=args.top_k,
         rag_max_tokens=args.rag_max_tokens,
+        rerank_model=rerank_model if args.rerank else None,
+        rerank_candidates=effective_candidates,
+        rerank_min_score=args.rerank_min_score,
         elapsed=round(time.perf_counter() - started, 2),
     )
     report = render_report(
@@ -959,6 +1274,10 @@ def main(argv: list[str] | None = None) -> int:
         top_k=args.top_k,
         max_context_tokens=args.rag_max_tokens,
         temperature=agent.temperature,
+        rerank_model=rerank_model if args.rerank else None,
+        candidate_k=effective_candidates,
+        min_rerank_score=args.rerank_min_score,
+        sweep=threshold_sweep(cases, questions, args.top_k or 4),
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")

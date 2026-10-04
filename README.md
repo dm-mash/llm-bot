@@ -97,6 +97,7 @@ llm-bot/
 │   ├── test_task_state.py     # task state machine tests
 │   ├── test_compare_compression.py
 │   ├── test_index_documents.py # document index (offline, fake embedder)
+│   ├── test_rerank.py          # second retrieval stage (offline, fake encoder)
 │   ├── test_stores.py         # YAML/JSON store tests
 │   └── test_gigachat.py       # GigaChat token provider tests
 ├── results/                   # experiment reports (markdown)
@@ -104,6 +105,8 @@ llm-bot/
 ├── agents.example.yaml        # template -> copy to data/agents.yaml
 ├── invariants.example.yaml    # template -> copy to data/invariants.yaml
 ├── index_queries.example.yaml # template -> hand-written benchmark queries for the index
+├── rag_questions.example.yaml       # control questions for the repo + coffee-shop corpora
+├── rag_questions.yaml                # control questions for the knowledge-base corpus
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -265,6 +268,14 @@ agents and models, applied once at session creation by
 [`apply_profile`](llm_bot/profiles.py) (system-prompt directives +
 `max_response_words`/`temperature` overrides), and never written to or read
 from the memory layers.
+
+Memory auto-extraction is deliberately conservative: the classifier may store
+only what the **user** asserted, never the assistant's own conclusions and never
+the contents of retrieved documents. This matters most when RAG is on. A
+grounded answer can still be wrong, and an unverified claim that reaches
+`long_term` becomes durable — it outranks the RAG block in the message stack
+(memory is injected before it) and survives the session, so one confabulation
+would contradict the documents on every later turn, including the next session.
 
 Create the file from the template:
 
@@ -1434,6 +1445,16 @@ Useful flags: `--index_dir` (default `data/emb`, git-ignored), `--out`
 dependency; vendored trees (`.venv`, `node_modules`, `data/`, `results/`, …)
 are never indexed.
 
+`--pdf_max_pages N` keeps only the first `N` pages of each PDF (`0` = all). It
+exists because a one-page service description repeats its terms verbatim on
+pages 2–4: in a measured 13-file corpus those pages were 80% of the volume and
+0.90–1.00 similar to each other, while page 1 held the only unique facts. Truncating
+quietly would make "the fact is not in the corpus" and "the fact was never
+indexed" look identical, so the report states how many pages were left out.
+Line numbers in a PDF citation (`file.pdf:12-38`) are positions in the text
+extracted by pypdf, not in the original file; the chunk metadata carries
+`page 1` alongside them.
+
 Tests: `tests/test_index_documents.py` (offline, no model download).
 
 ## RAG: ответы по локальному индексу
@@ -1458,8 +1479,55 @@ rule is carried by the block itself, identically for every agent.
 | ---- | ------- | ------- |
 | `--rag` | off | enable retrieval for this run; without it the bot behaves exactly as before |
 | `--rag-index` | `data/emb/index_structure.json` | which index to search; the embedding model is taken from the index itself, and a `--model` contradicting it is a hard error |
-| `--rag-top-k` | `4` | how many chunks to retrieve |
+| `--rag-top-k` | `4` | how many chunks reach the prompt |
+| `--rag-rerank` | off | re-score a wider shortlist with a cross-encoder first; extra model load, zero prompt tokens |
+| `--rag-rerank-candidates` | `20` | shortlist handed to the reranker; irrelevant without `--rag-rerank` |
+| `--rag-rerank-min-score` | unset | optional threshold; see below for why it is off by default |
 | `--rag-max-tokens` | unset | hard cap on the context block; unset means "derive it from the context window" |
+
+`--rag-rerank` needs `--rag`; on its own it exits with an error rather than
+quietly doing nothing, so "the reranker found nothing" never gets confused with
+"the reranker never ran".
+
+### Why the second stage exists
+
+Dense search compares one vector per chunk, so a chunk that is on-topic for a
+whole document outranks the chunk that states the fact. On a measured
+near-duplicate corpus the right chunk sat at rank 11 for a question about one
+service's height and weight limits — present, close, outside `top_k`. Measured
+over the 34 answerable questions:
+
+| | retrieval@1 | retrieval@4 | fact coverage | PASS |
+| --- | --- | --- | --- | --- |
+| dense only | 13/34 | 22/34 | .662 | 25/40 (.625) |
+| + cross-encoder | 20/34 | **32/34** | **.971** | **36/40 (.900)** |
+
+Two defaults come from those measurements. The shortlist is **20** wide, because
+recall@20 was 34/34 — that is the ceiling for the stage, and going wider would
+only add latency. And the passage handed to the cross-encoder is prefixed with
+`source — section`, which is worth three questions out of 34 on its own: the
+corpus is full of near-duplicate documents, and the filename is what tells
+them apart, not the body text.
+
+### Why there is no threshold
+
+There is `--rag-rerank-min-score`, and it is off by default because measuring it
+said so. The two score distributions overlap: the lowest-scoring correct chunk
+sits at **-4.0**, while an unanswerable question about a product that is
+genuinely absent from the corpus peaks at **+0.7** — above ten correct answers,
+because the document set really is about that product. Replaying one run's
+shortlist at several thresholds, reading the scores back off the saved run:
+
+| threshold | answerable kept | traps still fed | chunks per question |
+| --- | --- | --- | --- |
+| off | 32/34 | 6/6 | 4.0 |
+| -4 | 30/34 | 4/6 | 3.2 |
+| -2 | 26/34 | 4/6 | 1.9 |
+| 0 | 23/34 | 2/6 | 1.1 |
+| +2 | 17/34 | 0/6 | 0.5 |
+
+The filter removes correct answers long before it removes misleading ones. It
+is available, it is measured, and it is not the default.
 
 The embedding model (~470 MB) is downloaded on the first `--rag` run and cached
 afterwards; `--local_only` belongs to `scripts/index_documents.py`, not here.
@@ -1472,9 +1540,9 @@ again if the next one would overflow the budget; a chunk is only included if at
 least one whole word of it fits, so the model never sees a fragment cut mid
 sentence.
 
-Grounding is enforced by instruction, not by code: the block tells the model to
-answer **only** from the context, to cite `[file:lines]` after every fact, and
-to say it did not find an answer rather than invent one. That rule lives in the
+Grounding is *asked for* by instruction: the block tells the model to answer
+**only** from the context, to cite `[file:lines]` after every fact, and to say it
+did not find an answer rather than invent one. That rule lives in the
 block (`_RAG_PROTOCOL` in `llm_bot/rag.py`) and nowhere else — not in
 `data/invariants.yaml`, and not in any agent's `system_prompt`. Two reasons:
 
@@ -1482,6 +1550,128 @@ block (`_RAG_PROTOCOL` in `llm_bot/rag.py`) and nowhere else — not in
   in `--no-rag` mode, when there is no context to ground in;
 - a copy inside an agent would be a third source of truth. It already drifted
   once, which is why the agent configs no longer restate the rule.
+
+### Two ways to run it: with sources, without
+
+`--rag` asks the model to tag every fact with `[file:lines]` and audits those
+tags afterwards. When the sources are noise for the current task, `--rag-no-cite`
+answers from the same retrieved context without them:
+
+```
+--rag --rag-no-cite
+```
+
+| | `--rag` | `--rag --rag-no-cite` |
+|---|---|---|
+| Retrieval, reranking, token budget | on | on |
+| "Answer only from this context" | on | on |
+| No-blending rule | on | on |
+| "Say you did not find it" | on | on |
+| "Tag every fact with `[file:lines]`" | on | **off** |
+| Citation audit, `[источник не подтверждён]` marker | on | **off** |
+
+Nothing was deleted: the citation format lives in `_RAG_PROTOCOL`, the version
+without it in `_RAG_PROTOCOL_NO_CITATIONS`, and `Retriever(cite=False)` picks
+between them. Drop the flag to get sources back.
+
+### Invariant ids are not citations
+
+The prompt renders every invariant as `- [STACK-1] (kind) statement`, and models
+often work their checklist into the reply:
+
+```
+Проверяю запрос против инвариантов:
+- [RULE-LANG]: Вопрос на русском → отвечаю на русском ✓
+```
+
+`[STACK-1]` names a rule, not a document. The audit used to count those brackets
+as source citations, could not find them in the retrieved block, and replaced
+five valid ids with `[источник не подтверждён]` while logging five warnings on an
+answer whose facts were all correct. `audit_citations(..., ignore=…)` now takes
+the ids from the registry, so they pass through untouched and stay out of both
+`kept` and `dropped`. A reply citing nothing but invariants still counts as
+uncited, which is what it is.
+
+What code *does* enforce is the citation. `audit_citations` checks every
+`[file:lines]` in the reply against the block that was actually sent — file name
+and line range — and replaces anything unsupported with
+`[источник не подтверждён]`. This is not a formality. On a near-duplicate corpus
+**12 of 15** citations to one document came back with a single digit
+changed from the name on disk: the model rewrites what it copies, and nothing
+noticed. Unsupported citations are marked rather
+than deleted, because a wrong source in brackets reads as a verified one. Over a
+10-turn dialogue run three times (27/30 correct by content) the audit also caught
+12 turns that cited a document the block never contained — the model answering
+from its own earlier replies in history rather than from the evidence sent this
+turn. `Session.citation_audits` exposes the per-turn result.
+
+Two details of the check are deliberate. A citation may name the document by
+its id alone (`[ID-250-439-931-337]`) — the model does that — and that is
+accepted **only if that id belongs to exactly one document in play**; if two
+share it, the id identifies nothing and the citation stays unsupported. And
+a factual turn that cites nothing at all is not silently clean: `uncited` is set,
+because "no citation" is the case the protocol exists for and there is nothing to
+replace in the text.
+
+Whether a citation from an *earlier* turn of the same dialog counts is a policy
+call, not a technical one, and both are implemented: `audit_citations(also_backed=…)`
+accepts ranges this dialog already verified, and `make_session(rag_reuse_evidence=True)`
+turns it on. Measured over the same 10 turns x 3 runs it is 15/30 strict versus
+17/30 with reuse, and it does not touch the real defect — the rewritten number
+survives either way. It is off by default because the block is rebuilt per turn
+on purpose.
+
+### Two rules for documents that look alike
+
+The corpus is 13 one-page descriptions of unrelated services, and two of them
+describe the same offering: they share 15 of their 18 indexed lines and differ
+in three — the title, one word of the service line, and one number (20 minutes
+against 90). Without help the model answers a question about one from the
+other's chunk and cites the first, so two mechanisms were added:
+
+- **No blending** (`_RAG_NO_BLENDING`, part of the block): facts belong to one
+  document, take them only from the block with the same file name, and when the
+  customer has not said which one they mean, show the difference or ask.
+- **Subject continuity** (`Session._rag_subject`): the documents already cited
+  in this dialog keep a slot in the block. A follow-up like «а он долго
+  действует?» names no product at all, and since every document repeats the
+  same wording, the customer's own document fell out of the top-4 entirely and
+  the answer came from an unrelated business whose document *does* state a
+  flat validity period.
+
+Neither of these is a win on a dialog benchmark. Over the same 10 turns x 3 runs
+the scores are 28/30, 27/30, 26/30 and 23/30 for no blending, plus subject
+continuity, plus two further prompt rules — all inside the run-to-run noise, and
+every added rule made it worse.
+
+A third mechanism was built and then removed: the indexer computes, for each
+document, the lines whose **numbers** occur nowhere in its nearest near-duplicate
+(«занятие длится 20 минут» against «занятие длится 90 минут»), and the
+retriever prints them above the chunk as `ОТЛИЧАЕТСЯ ОТ …`. The selection rule
+cannot be wrong — a number is either in the sibling or it is not — and word-level
+alternatives were tried first and rejected for exactly that reason (token
+similarity rates a marketing slogan «это настоящий экстрим!» at 0.07 and a
+factual clause «длительность 20 минут» at 0.10, so it cannot tell a fact from
+a slogan). It still measured **worse: 15/30 with the card, 16/30 without**, and
+the reason is structural rather than a tuning problem. A card can only be printed
+for the chunk that contains its lines, so on a follow-up that resolves a pronoun
+— «То есть в моём документе это <другой вариант>?» — where the retrieved chunk
+is the marketing one and the card lives in a different chunk —
+there is no card at all, which is the one case it was built for. And it prints the
+sibling's file name directly above the text, which is precisely what the
+no-blending rule tells the model not to do. Turn 3 went 1/3 → 0/3.
+
+What is left failing, over 10 turns x 3 runs:
+
+| turn | correct | why |
+| ---- | --- | --- |
+| 3 | 1/3 | answers about the other document when asked about *«моём»* |
+| 5 | 0/3 | «рекомендуем использовать в течение 6 месяцев» becomes «срок действия — 6 месяцев» |
+| 9 | 0/3 | cites the other product's file for «оба в одном городе» |
+
+Turn 5 is a claim-strength failure with the right evidence sitting in the prompt,
+and prompt wording has been tried four times without moving it — see
+`data/certs_eval/dialogue.yaml` for the measurements and the raw answers.
 
 `researcher` therefore carries only a persona and `temperature: 0.1`. Nothing
 about grounding depends on it.
@@ -1505,7 +1695,42 @@ menu, delivery terms) to check that grounding generalizes outside the repo's own
 prose. It is added to the indexer's `DEFAULT_EXCLUDES`, so building the repo
 index stays at 12 documents and does not silently mix the two corpora.
 
-Tests: `tests/test_rag.py`, `tests/test_compare_rag.py` (offline).
+A third corpus lives entirely under `data/`, git-ignored: a set of scanned
+one-page service descriptions with near-duplicate bodies. Nothing about it is
+committed — not the documents, not the control questions. The lessons below
+are measured there, and the numbers are quoted without the corpus.
+
+Its reports go to `data/results/`, which the `data/` rule already covers, so
+they need no entry of their own in `.gitignore`. `results/` stays tracked and
+holds only the repo and coffee-shop reports — point `--out` at `data/results/`
+for this corpus.
+
+One tuning note generalises past it. Chunking with `--structure_max_tokens 128`
+split two senses of one word — the imperative «сделать это самостоятельно?» (line
+4) against the parenthetical «(самостоятельно)» in a venue line (line 11) — into
+*different* chunks. Both the cross-encoder and the model then matched the wrong
+sense and the bot invented a rule about solo participation that no document
+states. At 192 both senses share one chunk and the model answers from the real
+sentence. Re-ranked
+retrieval went 32/34 → 33/34; the block grew from 396 to 588 tokens.
+
+`scripts/compare_rag.py` gained a third arm, `rag_rerank`, and runs it *next to*
+the plain `rag` arm rather than instead of it, so the before/after lives in one
+run and one set of questions:
+
+```bash
+python scripts/compare_rag.py --questions "$QUESTIONS" \
+    --model leanstral --corpus "$CORPUS" --rerank --top-k 4 \
+    --out "$OUT"
+```
+
+Every case also stores the re-ranked shortlist with its scores
+(`RagEvent.scored`), so the threshold sweep is pure arithmetic over a saved run
+— `--from_json` rebuilds the whole report, sweep included, without touching the
+provider at all.
+
+Tests: `tests/test_rag.py`, `tests/test_rerank.py`, `tests/test_compare_rag.py`
+(offline).
 
 ## Adding a web interface
 

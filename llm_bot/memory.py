@@ -369,12 +369,24 @@ _EXTRACT_PROMPT = (
     "Split the extracted facts into TWO layers:\n"
     "- working: data of the CURRENT task (goal, constraints, steps, deadlines, "
     "in-progress decisions). It only survives within this session.\n"
-    "- long_term: user profile, their preferences, general knowledge, and "
-    "long-lived decisions/agreements. It carries across sessions.\n\n"
+    "- long_term: user profile, their preferences, and long-lived "
+    "decisions/agreements they stated. It carries across sessions.\n\n"
     "Return ONLY JSON, no explanations, no markdown:\n"
     '{{"working": {{"key": "value", ...}}, "long_term": {{"key": "value", ...}}}}\n'
     "An empty layer is an empty object. Keys are short, meaningful, in Russian or "
-    "English.\n\nDialogue:\n{transcript}"
+    "English.\n\n"
+    "Rules that override the layer descriptions above:\n"
+    "- Store ONLY what the USER asserted. Never turn the assistant's own answers, "
+    "conclusions or summaries into facts, however certain they sound. An assistant "
+    "claim is not evidence.\n"
+    "- Never store the contents of source documents as knowledge. Retrieved "
+    "documents are re-read on demand, so copying their text into memory only "
+    "creates stale claims that later contradict the sources.\n"
+    "- If the user merely asked something and the assistant answered, store nothing "
+    "from that exchange unless the user asserted a preference, a constraint or a "
+    "fact about themselves.\n"
+    "- Prefer an empty layer over a fact you cannot attribute to the user.\n\n"
+    "Dialogue:\n{transcript}"
 )
 
 

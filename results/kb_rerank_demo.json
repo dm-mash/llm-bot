@@ -1,0 +1,1076 @@
+{
+  "model": "leanstral",
+  "top_k": 4,
+  "rag_max_tokens": null,
+  "rerank_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+  "rerank_candidates": 20,
+  "rerank_min_score": null,
+  "elapsed": 67.05,
+  "corpora": {
+    "repo": {
+      "label": "Документы репозитория",
+      "index_path": "data/emb/index_structure.json",
+      "input_dir": "."
+    },
+    "kb": {
+      "label": "База знаний кофейни «Зёрна»",
+      "index_path": "data/kb_emb/index_structure.json",
+      "input_dir": "knowledge_base"
+    }
+  },
+  "questions": [
+    {
+      "index": 1,
+      "text": "Какая модель эмбеддингов используется по умолчанию и какое у неё окно в токенах?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "paraphrase-multilingual-MiniLM-L12-v2",
+        "128"
+      ],
+      "sources": [
+        "README.md:1319-1325"
+      ]
+    },
+    {
+      "index": 2,
+      "text": "Какой дефолт у max_summary_ratio и что он ограничивает?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "0.3",
+        "summary"
+      ],
+      "sources": [
+        "plans/compression.md:69-77"
+      ]
+    },
+    {
+      "index": 3,
+      "text": "Что за G5 в плане переходов состояния задачи?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "вне скоупа",
+        "429"
+      ],
+      "sources": [
+        "plans/task_state_transitions.md:188-195"
+      ]
+    },
+    {
+      "index": 4,
+      "text": "Почему Groq начинает отдавать 429?",
+      "corpus": "repo",
+      "answerable": true,
+      "expect": [
+        "8000",
+        "TPM"
+      ],
+      "sources": [
+        "README.md:646-649"
+      ]
+    },
+    {
+      "index": 5,
+      "text": "Какой max_request_tokens у модели groq/openai/gpt-oss-120b?",
+      "corpus": "repo",
+      "answerable": false,
+      "expect": [],
+      "sources": []
+    },
+    {
+      "index": 6,
+      "text": "Сколько стоит фирменный напиток «Тростниковый крем»?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "190",
+        "300"
+      ],
+      "sources": [
+        "kofeinya_zerna.md:10-16"
+      ]
+    },
+    {
+      "index": 7,
+      "text": "До какого времени кофейня работает в воскресенье?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "9:00",
+        "21:00"
+      ],
+      "sources": [
+        "kofeinya_zerna.md:39-43"
+      ]
+    },
+    {
+      "index": 8,
+      "text": "Что нужно сделать гостю с аллергией на орехи и когда?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "орех",
+        "до приготовления"
+      ],
+      "sources": [
+        "kofeinya_zerna.md:50-59"
+      ]
+    },
+    {
+      "index": 9,
+      "text": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
+      "corpus": "kb",
+      "answerable": true,
+      "expect": [
+        "700",
+        "1500",
+        "150"
+      ],
+      "sources": [
+        "delivery.md:5-7"
+      ]
+    },
+    {
+      "index": 10,
+      "text": "Сколько стоит латте на кокосовом молоке?",
+      "corpus": "kb",
+      "answerable": false,
+      "expect": [],
+      "sources": []
+    }
+  ],
+  "cases": [
+    {
+      "index": 6,
+      "question": "Сколько стоит фирменный напиток «Тростниковый крем»?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Фирменный напиток «Тростниковый крем» стоит **190 ₽** (объём 300 мл).\n\n[файл: kofeinya_zerna.md:14]",
+      "retrieved": [
+        "kofeinya_zerna.md:18-24",
+        "kofeinya_zerna.md:6-17",
+        "kofeinya_zerna.md:25-31",
+        "delivery.md:16-22"
+      ],
+      "context_tokens": 436,
+      "prompt_tokens": 453,
+      "elapsed": 1.2719857969786972,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "190",
+          "300"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 6,
+      "question": "Сколько стоит фирменный напиток «Тростниковый крем»?",
+      "corpus": "kb",
+      "mode": "rag_rerank",
+      "answerable": true,
+      "answer": "Фирменный напиток «Тростниковый крем» стоит **190 ₽** (объём 300 мл) [kofeinya_zerna.md:14].",
+      "retrieved": [
+        "kofeinya_zerna.md:18-24",
+        "kofeinya_zerna.md:6-17",
+        "delivery.md:1-9",
+        "kofeinya_zerna.md:25-31"
+      ],
+      "context_tokens": 456,
+      "prompt_tokens": 473,
+      "elapsed": 1.059923755005002,
+      "error": "",
+      "reranked": 17,
+      "filtered": 0,
+      "scored": [
+        [
+          "kofeinya_zerna.md:18-24",
+          3.626082181930542
+        ],
+        [
+          "kofeinya_zerna.md:6-17",
+          -1.5007299184799194
+        ],
+        [
+          "delivery.md:1-9",
+          -4.002162933349609
+        ],
+        [
+          "kofeinya_zerna.md:25-31",
+          -4.45434045791626
+        ],
+        [
+          "delivery.md:16-22",
+          -6.8193254470825195
+        ],
+        [
+          "kofeinya_zerna.md:61-69",
+          -7.185192108154297
+        ],
+        [
+          "kofeinya_zerna.md:77-83",
+          -7.971144676208496
+        ],
+        [
+          "delivery.md:10-15",
+          -8.786028861999512
+        ],
+        [
+          "kofeinya_zerna.md:70-76",
+          -9.221904754638672
+        ],
+        [
+          "kofeinya_zerna.md:39-44",
+          -9.435196876525879
+        ],
+        [
+          "kofeinya_zerna.md:50-51",
+          -9.465629577636719
+        ],
+        [
+          "kofeinya_zerna.md:1-5",
+          -9.564608573913574
+        ],
+        [
+          "kofeinya_zerna.md:84-88",
+          -9.701882362365723
+        ],
+        [
+          "delivery.md:23-28",
+          -9.722397804260254
+        ],
+        [
+          "kofeinya_zerna.md:45-49",
+          -9.76297664642334
+        ],
+        [
+          "kofeinya_zerna.md:32-38",
+          -9.997427940368652
+        ],
+        [
+          "kofeinya_zerna.md:52-60",
+          -10.393921852111816
+        ]
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "190",
+          "300"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 6,
+      "question": "Сколько стоит фирменный напиток «Тростниковый крем»?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "Я не располагаю актуальной информацией о ценах на напитки в конкретных заведениях, так как у меня нет доступа к базам данных ресторанов или кафе.\n\nЧтобы узнать стоимость «Тростникового крема», рекомендую:\n\n- **Позвонить в интересующее вас заведение** — обычно в меню или на сайте указаны телефоны\n- **Проверить официальный сайт или приложение** заведения\n- **Уточнить при личном визите**\n\nЕсли вы расскажете, в каком кафе или ресторане подают этот напиток, я постараюсь помочь с другой информацией о заведении.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 17,
+      "elapsed": 1.7257864760467783,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "190",
+          "300"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 7,
+      "question": "До какого времени кофейня работает в воскресенье?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Кофейня работает в воскресенье с 9:00 до 21:00.\n\n[файл: kofeinya_zerna.md:43]",
+      "retrieved": [
+        "kofeinya_zerna.md:32-38",
+        "kofeinya_zerna.md:45-49",
+        "delivery.md:10-15",
+        "kofeinya_zerna.md:39-44"
+      ],
+      "context_tokens": 377,
+      "prompt_tokens": 394,
+      "elapsed": 1.2953924130415544,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "9:00",
+          "21:00"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 7,
+      "question": "До какого времени кофейня работает в воскресенье?",
+      "corpus": "kb",
+      "mode": "rag_rerank",
+      "answerable": true,
+      "answer": "Кофейня «Зёрна» работает в воскресенье с 9:00 до 21:00 [kofeinya_zerna.md:39-44].",
+      "retrieved": [
+        "kofeinya_zerna.md:39-44",
+        "kofeinya_zerna.md:32-38",
+        "kofeinya_zerna.md:61-69",
+        "kofeinya_zerna.md:45-49"
+      ],
+      "context_tokens": 412,
+      "prompt_tokens": 429,
+      "elapsed": 1.0210005179978907,
+      "error": "",
+      "reranked": 17,
+      "filtered": 0,
+      "scored": [
+        [
+          "kofeinya_zerna.md:39-44",
+          3.8689262866973877
+        ],
+        [
+          "kofeinya_zerna.md:32-38",
+          1.1452758312225342
+        ],
+        [
+          "kofeinya_zerna.md:61-69",
+          -3.6168406009674072
+        ],
+        [
+          "kofeinya_zerna.md:45-49",
+          -3.915473222732544
+        ],
+        [
+          "delivery.md:10-15",
+          -4.224453926086426
+        ],
+        [
+          "kofeinya_zerna.md:77-83",
+          -6.412065029144287
+        ],
+        [
+          "kofeinya_zerna.md:1-5",
+          -7.6239848136901855
+        ],
+        [
+          "kofeinya_zerna.md:84-88",
+          -7.744081974029541
+        ],
+        [
+          "kofeinya_zerna.md:70-76",
+          -8.158921241760254
+        ],
+        [
+          "kofeinya_zerna.md:50-51",
+          -8.458175659179688
+        ],
+        [
+          "kofeinya_zerna.md:52-60",
+          -8.759190559387207
+        ],
+        [
+          "kofeinya_zerna.md:18-24",
+          -9.371140480041504
+        ],
+        [
+          "kofeinya_zerna.md:25-31",
+          -9.450605392456055
+        ],
+        [
+          "delivery.md:1-9",
+          -9.461129188537598
+        ],
+        [
+          "kofeinya_zerna.md:6-17",
+          -9.551447868347168
+        ],
+        [
+          "delivery.md:23-28",
+          -9.644654273986816
+        ],
+        [
+          "delivery.md:16-22",
+          -9.808674812316895
+        ]
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "9:00",
+          "21:00"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": true,
+        "refused": null,
+        "cited_files": [
+          "kofeinya_zerna.md"
+        ],
+        "retrieved_files": [
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 7,
+      "question": "До какого времени кофейня работает в воскресенье?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "Я не располагаю информацией о конкретной кофейне, о которой вы спрашиваете. Уточните, пожалуйста:\n\n- **Название кофейни** (если это сеть — какая именно)\n- **Город или адрес**\n\nТогда я смогу проверить актуальное расписание работы на воскресенье.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 17,
+      "elapsed": 1.0909973710076883,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "9:00",
+          "21:00"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 8,
+      "question": "Что нужно сделать гостю с аллергией на орехи и когда?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "По контексту:\n\n**Что делать:**\n- Бариста обязаны предупредить гостя о составе сиропа **до** приготовления, а не после [kofeinya_zerna.md:58-59]\n- Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или воду и не предлагает альтернативу «на глаз» [kofeinya_zerna.md:60]\n\n**Когда:**\n- До приготовления напитка — предупредить о составе сиропа [kofeinya_zerna.md:58-59]\n\nТакже по аллергии на орехи:\n- Ореховый сироп содержит фундук и миндаль, при аллергии на орехи его не предлагают, а напиток делают без него [kofeinya_zerna.md:52-53]\n- Миндаль в круассане — отдельный компонент, не «возможный след» [kofeinya_zerna.md:54]",
+      "retrieved": [
+        "kofeinya_zerna.md:50-51",
+        "kofeinya_zerna.md:52-60",
+        "kofeinya_zerna.md:77-83",
+        "kofeinya_zerna.md:18-24"
+      ],
+      "context_tokens": 464,
+      "prompt_tokens": 482,
+      "elapsed": 2.0596711699618027,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "орех",
+          "до приготовления"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": true,
+        "refused": null,
+        "cited_files": [
+          "kofeinya_zerna.md"
+        ],
+        "retrieved_files": [
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 8,
+      "question": "Что нужно сделать гостю с аллергией на орехи и когда?",
+      "corpus": "kb",
+      "mode": "rag_rerank",
+      "answerable": true,
+      "answer": "[файл:kofeinya_zerna.md:52-60]\n\nПри аллергии на орехи гостю **не предлагают** ореховый сироп, а напиток делают **без него**. Бариста обязаны предупредить гостя о составе сиропа **до** приготовления, а не после. Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или воду и не предлагает альтернативу «на глаз».",
+      "retrieved": [
+        "kofeinya_zerna.md:52-60",
+        "delivery.md:16-22",
+        "kofeinya_zerna.md:61-69",
+        "kofeinya_zerna.md:77-83"
+      ],
+      "context_tokens": 526,
+      "prompt_tokens": 544,
+      "elapsed": 1.3372245508944616,
+      "error": "",
+      "reranked": 17,
+      "filtered": 0,
+      "scored": [
+        [
+          "kofeinya_zerna.md:52-60",
+          -0.2786934971809387
+        ],
+        [
+          "delivery.md:16-22",
+          -6.027927875518799
+        ],
+        [
+          "kofeinya_zerna.md:61-69",
+          -6.248216152191162
+        ],
+        [
+          "kofeinya_zerna.md:77-83",
+          -6.32452392578125
+        ],
+        [
+          "kofeinya_zerna.md:70-76",
+          -6.829304218292236
+        ],
+        [
+          "kofeinya_zerna.md:18-24",
+          -6.975230693817139
+        ],
+        [
+          "kofeinya_zerna.md:25-31",
+          -7.282742977142334
+        ],
+        [
+          "delivery.md:10-15",
+          -7.319916248321533
+        ],
+        [
+          "kofeinya_zerna.md:39-44",
+          -7.9905104637146
+        ],
+        [
+          "kofeinya_zerna.md:6-17",
+          -8.09127426147461
+        ],
+        [
+          "delivery.md:23-28",
+          -8.160202980041504
+        ],
+        [
+          "kofeinya_zerna.md:32-38",
+          -8.179205894470215
+        ],
+        [
+          "kofeinya_zerna.md:84-88",
+          -8.2544527053833
+        ],
+        [
+          "kofeinya_zerna.md:50-51",
+          -9.037206649780273
+        ],
+        [
+          "delivery.md:1-9",
+          -9.079507827758789
+        ],
+        [
+          "kofeinya_zerna.md:45-49",
+          -9.08712387084961
+        ],
+        [
+          "kofeinya_zerna.md:1-5",
+          -9.25390625
+        ]
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "орех",
+          "до приготовления"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [
+          "файл:kofeinya_zerna.md"
+        ],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 8,
+      "question": "Что нужно сделать гостю с аллергией на орехи и когда?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "## Что делать гостю с аллергией на орехи\n\n### **Перед визитом**\n- **Предупредить хозяина** о своей аллергии и степени тяжести (сыпь, отёк, анафилаксия)\n- Уточнить, **будут ли орехи в блюдах** — даже в скрытой форме (масла, мука, соусы, выпечка)\n- Узнать, **где готовится еда** — риск перекрёстного загрязнения на кухне\n\n### **Во время визита**\n- **Не стесняться** ещё раз напомнить о своей аллергии\n- **Не есть** то, что не уверен в составе\n- **Иметь при себе** антигистаминное средство и, если назначено врачом, адреналин (Эпипен)\n- **Наблюдать** за реакцией — первые симптомы (зуд, покалывание, отёк) могут появиться быстро\n\n### **Если произошла реакция**\n1. **Прекратить приём пищи**\n2. **Принять антигистаминное** (если есть)\n3. **Вызвать скорую**, если:\n   - Затруднено дыхание\n   - Отёк языка/горла\n   - Появилась сыпь по всему телу\n   - Тошнота, рвота, головокружение\n\n---\n\n**Важно:** аллергия на орехи — одна из самых опасных. Даже микроскопическое количество может вызвать анафилаксию. Лучше перестраховаться, чем рисковать здоровьем.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 18,
+      "elapsed": 2.230583902914077,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 0.5,
+        "hit": [
+          "орех"
+        ],
+        "missed": [
+          "до приготовления"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 9,
+      "question": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Минимальная сумма заказа для собственной доставки — 700 ₽. Доставка бесплатна от 1500 ₽.\n\n[delivery.md:1-9]",
+      "retrieved": [
+        "delivery.md:1-9",
+        "delivery.md:10-15",
+        "kofeinya_zerna.md:6-17",
+        "kofeinya_zerna.md:25-31"
+      ],
+      "context_tokens": 437,
+      "prompt_tokens": 459,
+      "elapsed": 1.3177653760649264,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "700",
+          "1500",
+          "150"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": true,
+        "refused": null,
+        "cited_files": [
+          "delivery.md"
+        ],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 9,
+      "question": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
+      "corpus": "kb",
+      "mode": "rag_rerank",
+      "answerable": true,
+      "answer": "Минимальная сумма заказа для собственной доставки — 700 ₽. Доставка бесплатна от 1500 ₽ [delivery.md:1-9].",
+      "retrieved": [
+        "delivery.md:1-9",
+        "kofeinya_zerna.md:25-31",
+        "delivery.md:16-22",
+        "delivery.md:10-15"
+      ],
+      "context_tokens": 431,
+      "prompt_tokens": 453,
+      "elapsed": 1.4187579849967733,
+      "error": "",
+      "reranked": 17,
+      "filtered": 0,
+      "scored": [
+        [
+          "delivery.md:1-9",
+          1.8634706735610962
+        ],
+        [
+          "kofeinya_zerna.md:25-31",
+          -6.254920482635498
+        ],
+        [
+          "delivery.md:16-22",
+          -6.765974521636963
+        ],
+        [
+          "delivery.md:10-15",
+          -7.007176399230957
+        ],
+        [
+          "kofeinya_zerna.md:18-24",
+          -7.475822925567627
+        ],
+        [
+          "kofeinya_zerna.md:61-69",
+          -7.539262771606445
+        ],
+        [
+          "delivery.md:23-28",
+          -7.820362091064453
+        ],
+        [
+          "kofeinya_zerna.md:77-83",
+          -8.13615894317627
+        ],
+        [
+          "kofeinya_zerna.md:6-17",
+          -8.34707260131836
+        ],
+        [
+          "kofeinya_zerna.md:39-44",
+          -8.899397850036621
+        ],
+        [
+          "kofeinya_zerna.md:70-76",
+          -9.20323657989502
+        ],
+        [
+          "kofeinya_zerna.md:84-88",
+          -9.567952156066895
+        ],
+        [
+          "kofeinya_zerna.md:32-38",
+          -9.711339950561523
+        ],
+        [
+          "kofeinya_zerna.md:50-51",
+          -10.014679908752441
+        ],
+        [
+          "kofeinya_zerna.md:45-49",
+          -10.070595741271973
+        ],
+        [
+          "kofeinya_zerna.md:1-5",
+          -10.077765464782715
+        ],
+        [
+          "kofeinya_zerna.md:52-60",
+          -10.19936466217041
+        ]
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "700",
+          "1500",
+          "150"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": true,
+        "refused": null,
+        "cited_files": [
+          "delivery.md"
+        ],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 9,
+      "question": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "К сожалению, у меня нет информации о минимальной сумме заказа и условиях бесплатной доставки — эти данные зависят от конкретного магазина или сервиса.\n\n**Где можно узнать:**\n- На сайте магазина в разделе «Доставка» или «Оплата»\n- В карточке товара (обычно указано рядом с ценой доставки)\n- По телефону горячей линии магазина\n- В личном кабинете при оформлении заказа\n\nЕсли уточните, о каком магазине или сервисе идёт речь, я постараюсь помочь найти актуальную информацию.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 22,
+      "elapsed": 2.088760123006068,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "700",
+          "1500",
+          "150"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 10,
+      "question": "Сколько стоит латте на кокосовом молоке?",
+      "corpus": "kb",
+      "mode": "rag",
+      "answerable": false,
+      "answer": "В контексте нет информации о латте на кокосовом молоке. В базе знаний есть только напиток «Раф на овсяном» (300 мл, 290 ₽) [kofeinya_zerna.md:14], но нет упоминания кокосового молока или латте на нём.",
+      "retrieved": [
+        "kofeinya_zerna.md:18-24",
+        "kofeinya_zerna.md:6-17",
+        "kofeinya_zerna.md:70-76",
+        "kofeinya_zerna.md:25-31"
+      ],
+      "context_tokens": 435,
+      "prompt_tokens": 449,
+      "elapsed": 1.6995490730041638,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": true,
+        "cited_files": [],
+        "retrieved_files": [
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 10,
+      "question": "Сколько стоит латте на кокосовом молоке?",
+      "corpus": "kb",
+      "mode": "rag_rerank",
+      "answerable": false,
+      "answer": "Не нашёл ответа в контексте.\n\nВ базе есть информация о напитке «Раф на овсяном» (290 ₽) и «Тростниковый крем» (190 ₽), но конкретного латте на кокосовом молоке в меню не указано. Возможно, это сезонный или временный напиток, не внесённый в текущее меню.",
+      "retrieved": [
+        "kofeinya_zerna.md:18-24",
+        "kofeinya_zerna.md:6-17",
+        "kofeinya_zerna.md:25-31",
+        "delivery.md:1-9"
+      ],
+      "context_tokens": 456,
+      "prompt_tokens": 470,
+      "elapsed": 1.1553671760484576,
+      "error": "",
+      "reranked": 17,
+      "filtered": 0,
+      "scored": [
+        [
+          "kofeinya_zerna.md:18-24",
+          -4.291315078735352
+        ],
+        [
+          "kofeinya_zerna.md:6-17",
+          -4.40592098236084
+        ],
+        [
+          "kofeinya_zerna.md:25-31",
+          -4.601174831390381
+        ],
+        [
+          "delivery.md:1-9",
+          -5.298301696777344
+        ],
+        [
+          "kofeinya_zerna.md:61-69",
+          -6.844669818878174
+        ],
+        [
+          "delivery.md:16-22",
+          -8.240694999694824
+        ],
+        [
+          "kofeinya_zerna.md:77-83",
+          -8.401671409606934
+        ],
+        [
+          "kofeinya_zerna.md:70-76",
+          -9.387879371643066
+        ],
+        [
+          "kofeinya_zerna.md:1-5",
+          -9.633112907409668
+        ],
+        [
+          "kofeinya_zerna.md:45-49",
+          -9.688569068908691
+        ],
+        [
+          "delivery.md:10-15",
+          -9.79066276550293
+        ],
+        [
+          "kofeinya_zerna.md:39-44",
+          -9.928205490112305
+        ],
+        [
+          "kofeinya_zerna.md:84-88",
+          -9.97443962097168
+        ],
+        [
+          "kofeinya_zerna.md:50-51",
+          -9.977206230163574
+        ],
+        [
+          "delivery.md:23-28",
+          -10.064888954162598
+        ],
+        [
+          "kofeinya_zerna.md:32-38",
+          -10.231289863586426
+        ],
+        [
+          "kofeinya_zerna.md:52-60",
+          -10.38867473602295
+        ]
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": true,
+        "cited_files": [],
+        "retrieved_files": [
+          "delivery.md",
+          "kofeinya_zerna.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 10,
+      "question": "Сколько стоит латте на кокосовом молоке?",
+      "corpus": "kb",
+      "mode": "no_rag",
+      "answerable": false,
+      "answer": "Цена латте на кокосовом молоке зависит от места:\n\n**В кофейнях:**\n- В России: 250–450 ₽ (в Москве/СПб дороже)\n- В Европе: €3,50–€6\n- В США: $4–$7\n\n**В рецептах для дома:**\n- Кокосовое молоко (банка 400 мл): 80–150 ₽\n- Эспрессо/кофе: 30–60 ₽\n- Молоко/сливки для микдофоама: 20–40 ₽\n- Сиропы, специи: 30–50 ₽\n- **Итого: ~160–300 ₽** за порцию\n\nГде вы планируете готовить — дома или в заведении?",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 14,
+      "elapsed": 7.171414644108154,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": false,
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    }
+  ],
+  "summary": {
+    "rag": {
+      "questions": 5,
+      "answered": 5,
+      "errors": [],
+      "fact_coverage_mean": 1.0,
+      "fact_coverage_full": 4,
+      "answerable": 4,
+      "refusal_rate": 1.0,
+      "unanswerable": 1,
+      "retrieval_hit_rate": 1.0,
+      "citation_rate": 0.5,
+      "passed": 5,
+      "pass_rate": 1.0,
+      "prompt_tokens_mean": 447.4,
+      "elapsed_mean": 1.53,
+      "context_tokens_mean": 429.8
+    },
+    "rag_rerank": {
+      "questions": 5,
+      "answered": 5,
+      "errors": [],
+      "fact_coverage_mean": 1.0,
+      "fact_coverage_full": 4,
+      "answerable": 4,
+      "refusal_rate": 1.0,
+      "unanswerable": 1,
+      "retrieval_hit_rate": 1.0,
+      "citation_rate": 0.5,
+      "passed": 5,
+      "pass_rate": 1.0,
+      "prompt_tokens_mean": 473.8,
+      "elapsed_mean": 1.2,
+      "context_tokens_mean": 456.2
+    },
+    "no_rag": {
+      "questions": 5,
+      "answered": 5,
+      "errors": [],
+      "fact_coverage_mean": 0.125,
+      "fact_coverage_full": 0,
+      "answerable": 4,
+      "refusal_rate": 0.0,
+      "unanswerable": 1,
+      "retrieval_hit_rate": 0.0,
+      "citation_rate": 0.0,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "prompt_tokens_mean": 17.6,
+      "elapsed_mean": 2.86,
+      "context_tokens_mean": 0.0
+    }
+  }
+}

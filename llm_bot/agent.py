@@ -33,7 +33,14 @@ from llm_bot.invariants import (
 )
 from llm_bot.mcp_tools import DEFAULT_MAX_ROUNDS, MCPEvent, MCPRouter
 from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
-from llm_bot.rag import RagEvent, Retriever
+from llm_bot.rag import (
+    CitationAudit,
+    RagEvent,
+    Retriever,
+    audit_citations,
+    sources_from_text,
+    strip_citations,
+)
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.task_state import (
     TaskDetectionEvent,
@@ -240,6 +247,8 @@ class Session:
         mcp: MCPRouter | None = None,
         mcp_max_rounds: int | None = None,
         retriever: Retriever | None = None,
+        rag_reuse_evidence: bool = False,
+        rag_cite: bool = True,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -261,6 +270,13 @@ class Session:
         # yesterday's evidence (same rule as tool results under ARCH-2).
         self._retriever = retriever
         self._rag_events: list[RagEvent] = []
+        self._citation_audits: list[CitationAudit] = []
+        # Evidence this dialog has already seen, kept only when the owner asks
+        # for it. Off by default: the block is rebuilt per turn on purpose, and
+        # remembering it would undo that.
+        self._rag_reuse_evidence = rag_reuse_evidence
+        self._rag_cite = rag_cite
+        self._rag_earlier: list[str] = []
         # Round budget: an explicit value wins; otherwise the router's
         # ``max_rounds`` (configurable via the ``max_rounds`` key of the MCP
         # config for long cross-server chains), otherwise the default.
@@ -442,6 +458,44 @@ class Session:
     def last_rag_event(self) -> RagEvent | None:
         """The most recent retrieval event, or ``None``."""
         return self._rag_events[-1] if self._rag_events else None
+
+    @property
+    def citation_audits(self) -> list[CitationAudit]:
+        """One citation check per grounded turn, in order."""
+        return list(self._citation_audits)
+
+    def _invariant_ids(self) -> tuple[str, ...]:
+        """Ids rendered as ``[STACK-1]`` in the prompt — never source citations."""
+        if self._invariants is None:
+            return ()
+        return tuple(item.id for item in self._invariants.items())
+
+    @property
+    def last_citation_audit(self) -> CitationAudit | None:
+        """The most recent citation check, or ``None``."""
+        return self._citation_audits[-1] if self._citation_audits else None
+
+    def _rag_subject(self, *, limit: int = 2) -> list[str]:
+        """Documents this dialog has already answered from, newest first.
+
+        A follow-up often names no product at all («а он долго действует?»),
+        and in a corpus of near-duplicate documents every file repeats the same
+        wording — so plain retrieval answers from whichever unrelated file the
+        reranker happened to like. Passing the files already cited keeps the
+        block on the subject the customer is actually asking about. Read from the
+        visible history only: the RAG block is not stored there, so these are the
+        citations the model itself produced.
+        """
+        names: list[str] = []
+        for message in reversed(self._history):
+            if message.get("role") != "assistant":
+                continue
+            for name in sources_from_text(str(message.get("content", "")), limit=2):
+                if name not in names:
+                    names.append(name)
+            if len(names) >= limit:
+                break
+        return names[:limit]
 
     @property
     def invariant_events(self) -> list[InvariantAuditEvent]:
@@ -725,9 +779,12 @@ class Session:
         # towards the budget checks below like any other part of the request,
         # so a big index cannot silently blow the context window.
         rag_prefix = []
+        rag_event: RagEvent | None = None
         if self._retriever is not None:
             try:
-                rag_block, rag_event = self._retriever.render(user_message)
+                rag_block, rag_event = self._retriever.render(
+                    user_message, prefer_sources=self._rag_subject()
+                )
             except Exception as exc:  # noqa: BLE001 - retrieval must never
                 # take the turn down: the bot answers without grounding rather
                 # than failing (same policy as memory/task extraction below).
@@ -915,6 +972,38 @@ class Session:
                 # Token accounting must reflect what was actually sent across
                 # the whole turn, including tool round-trips.
                 context_tokens = count_messages_tokens(messages)
+
+        # Every citation in the answer has to be backed by the block that was
+        # actually sent. Done before the reply reaches memory and the session
+        # store, so a rewritten source number is not persisted as "what we told
+        # the customer" and then reused as evidence on the next turn.
+        if rag_event is not None and rag_event.retrieved:
+            if self._rag_cite:
+                reply, audit = audit_citations(
+                    reply,
+                    rag_event.retrieved,
+                    also_backed=self._rag_earlier if self._rag_reuse_evidence else (),
+                    ignore=self._invariant_ids(),
+                )
+                self._citation_audits.append(audit)
+                if self._rag_reuse_evidence and audit.clean:
+                    self._rag_earlier.extend(rag_event.retrieved)
+                if audit.dropped:
+                    logger.warning(
+                        "RAG citations not in the retrieved block: %s",
+                        ", ".join(audit.dropped),
+                    )
+            else:
+                reply = strip_citations(reply, ignore=self._invariant_ids())
+                # Reusing earlier evidence is gated on a clean audit because a
+                # citation contradicting the answer is what makes a block unsafe
+                # to lean on again. A reply with no citations contradicts
+                # nothing, so the block is reused. Otherwise switching
+                # --rag-no-cite on for readability would quietly change what
+                # gets retrieved on the follow-up turn, and the two modes would
+                # no longer be comparable.
+                if self._rag_reuse_evidence:
+                    self._rag_earlier.extend(rag_event.retrieved)
 
         # Mirror the assistant reply into the short-term (current dialog) layer.
         if self._memory is not None:

@@ -177,6 +177,49 @@ def test_cited_sources_reads_file_line_ranges() -> None:
     assert found == {"kb/hours.md", "kb/menu.md"}
 
 
+def test_cited_sources_accepts_cyrillic_and_spaces_in_a_pdf_name() -> None:
+    """The scanned names hold Cyrillic, spaces and dots.
+
+    A pattern limited to ``[\\w./-]`` or to ``.md`` returned nothing for every
+    one of them, so the citation score read 0.000 while retrieval was healthy —
+    a broken metric that looks exactly like a broken answer.
+    """
+    answer = (
+        "Занятие на 20 минут "
+        "[ID-250-248-463-709 Отчёт Б.pdf:12-38]"
+    )
+    assert cmp_rag.cited_sources(answer) == {
+        "ID-250-248-463-709 Отчёт Б.pdf"
+    }
+
+
+def test_cited_sources_score_a_cyrillic_name_against_a_source() -> None:
+    """The parsed name must intersect the expected source, not just look like one."""
+    sources = ["ID-250-905-682-540 Занятие_60мин.pdf:5-12"]
+    answer = "(ID-250-905-682-540 Занятие_60мин.pdf:5-12)"
+    assert cmp_rag.cited_sources(answer) & cmp_rag.source_files(sources)
+
+
+def test_cited_sources_ignores_a_page_suffix_after_the_range() -> None:
+    """``file.pdf:12-38 — page 1`` must not swallow the page label."""
+    answer = "[ID-250-801-540-383 Занятие.pdf:1-9 — page 1]"
+    assert cmp_rag.cited_sources(answer) == {
+        "ID-250-801-540-383 Занятие.pdf"
+    }
+
+
+def test_cited_sources_ignores_prose_and_prices() -> None:
+    assert cmp_rag.cited_sources("Стоит 190 руб, точной цифры нет") == set()
+    assert cmp_rag.cited_sources("в файле data/docs/ нет ничего") == set()
+
+
+def test_cited_sources_reads_other_indexed_extensions() -> None:
+    found = cmp_rag.cited_sources(
+        "[llm_bot/rag.py:12-34] и scripts/index_documents.py:300-320"
+    )
+    assert found == {"llm_bot/rag.py", "scripts/index_documents.py"}
+
+
 def test_refusal_detection() -> None:
     assert cmp_rag._REFUSAL_RE.search("Я не нашёл это в базе")
     assert cmp_rag._REFUSAL_RE.search("Информации об этом нет")
@@ -733,3 +776,322 @@ def test_main_rejects_an_unknown_corpus_filter(
         "--out", str(tmp_path / "x.md"),
     ])
     assert code == 2
+
+# --------------------------------------------------------------------------- #
+# The third arm: rag_rerank
+# --------------------------------------------------------------------------- #
+
+
+class SpyReranker:
+    """Records the shortlist size it is handed; reorders nothing."""
+
+    name = "fake-cross"
+
+    def __init__(self) -> None:
+        self.shortlists: list[int] = []
+
+    def rerank(self, question, hits, top_k):
+        self.shortlists.append(len(hits))
+        return list(hits)[:top_k]
+
+
+def test_modes_for_adds_the_third_arm_only_on_request() -> None:
+    """The day-22 two-arm run must stay byte-identical by default."""
+    assert cmp_rag.modes_for(False) == cmp_rag.MODES == ("rag", "no_rag")
+    assert cmp_rag.modes_for(True) == ("rag", "rag_rerank", "no_rag")
+
+
+def test_the_rerank_arm_runs_next_to_the_plain_one(
+    questions_file: Path, tmp_path: Path
+) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    reranker = SpyReranker()
+    original = cmp_rag.Retriever
+    cmp_rag.Retriever = lambda path, **kw: original(
+        path, embedder=FakeEmbedder("fake-mini"), **kw
+    )
+    client = _client({"1": "С 9:00 до 21:00", "2": "С 9:00 до 21:00",
+                      "3": "С 9:00 до 21:00", "4": "не нашёл",
+                      "5": "С 9:00 до 21:00", "6": "не нашёл"}, [])
+    try:
+        cases = cmp_rag.run(
+            corpora, questions, client, reranker=reranker,
+            candidate_k=3, top_k=1,
+            modes=cmp_rag.modes_for(True),
+        )
+    finally:
+        cmp_rag.Retriever = original
+
+    assert [c.mode for c in cases] == ["rag", "rag_rerank", "no_rag"] * 2
+    summary = cmp_rag.aggregate(cases, questions)
+    assert set(summary) == {"rag", "rag_rerank", "no_rag"}
+    # Both retrieval arms were judged against the same `sources` rule.
+    assert summary["rag_rerank"]["retrieval_hit_rate"] is not None
+    assert reranker.shortlists, "the reranker was never called"
+
+
+def test_the_rerank_arm_needs_a_reranker_rather_than_silently_skipping(
+    questions_file: Path,
+) -> None:
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    original = cmp_rag.Retriever
+    cmp_rag.Retriever = lambda path, **kw: original(
+        path, embedder=FakeEmbedder("fake-mini"), **kw
+    )
+    try:
+        with pytest.raises(ValueError, match="требует reranker"):
+            cmp_rag.run(
+                corpora, questions, _client({}, []),
+                modes=("rag_rerank",),
+            )
+    finally:
+        cmp_rag.Retriever = original
+
+
+def test_the_two_retrieval_arms_do_not_share_a_retriever(
+    questions_file: Path,
+) -> None:
+    """One shared retriever would leak the reranker's state into the `rag` arm."""
+    corpora, questions = cmp_rag.load_questions(questions_file)
+    original = cmp_rag.Retriever
+    built: list[dict] = []
+
+    def spy(path, **kw):
+        built.append(kw)
+        return original(path, embedder=FakeEmbedder("fake-mini"), **kw)
+
+    cmp_rag.Retriever = spy
+    client = _client({}, [])
+    try:
+        cmp_rag.run(
+            corpora, questions, client, reranker=SpyReranker(),
+            top_k=2, candidate_k=7, modes=cmp_rag.modes_for(True),
+        )
+    finally:
+        cmp_rag.Retriever = original
+
+    with_reranker = [kw for kw in built if "reranker" in kw]
+    without = [kw for kw in built if "reranker" not in kw]
+    assert len(with_reranker) == 1 and len(without) == 1
+    assert with_reranker[0]["candidate_k"] == 7
+    assert with_reranker[0]["top_k"] == 2
+    assert "candidate_k" not in without[0]
+
+
+# --------------------------------------------------------------------------- #
+# Threshold sweep
+# --------------------------------------------------------------------------- #
+
+
+def _sweep_cases() -> tuple[list[cmp_rag.Case], list[cmp_rag.Question]]:
+    """Three cases shaped so a threshold visibly costs something.
+
+    Question 2's own chunk scores *below* the distractor that outranks it, and
+    the trap scores below both. That is the real shape of the problem: cutting on
+    score removes the trap last and the answer second.
+    """
+    questions = [
+        cmp_rag.Question("часы", "kb", ("21:00",), ("kb/hours.md:11-15",), True),
+        cmp_rag.Question("меню", "kb", ("190",), ("kb/menu.md:1-5",), True),
+        cmp_rag.Question("скидка", "kb", (), (), False),
+    ]
+    cases = [
+        cmp_rag.Case(
+            index=1, question="часы", corpus="kb", mode=cmp_rag.RERANK_MODE,
+            answerable=True, answer="",
+            scored=(("kb/hours.md:11-15", 5.0), ("kb/menu.md:1-5", -1.0)),
+        ),
+        cmp_rag.Case(
+            index=2, question="меню", corpus="kb", mode=cmp_rag.RERANK_MODE,
+            answerable=True, answer="",
+            scored=(("kb/hours.md:11-15", 5.0), ("kb/menu.md:1-5", -3.0)),
+        ),
+        cmp_rag.Case(
+            index=3, question="скидка", corpus="kb", mode=cmp_rag.RERANK_MODE,
+            answerable=False, answer="",
+            scored=(("kb/hours.md:11-15", 1.5),),
+        ),
+    ]
+    return cases, questions
+
+
+def test_the_sweep_replays_the_saved_shortlist_without_any_model() -> None:
+    cases, questions = _sweep_cases()
+    rows = cmp_rag.threshold_sweep(cases, questions, top_k=2)
+    assert [row["threshold"] for row in rows] == list(cmp_rag.SWEEP_THRESHOLDS)
+    # No filter: every answerable question keeps its chunk.
+    assert rows[0]["hits"] == 2 and rows[0]["checked"] == 2
+    assert rows[0]["rate"] == 1.0
+    assert rows[0]["traps_armed"] == 1  # the trap got something either way
+
+    by_threshold = {row["threshold"]: row for row in rows}
+    # -2.0 drops the menu chunk but not the hours one: one answer is already lost.
+    assert by_threshold[-2.0]["hits"] == 1
+    # 2.0 finally disarms the trap, and by then half the answers are gone.
+    # This trade-off is the whole argument for leaving the threshold off.
+    assert by_threshold[2.0]["traps_armed"] == 0
+    assert by_threshold[2.0]["hits"] == 1
+
+
+def test_the_sweep_counts_the_chunks_a_threshold_would_send() -> None:
+    cases, questions = _sweep_cases()
+    rows = {row["threshold"]: row for row in
+            cmp_rag.threshold_sweep(cases, questions, top_k=2)}
+    assert rows[None]["chunks_mean"] == pytest.approx(5 / 3, abs=0.01)
+    # At 2.0 the trap is empty and the menu question keeps only its wrong chunk:
+    # two chunks left, one of them still useless.
+    assert rows[2.0]["chunks_mean"] == pytest.approx(2 / 3, abs=0.01)
+
+
+def test_the_sweep_needs_the_rerank_arm_and_ignores_others() -> None:
+    cases, questions = _sweep_cases()
+    cases.append(
+        cmp_rag.Case(index=1, question="часы", corpus="kb", mode="rag",
+                     answerable=True, answer="", scored=(("kb/hours.md:11-15", 5.0),))
+    )
+    rows = cmp_rag.threshold_sweep(cases, questions, top_k=2)
+    assert rows[0]["checked"] == 2  # the `rag` case was not counted
+
+
+def test_the_report_shows_the_sweep_and_the_reranker_settings() -> None:
+    cases, questions = _sweep_cases()
+    corpora = {"kb": cmp_rag.Corpus("kb", "Кофейня", Path(), Path(), (".md",))}
+    summary = cmp_rag.aggregate(cases, questions)
+    report = cmp_rag.render_report(
+        corpora, questions, cases, summary,
+        model_name="fake", top_k=2, max_context_tokens=None,
+        rerank_model="fake-cross", candidate_k=20, min_rerank_score=None,
+        sweep=cmp_rag.threshold_sweep(cases, questions, top_k=2),
+    )
+    assert "Порог отсечения" in report
+    assert "fake-cross" in report
+    assert "| выключен | 2/2 | 1/1 |" in report
+    # A threshold being off is stated, so its absence is not read as an oversight.
+    assert "Порог отсечения: выключен" in report
+    assert "с RAG + реранкер" in report
+
+
+def test_the_report_names_the_threshold_when_one_was_used() -> None:
+    cases, questions = _sweep_cases()
+    corpora = {"kb": cmp_rag.Corpus("kb", "Кофейня", Path(), Path(), (".md",))}
+    report = cmp_rag.render_report(
+        corpora, questions, cases, cmp_rag.aggregate(cases, questions),
+        model_name="fake", top_k=2, max_context_tokens=None,
+        rerank_model="fake-cross", candidate_k=20, min_rerank_score=0.5,
+    )
+    assert "Порог отсечения: 0.5" in report
+
+
+def test_a_saved_run_keeps_its_rerank_diagnostics(tmp_path: Path) -> None:
+    cases, questions = _sweep_cases()
+    path = tmp_path / "run.json"
+    cmp_rag.save_json(
+        path, {}, questions, cases, cmp_rag.aggregate(cases, questions),
+        model="fake", top_k=2, rerank_model="fake-cross",
+        rerank_candidates=20, rerank_min_score=None,
+    )
+    _, reloaded = cmp_rag.load_saved_cases(path)
+    assert reloaded[0].scored == (("kb/hours.md:11-15", 5.0), ("kb/menu.md:1-5", -1.0))
+    assert reloaded[0].mode == cmp_rag.RERANK_MODE
+    meta = cmp_rag.load_saved_meta(path)
+    assert meta["top_k"] == 2 and meta["rerank_model"] == "fake-cross"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "минимальный срок действия не указан",
+        "срок не указан в документе",
+        "не указано",
+        "не указана",
+        "не указаны",
+    ],
+)
+def test_a_refusal_is_recognised_in_every_gender(phrase: str) -> None:
+    """The masculine form was missing and scored a correct refusal as a failure.
+
+    Found on a PDF corpus: the model answered «срок не указан» — a
+    refusal — and the ``не указано``-only pattern counted it as a confabulation,
+    understating the ``rag_rerank`` refusal rate by one question in six.
+    """
+    assert cmp_rag._REFUSAL_RE.search(phrase), phrase
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "в кофейне нет Wi-Fi",
+        "в стоимость входит один сеанс",
+        "сеансы проводятся по выходным дням",
+    ],
+)
+def test_a_confident_answer_is_not_mistaken_for_a_refusal(phrase: str) -> None:
+    """The widening above must not start swallowing real answers."""
+    assert not cmp_rag._REFUSAL_RE.search(phrase), phrase
+
+
+# --------------------------------------------------------------------------- #
+# The PDF control set
+# --------------------------------------------------------------------------- #
+
+PDF_INDEX = ROOT / "data/certs_emb/index_structure.json"
+PDF_QUESTIONS = ROOT / "data/certs_eval/questions.yaml"
+
+
+@pytest.mark.skipif(
+    not (PDF_INDEX.is_file() and (ROOT / "data/certs").is_dir()),
+    reason="нужен локальный корпус PDF: data/ в .gitignore",
+)
+def test_every_pdf_span_contains_its_facts() -> None:
+    """The same anti-drift guard the day-22 set has, for the PDF corpus.
+
+    The corpus and its questions both live under git-ignored ``data/``, so
+    silent drift is the normal failure mode here:
+    bump pypdf and every line number shifts, and the benchmark starts reporting
+    a retrieval problem when the cause was the extraction.
+
+    The text is re-extracted from the PDFs with the *indexer's own* function
+    rather than reassembled from the stored chunks. A chunk's ``start_line`` is
+    the start of its section, not of its text — headers and page markers sit in
+    between — so a chunk-based reconstruction would report offsets that were
+    never the ones the citations were written against.
+    """
+    from scripts.index_documents import extract_pdf_text, split_lines
+
+    config = yaml.safe_load(PDF_QUESTIONS.read_text(encoding="utf-8"))
+    cache: dict[str, list[str]] = {}
+
+    def lines_of(source: str) -> list[str]:
+        if source not in cache:
+            text, _ = extract_pdf_text(ROOT / "data/certs" / source, max_pages=1)
+            cache[source] = split_lines(text)
+        return cache[source]
+
+    answerable = 0
+    for index_no, question in enumerate(config["questions"], start=1):
+        if not question.get("sources"):
+            assert not question.get("expect"), (
+                f"#{index_no}: неответимый вопрос не должен иметь ожиданий"
+            )
+            continue
+        answerable += 1
+        # Facts are checked against the *union* of the declared spans: a question
+        # may deliberately spread them ("where" in one chunk, "how old" in
+        # another). Demanding each fact inside each span would reject exactly the
+        # questions this corpus is built around.
+        parts: list[str] = []
+        for source in question["sources"]:
+            name, _, span = source.partition(":")
+            start, _, end = span.partition("-")
+            document = lines_of(name)
+            assert 1 <= int(start) <= int(end) <= len(document), (
+                f"#{index_no}: {source} выходит за пределы документа "
+                f"({len(document)} строк)"
+            )
+            parts.append("\n".join(document[int(start) - 1 : int(end)]))
+        plain = "\n".join(parts).lower().replace("*", "")
+        for fact in question["expect"]:
+            assert fact.lower().replace("*", "") in plain, (
+                f"#{index_no}: факт {fact!r} не лежит в {question['sources']}"
+            )
+    assert answerable == 34, f"ожидалось 34 ответимых вопроса, а их {answerable}"

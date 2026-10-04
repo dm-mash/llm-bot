@@ -40,6 +40,7 @@ from llm_bot.memory_store import JsonMemoryStore, MemoryStore
 from llm_bot.profiles import apply_profile
 from llm_bot.rag import DEFAULT_TOP_K as DEFAULT_RAG_TOP_K
 from llm_bot.rag import Retriever
+from llm_bot.rerank import Reranker
 from llm_bot.stores import (
     AgentConfig,
     AgentStore,
@@ -214,6 +215,11 @@ def make_session(
     rag_index: str | Path | None = None,
     rag_top_k: int | None = None,
     rag_max_context_tokens: int | None = None,
+    rag_rerank: bool = False,
+    rag_rerank_candidates: int | None = None,
+    rag_rerank_min_score: float | None = None,
+    rag_reuse_evidence: bool = False,
+    rag_cite: bool = True,
     retriever: Retriever | None = None,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
@@ -257,6 +263,14 @@ def make_session(
     block's ceiling also falls back to a share of the model's context window
     (see :func:`llm_bot.rag.rag_budget_tokens`). Pass a ready-made *retriever*
     instead to skip construction (tests, custom retrieval).
+
+    *rag_rerank* adds a second stage: dense retrieval returns
+    *rag_rerank_candidates* chunks (default 20) and a cross-encoder re-scores
+    them down to *rag_top_k*. It costs one extra model load and no prompt
+    tokens, and is off unless asked for. *rag_rerank_min_score* is an optional
+    threshold on that score — left unset, because on a near-duplicate corpus it
+    discards correct answers before it removes misleading ones
+    (:mod:`llm_bot.rerank`).
     """
     agent_config = agent_store.get(agent_name)
     if profile is not None:
@@ -354,11 +368,18 @@ def make_session(
     # model itself is still loaded lazily on the first query.
     effective_retriever = retriever
     if effective_retriever is None and rag_index is not None:
+        # ``rag_rerank`` loads a second model; kept optional and injected here
+        # so the RAG-off path — and the common path — never pays for it.
+        reranker = Reranker() if rag_rerank else None
         effective_retriever = Retriever(
             rag_index,
             top_k=rag_top_k if rag_top_k is not None else DEFAULT_RAG_TOP_K,
             max_context_tokens=rag_max_context_tokens,
             context_window=agent.context_window,
+            reranker=reranker,
+            candidate_k=rag_rerank_candidates,
+            min_rerank_score=rag_rerank_min_score,
+            cite=rag_cite,
         )
 
     return Session(
@@ -390,4 +411,6 @@ def make_session(
             )
         ),
         retriever=effective_retriever,
+        rag_reuse_evidence=rag_reuse_evidence,
+        rag_cite=rag_cite,
     )
