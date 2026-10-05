@@ -1,11 +1,11 @@
 {
   "model": "leanstral",
-  "top_k": 4,
+  "top_k": null,
   "rag_max_tokens": null,
-  "rerank_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-  "rerank_candidates": 20,
+  "rerank_model": null,
+  "rerank_candidates": null,
   "rerank_min_score": null,
-  "elapsed": 67.05,
+  "elapsed": 90.41,
   "corpora": {
     "repo": {
       "label": "Документы репозитория",
@@ -143,25 +143,487 @@
   ],
   "cases": [
     {
+      "index": 1,
+      "question": "Какая модель эмбеддингов используется по умолчанию и какое у неё окно в токенах?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Не нашёл ответа в предоставленном контексте. Уточни, пожалуйста, о каком именно документе идёт речь — возможно, это относится к одному из файлов, не представленных в текущем контексте (например, к конфигурации модели или документации по эмбеддингам).",
+      "retrieved": [
+        "README.md:949-951",
+        "plans/invariants.md:91-92",
+        "README.md:995-1000",
+        "tasks/day22.md:22-22"
+      ],
+      "context_tokens": 465,
+      "prompt_tokens": 489,
+      "elapsed": 1.3583384159719571,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [
+        "(«принято, завершай»). The model's own reports («проверка пройдена,\nдефектов нет») are never treated as hints — the agent cannot promote itself\nthrough the pipeline. Machine-generated turns (the CLI auto-turn after a",
+        "| Поле | Тип | Обяз. | Назначение | Валидация |\n|---|---|---|---|---|",
+        "артефакт\"; `validation` → \"проверяй по критериям; дефекты — предлагай\n/task rework\"; `done` → \"только итоговая сводка\". Advancing a stage also\nauto-fills `expected_action` with a stage-typical default (a user-set action\nis kept), so after `/task next` the model immediately knows what is expected\nnext.",
+        "Агент с двумя режимами (с RAG / без RAG) + 10 контрольных вопросов и сравнение качества"
+      ],
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "paraphrase-multilingual-MiniLM-L12-v2",
+          "128"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "refused",
+        "cited_files": [],
+        "retrieved_files": [
+          "README.md",
+          "plans/invariants.md",
+          "tasks/day22.md"
+        ],
+        "passed": false
+      }
+    },
+    {
+      "index": 1,
+      "question": "Какая модель эмбеддингов используется по умолчанию и какое у неё окно в токенах?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "По умолчанию в **GPT-4** используется модель эмбеддингов **text-embedding-3-small** (или её предшественник **text-embedding-ada-002** в более ранних версиях API).\n\n## Параметры по умолчанию\n\n| Параметр | Значение |\n|----------|----------|\n| **Модель** | `text-embedding-3-small` |\n| **Размер окна (input)** | **8191 токенов** |\n| **Размер выхода** | 1536 измерений |\n\n## Важные нюансы\n\n### Окно в токенах\n- **Входное окно**: до **8191 токенов** на один запрос\n- Если текст длиннее — происходит **обрезка** (truncation), а не ошибка\n- Можно включить `truncate: \"none\"` для явного запрета обрезки (вернёт ошибку при превышении)\n\n### Сравнение с другими моделями\n\n| Модель | Размер окна | Размер эмбеддинга |\n|--------|-------------|-------------------|\n| `text-embedding-3-small` | 8191 | 1536 |\n| `text-embedding-3-large` | 8191 | 3072 |\n| `text-embedding-ada-002` | 8191 | 1536 |\n\n### Практическое замечание\nДля большинства задач рекомендуется **разбивать длинные документы на чанки по 8000 токенов** с перекрытием (overlap) для сохранения контекста на границах.\n\nЕсли вам нужны эмбеддинги для русского языка — модель работает, но качество может быть ниже, чем для английского. Для русского специализированные модели (например, от Сбера или Яндекса) часто дают лучший результат.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 24,
+      "elapsed": 3.262639986933209,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [],
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "paraphrase-multilingual-MiniLM-L12-v2",
+          "128"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 2,
+      "question": "Какой дефолт у max_summary_ratio и что он ограничивает?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "`max_summary_ratio` по умолчанию `0.3` [1] «`max_summary_ratio` (по умолчанию `0.3`» [1]. Он ограничивает размер summary как долю контекстного окна модели: summary ≤ 30% от контекстного окна, даже если токен-лимит не задан [1] «summary ≤ этой доли контекстного окна модели, даже если токен-лимит не задан» [1].\nИсточник:\n[1] plans/compression.md:69-77 — План: управление контекстом — сжатие истории (rolling summary) > Ограничение размера summary · chunk structure-002-010",
+      "retrieved": [
+        "plans/compression.md:69-77",
+        "plans/compression.md:81-87",
+        "plans/compression.md:12-19",
+        "README.md:1163-1167"
+      ],
+      "context_tokens": 714,
+      "prompt_tokens": 732,
+      "elapsed": 1.6191542880842462,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [
+        "## Ограничение размера summary\n\nБегущий summary растёт с каждым сворачиванием и со временем может не влезть в\nконтекстное окно модели. Чтобы этого избежать, у сжатия есть два лимита:\n\n* `max_summary_tokens` — жёсткий предел summary в токенах;\n* `max_summary_ratio` (по умолчанию `0.3`) — страховка: summary ≤ этой доли\n  контекстного окна модели, даже если токен-лимит не задан.",
+        "1. **Мягкий лимит в промпте** — в `summarize_prompt` добавляется инструкция\n   «изложение должно быть не длиннее ~N символов», чтобы модель чаще сама\n   укладывалась в бюджет;\n2. **Жёсткая обрезка в коде** — `ContextCompressor` после ответа модели\n   детерминированно обрезает summary до бюджета (по границе слова) с пометкой\n   «…», гарантируя, что summary никогда не превысит лимит.",
+        "## Ключевые решения\n\n1. **Два параметра** `CompressionSettings(keep_last=N, block_size=M)`:\n   - `keep_last` (N) — сколько свежих сообщений остаются дословно (качество);\n   - `block_size` (M) — когда история перевалила за M, самый старый кусок\n     сворачивается в summary (частота/стоимость суммаризации).\n   Только N давало бы слишком частую (и дорогую) суммаризацию почти на каждый ход.",
+        "**Limiting the summary size.** A running summary can grow large over a long\nconversation. To keep it from crowding out the context window, cap its size with\n`max_summary_tokens` (hard cap, applied in code) and/or `max_summary_ratio`\n(soft cap as a fraction of the model's context window; default `0.3`). The\neffective budget is the smaller of the two, and the summary is **truncated in"
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "0.3",
+          "summary"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": true,
+        "refused": null,
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": true,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [
+          "max_summary_ratio"
+        ],
+        "grounding": "grounded",
+        "cited_files": [
+          "plans/compression.md"
+        ],
+        "retrieved_files": [
+          "README.md",
+          "plans/compression.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 2,
+      "question": "Какой дефолт у max_summary_ratio и что он ограничивает?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "## `max_summary_ratio` в ClickHouse\n\n### Дефолтное значение\n**0.5** (50%)\n\n### Что ограничивает\n\nЭтот параметр контролирует **максимальное соотношение размера секции `SUMMARY` к размеру секции `DATA`** в сжатом блоке.\n\n### Как работает\n\nПри сжатии данных ClickHouse разбивает блок на две части:\n- **DATA** — несжатые или слабо сжатые данные\n- **SUMMARY** — индекс/заголовок для быстрого поиска\n\nПараметр `max_summary_ratio` задаёт порог, при превышении которого ClickHouse **не будет использовать сжатие** для данного блока, даже если оно дало бы хорошее сжатие.\n\n### Пример\n\n```sql\n-- Если в блоке:\n-- DATA = 100 МБ\n-- SUMMARY = 60 МБ (ratio = 0.6)\n\n-- При max_summary_ratio = 0.5\n-- Блок НЕ будет сжат, т.к. 0.6 > 0.5\n```\n\n### Когда менять\n\n| Ситуация | Рекомендация |\n|----------|-------------|\n| Мало CPU, много диска | Увеличить (0.7-0.9) |\n| Мало диска, много CPU | Уменьшить (0.3-0.5) |\n| Быстрые SSD, сжатие даёт мало выгоды | Уменьшить или отключить |\n\n### Отключение\n```sql\nSET max_summary_ratio = 1.0;  -- или 0 для полного отключения проверки\n```\n\n### Где задаётся\n- Глобально: `config.xml` или `users.xml`\n- Локально: `SET max_summary_ratio = ...` в сессии",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 18,
+      "elapsed": 2.443769400008023,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "0.3",
+          "summary"
+        ],
+        "missed": [],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": true
+      }
+    },
+    {
+      "index": 3,
+      "question": "Что за G5 в плане переходов состояния задачи?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "G5 — это **fail-open аудита инвариантов при 429** (HTTP-код «слишком много запросов»).\n\nСогласно контексту, G5 находится **вне скоупа** текущего плана и решается отдельно:\n\n> «G5 (fail-open аудита инвариантов при 429) — **вне скоупа**, решается отдельно» [3]\nИсточник:\n[3] plans/task_state_transitions.md:188-195 — План: Контролируемые переходы состояний задачи (G1–G4) > Что НЕ меняется · chunk structure-009-036",
+      "retrieved": [
+        "plans/task_state_transitions.md:1-9",
+        "plans/task_state_transitions.md:170-178",
+        "plans/task_state_transitions.md:188-195",
+        "plans/task_state_transitions.md:152-157"
+      ],
+      "context_tokens": 723,
+      "prompt_tokens": 739,
+      "elapsed": 1.4753702089656144,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [
+        "# План: Контролируемые переходы состояний задачи (G1–G4)\n\n## Цель\n\nДовести жизненный цикл задачи до полного соответствия ТЗ «Контролируемые\nпереходы состояний»: явные допустимые состояния, разрешённые переходы,\nневозможность «перепрыгнуть» этап, явная реакция на нелегальные попытки,\nкорректное продолжение после паузы.",
+        "### G8 — авто-ход сразу после авто-детектированного перехода\n\nРучной `/task next` шлёт сервисный авто-ход («этап изменился — действуй по\nсостоянию»), а авто-детектированный переход — нет: реплика, вызвавшая\nпереход, сгенерирована под старой директивой этапа (детектор работает\nпост-фактум), поэтому артефакт отставал на один ход пользователя («дай\nфинальный этап» → сводка требований, рекомендации только на следующее\nсообщение).",
+        "## Что НЕ меняется\n\n- Таблица `TRANSITIONS` в части forward-рёбер и `paused`/`done` — уже корректна.\n- Компрессия, память, профили, стратегии контекста — ортогональны.\n- Обратная совместимость: старые JSON-сессии читаются как раньше;\n  `task_exit`-поле детектора опционально.\n- G5 (fail-open аудита инвариантов при 429) — **вне скоупа**, решается отдельно.",
+        "### G7 — семантика подсказки и критерий выхода planning для задач-консультаций\n\n1. **Hint = этап запрашиваемой работы, а не дословное слово.**\n   [_DETECTION_PROMPT](../llm_bot/task_state.py): просьба из planning дать\n   «результат / итоговый вариант / финальный этап» — это `stage_hint:\n   execution` (просят само исполнение), а НЕ `done`; `done` — только явное"
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [
+          "вне скоупа",
+          "429"
+        ],
+        "missed": [],
+        "retrieval_hit": true,
+        "citation_hit": true,
+        "refused": null,
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": true,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [
+          "слишком много запросов"
+        ],
+        "grounding": "grounded",
+        "cited_files": [
+          "plans/task_state_transitions.md"
+        ],
+        "retrieved_files": [
+          "plans/task_state_transitions.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 3,
+      "question": "Что за G5 в плане переходов состояния задачи?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "В контексте **переходов состояния задач** (workflow/task states) **G5** обычно относится к **пятиуровневой модели готовности/зрелости** или к **матрице переходов состояний**.\n\n## Наиболее вероятные значения:\n\n### 1. **G5 = Generic 5 (Общий уровень 5)**\nВ системах управления задачами (Jira, Azure DevOps, ServiceNow) иногда используется классификация:\n- **G1–G5** — уровни сложности/приоритета/риска\n- Переходы между ними требуют определённых условий (например, G1→G2 только после выполнения G1-задач)\n\n### 2. **G5 в контексте ITIL/ITSM**\n- **G** = **Generic** или **Governance**\n- Уровень 5 может означать **пятый уровень зрелости процесса** (CMMI Level 5) или **пятую стадию эскалации**\n\n### 3. **G5 в контексте workflow-движков**\nНекоторые системы используют **G-матрицы** для описания переходов:\n```\nG5: [G1] → [G2] → [G3] → [G4] → [G5]\n```\nГде каждый уровень — это состояние, а стрелки — разрешённые переходы.\n\n---\n\n## Уточните контекст:\n- Какая **система управления задачами** используется?\n- Это **ITSM**, **проектный менеджмент**, **разработка ПО**?\n- Где именно видите обозначение G5 — в **настройках workflow**, **документации**, **интерфейсе**?\n\nТогда смогу дать точный ответ.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 16,
+      "elapsed": 4.414353494998068,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [],
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "вне скоупа",
+          "429"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 4,
+      "question": "Почему Groq начинает отдавать 429?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": true,
+      "answer": "Groq начинает отдавать 429 (Too Many Requests) из-за жёсткого лимита токенов на запрос, который зависит от тарифа аккаунта.\n\n[4] «Some providers impose a **hard per-request token ceiling** from the account tier (e.g. Groq's `on_demand` tier refuses any single request above its TPM cap even with a full rate-limit bucket — retrying can never help). Set `max_request_tokens:` per model (or `LLM_MAX_REQUEST_TOKENS` globally) and the»\nИсточник:\n[4] README.md:784-787 — llm-bot > Token accounting and context limits · chunk structure-000-122",
+      "retrieved": [
+        "README.md:1298-1300",
+        "README.md:1336-1341",
+        "README.md:1380-1384",
+        "README.md:784-787"
+      ],
+      "context_tokens": 584,
+      "prompt_tokens": 597,
+      "elapsed": 1.562129808939062,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [
+        "The default model ladder is tailored to this project's Groq account\n(`openai/gpt-oss-20b` → `openai/gpt-oss-120b` → `qwen/qwen3.8-27b`). If a model id\nisn't available on your account you'll get a `404` — pass your own ids with",
+        "Sizes are counted in **tokens of the embedding model**, not characters: a\n1200-character Russian chunk is ~320 MiniLM tokens and everything past 256 is\nsilently dropped by the model. That is what the report's\n`доля чанков длиннее окна модели` row measures, and why the original\n\"1000 characters per chunk\" default was wrong.",
+        "The two strategies differ exactly where it matters: for the same question\n`fixed_size` returns the neighbouring \"Ollama server\" fragment, `structure`\nreturns the whole GigaChat section. Every hit carries `file:line`, so verify it\nwith `sed -n '162,183p' README.md`.",
+        "* Some providers impose a **hard per-request token ceiling** from the account\n  tier (e.g. Groq's `on_demand` tier refuses any single request above its TPM\n  cap even with a full rate-limit bucket — retrying can never help). Set\n  `max_request_tokens:` per model (or `LLM_MAX_REQUEST_TOKENS` globally) and the"
+      ],
+      "score": {
+        "fact_coverage": 0.5,
+        "hit": [
+          "TPM"
+        ],
+        "missed": [
+          "8000"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": true,
+        "refused": null,
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": true,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "grounded",
+        "cited_files": [
+          "README.md"
+        ],
+        "retrieved_files": [
+          "README.md"
+        ],
+        "passed": false
+      }
+    },
+    {
+      "index": 4,
+      "question": "Почему Groq начинает отдавать 429?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": true,
+      "answer": "# Почему Groq возвращает 429 (Too Many Requests)\n\n## Основные причины\n\n### 1. **Rate Limiting (Ограничение скорости)**\n```javascript\n// Groq имеет лимиты запросов в минуту/секунду\n// Обычно: ~100-1000 запросов/мин в зависимости от тарифа\n```\n\n### 2. **Слишком частые запросы**\n```javascript\n// ❌ Плохо: цикл с запросами без пауз\nfor (let i = 0; i < 100; i++) {\n  client.query(`*[_type == \"post\"]{_id}`); // 100 запросов подряд\n}\n\n// ✅ Лучше: пагинация или batched запросы\n```\n\n### 3. **Долгие запросы + высокая нагрузка**\n```javascript\n// Тяжёлый запрос, который блокирует ресурсы\nclient.query(`*[_type == \"large_dataset\"]{\n  ...,\n  \"related\": *[references(^._id)]{...}  // ← N+1 проблема\n}`);\n```\n\n---\n\n## Как диагностировать\n\n```javascript\n// Проверьте заголовки ответа\nfetch('https://your-project.sanity.io/v2023-05-03/data/query/production')\n  .then(res => {\n    console.log(res.headers.get('x-ratelimit-limit'));   // лимит\n    console.log(res.headers.get('x-ratelimit-remaining')); // осталось\n    console.log(res.headers.get('retry-after'));          // когда можно повторить\n  });\n```\n\n---\n\n## Решения\n\n### 1. **Экспоненциальная задержка (Backoff)**\n```javascript\nasync function queryWithRetry(query, options = {}, maxRetries = 5) {\n  let attempt = 0;\n\n  while (attempt < maxRetries) {\n    try {\n      return await client.query(query, options);\n    } catch (error) {\n      if (error.statusCode === 429 && attempt < maxRetries - 1) {\n        const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s, 8s, 16s\n        await new Promise(resolve => setTimeout(resolve, delay));\n        attempt++;\n      } else {\n        throw error;\n      }\n    }\n  }\n}\n```\n\n### 2. **Оптимизация запросов**\n```javascript\n// ❌ Плохо: выбирает всё\n*[_type == \"post\"]{_id, title}\n\n// ✅ Лучше: лимитируйте и фильтруйте\n*[_type == \"post\" && _createdAt > $date][0..20]{_id, title}\n\n// ✅ Ещё лучше: используйте @client для кэширования\n```\n\n### 3. **Batched запросы**\n```javascript\n// Вместо 100 отдельных запросов — один с массивом ID\nconst ids = Array.from({length: 100}, (_, i) => `post${i}`);\nconst posts = await client.fetch(\n  `*[_id in $ids]`,\n  { ids }\n);\n```\n\n### 4. **Serverless: используйте Edge Config / CDN**\n```javascript\n// Для статических данных — кэшируйте на CDN\nimport { createClient } from '@sanity/client';\n\nconst client = createClient({\n  projectId: 'xxx',\n  dataset: 'production',\n  apiVersion: '2023-05-03',\n  // Включите кэширование на CDN\n  perspective: 'published',\n});\n```\n\n---\n\n## Проверьте также\n\n| Причина | Как проверить |\n|---------|---------------|\n| Неправильный `apiVersion` | Устаревший API = другие лимиты |\n| Проблемы с аутентификацией | Проверьте токен в `sanity.cli` |\n| Региональные ограничения | Запросы из разных регионов могут считаться отдельно |\n| Large mutations | Записи тоже имеют лимиты |\n\n---\n\n## Быстрая проверка лимитов\n\n```bash\n# Посмотреть текущие лимиты проекта\nsanity limits --project <projectId>\n```\n\nЕсли лимиты критичны — рассмотрите **GROQ CDN** или **Edge Functions** для кэширования.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 13,
+      "elapsed": 4.712799524073489,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [],
+      "score": {
+        "fact_coverage": 0.0,
+        "hit": [],
+        "missed": [
+          "8000",
+          "TPM"
+        ],
+        "retrieval_hit": false,
+        "citation_hit": false,
+        "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
+      "index": 5,
+      "question": "Какой max_request_tokens у модели groq/openai/gpt-oss-120b?",
+      "corpus": "repo",
+      "mode": "rag",
+      "answerable": false,
+      "answer": "Не нашёл ответа в контексте.\n\nВ предоставленных фрагментах упоминается модель `openai/gpt-oss-120b` в контексте сравнения моделей по уровням (weak/medium/strong) [3], но конкретное значение [цитата не подтверждена] для этой модели не указано.\n\nУточните, пожалуйста, о каком именно документе идёт речь — возможно, это настройки провайдера в [цитата не подтверждена] или другой конфигурационный файл?\nИсточник:\n[3] README.md:1286-1291 — llm-bot > Comparing models by tier (weak / medium / strong) · chunk structure-000-205",
+      "retrieved": [
+        "README.md:380-393",
+        "plans/agent.md:73-81",
+        "README.md:1286-1291",
+        "README.md:634-637"
+      ],
+      "context_tokens": 596,
+      "prompt_tokens": 615,
+      "elapsed": 1.348135540029034,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [
+        "```\n[details] POST https://api.openai.com/v1/chat/completions\n[details] model: gpt-4o-mini\n[details] request body:\n           {\n             \"model\": \"gpt-4o-mini\",\n             \"messages\": [\n               {\"role\": \"user\", \"content\": \"Hello\"}\n             ]\n           }\n[details] attempt 1: HTTP 200 in 320ms\n[details] usage: prompt_tokens=8 completion_tokens=5 total_tokens=13\n```",
+        "model: llama3.2\n    provider: openai\n  gigachat-max:\n    provider: gigachat\n    model: GigaChat-2-Max\n    client_id: ${GIGACHAT_CLIENT_ID}\n    client_secret: ${GIGACHAT_CLIENT_SECRET}\n```",
+        "--models openai/gpt-oss-20b,openai/gpt-oss-120b,qwen/qwen3.8-27b\n\n# Prices for a paid provider (USD per 1M input/output tokens); repeatable\n.venv/bin/python scripts/compare_models.py --price \"gpt-4o=2.50,10.00\"\n\n# Use GigaChat (auth comes from GIGACHAT_* env vars)",
+        "The live LLM leg needs a provider quota that fits two rounds of a\n~24-point series (Groq's free 8000 TPM returns 429) and a model that\nfollows text protocols — models tuned for native tool-calling (e.g. the\n`liquid` agent's) reply in Hermes `tool_call` syntax that the plain-chat"
+      ],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": true,
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [
+          "max_request_tokens",
+          "data/models.yaml"
+        ],
+        "unchecked_quotes": [
+          "openai/gpt-oss-120b"
+        ],
+        "grounding": "refused",
+        "cited_files": [
+          "README.md"
+        ],
+        "retrieved_files": [
+          "README.md",
+          "plans/agent.md"
+        ],
+        "passed": true
+      }
+    },
+    {
+      "index": 5,
+      "question": "Какой max_request_tokens у модели groq/openai/gpt-oss-120b?",
+      "corpus": "repo",
+      "mode": "no_rag",
+      "answerable": false,
+      "answer": "Я не располагаю точной информацией о значении `max_request_tokens` для модели `gpt-oss-120b` в API Groq/OpenAI.\n\n## Что я знаю:\n\n| Параметр | Значение |\n|----------|----------|\n| Модель | `gpt-oss-120b` (разработана OpenAI, размещена на Groq) |\n| Размер | 120 млрд параметров |\n| Тип | Mixture of Experts (MoE) |\n\n## Рекомендации:\n\n1. **Проверьте документацию Groq API** — там указаны лимиты для каждой модели\n2. **Проверьте через API**:\n   ```bash\n   curl https://api.groq.com/openai/v1/models \\\n     -H \"Authorization: Bearer $GROQ_API_KEY\"\n   ```\n   и найдите `gpt-oss-120b` в ответе — там будет `max_tokens` или подобное поле\n\n3. **Обратитесь в поддержку Groq** — для новых моделей лимиты могут быть скорректированы\n\n## Примерный порядок:\n\nДля моделей такого класса обычно:\n- `max_tokens`: 128K–256K (или больше для reasoning-моделей)\n- `max_request_tokens`: часто совпадает с `max_tokens` или чуть меньше\n\nЕсли у вас есть доступ к API, покажите вывод команды выше — помогу разобраться.",
+      "retrieved": [],
+      "context_tokens": 0,
+      "prompt_tokens": 19,
+      "elapsed": 4.303637546021491,
+      "error": "",
+      "reranked": 0,
+      "filtered": 0,
+      "scored": [],
+      "chunk_texts": [],
+      "score": {
+        "fact_coverage": 1.0,
+        "hit": [],
+        "missed": [],
+        "retrieval_hit": null,
+        "citation_hit": null,
+        "refused": false,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
+        "cited_files": [],
+        "retrieved_files": [],
+        "passed": false
+      }
+    },
+    {
       "index": 6,
       "question": "Сколько стоит фирменный напиток «Тростниковый крем»?",
       "corpus": "kb",
       "mode": "rag",
       "answerable": true,
-      "answer": "Фирменный напиток «Тростниковый крем» стоит **190 ₽** (объём 300 мл).\n\n[файл: kofeinya_zerna.md:14]",
+      "answer": "Фирменный напиток «Тростниковый крем» стоит 190 ₽ [2] «Тростниковый крем | 300 мл | 190 ₽».\nИсточник:\n[2] kofeinya_zerna.md:6-17 — Зёрна — кофейня на Малой Садовой, 14 > Меню > Напитки · chunk structure-001-001",
       "retrieved": [
         "kofeinya_zerna.md:18-24",
         "kofeinya_zerna.md:6-17",
         "kofeinya_zerna.md:25-31",
         "delivery.md:16-22"
       ],
-      "context_tokens": 436,
-      "prompt_tokens": 453,
-      "elapsed": 1.2719857969786972,
+      "context_tokens": 490,
+      "prompt_tokens": 507,
+      "elapsed": 1.2832516699563712,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [
+        "### Сиропы\n\n- Карамельный — 40 ₽ добавки.\n- Тростниковый — 40 ₽ добавки. Используется в фирменном напитке «Тростниковый крем».\n- Ореховый — 50 ₽ добавки.\n- Сиропы не входят в стоимость напитка и добавляются по желанию гостя.",
+        "## Меню\n\n### Напитки\n\n| Напиток | Объём | Цена |\n| --- | --- | --- |\n| Эспрессо | 30 мл | 120 ₽ |\n| Флэт уайт | 250 мл | 260 ₽ |\n| Капучино | 300 мл | 240 ₽ |\n| Раф на овсяном | 300 мл | 290 ₽ |\n| Тростниковый крем | 300 мл | 190 ₽ |",
+        "### Выпечка\n\n- Круассан с миндалём — 180 ₽.\n- Бадмин-брутч с хамоном — 320 ₽.\n- Чизкейк — 350 ₽.\n- Веганский кекс — 300 ₽.",
+        "## Упаковка\n\n- Стаканы на вынос — только бумажные, крышка — герметичная пластиковая.\n- Двойной стакан — обязателен для напитков с молоком без пены и для горячего\n  чая.\n- Крышку крепят скотчем к стакану, если стакан выше 300 мл."
+      ],
       "score": {
         "fact_coverage": 1.0,
         "hit": [
@@ -170,116 +632,20 @@
         ],
         "missed": [],
         "retrieval_hit": true,
-        "citation_hit": false,
+        "citation_hit": true,
         "refused": null,
-        "cited_files": [],
-        "retrieved_files": [
-          "delivery.md",
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": true,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [
+          "Тростниковый крем"
+        ],
+        "grounding": "grounded",
+        "cited_files": [
           "kofeinya_zerna.md"
         ],
-        "passed": true
-      }
-    },
-    {
-      "index": 6,
-      "question": "Сколько стоит фирменный напиток «Тростниковый крем»?",
-      "corpus": "kb",
-      "mode": "rag_rerank",
-      "answerable": true,
-      "answer": "Фирменный напиток «Тростниковый крем» стоит **190 ₽** (объём 300 мл) [kofeinya_zerna.md:14].",
-      "retrieved": [
-        "kofeinya_zerna.md:18-24",
-        "kofeinya_zerna.md:6-17",
-        "delivery.md:1-9",
-        "kofeinya_zerna.md:25-31"
-      ],
-      "context_tokens": 456,
-      "prompt_tokens": 473,
-      "elapsed": 1.059923755005002,
-      "error": "",
-      "reranked": 17,
-      "filtered": 0,
-      "scored": [
-        [
-          "kofeinya_zerna.md:18-24",
-          3.626082181930542
-        ],
-        [
-          "kofeinya_zerna.md:6-17",
-          -1.5007299184799194
-        ],
-        [
-          "delivery.md:1-9",
-          -4.002162933349609
-        ],
-        [
-          "kofeinya_zerna.md:25-31",
-          -4.45434045791626
-        ],
-        [
-          "delivery.md:16-22",
-          -6.8193254470825195
-        ],
-        [
-          "kofeinya_zerna.md:61-69",
-          -7.185192108154297
-        ],
-        [
-          "kofeinya_zerna.md:77-83",
-          -7.971144676208496
-        ],
-        [
-          "delivery.md:10-15",
-          -8.786028861999512
-        ],
-        [
-          "kofeinya_zerna.md:70-76",
-          -9.221904754638672
-        ],
-        [
-          "kofeinya_zerna.md:39-44",
-          -9.435196876525879
-        ],
-        [
-          "kofeinya_zerna.md:50-51",
-          -9.465629577636719
-        ],
-        [
-          "kofeinya_zerna.md:1-5",
-          -9.564608573913574
-        ],
-        [
-          "kofeinya_zerna.md:84-88",
-          -9.701882362365723
-        ],
-        [
-          "delivery.md:23-28",
-          -9.722397804260254
-        ],
-        [
-          "kofeinya_zerna.md:45-49",
-          -9.76297664642334
-        ],
-        [
-          "kofeinya_zerna.md:32-38",
-          -9.997427940368652
-        ],
-        [
-          "kofeinya_zerna.md:52-60",
-          -10.393921852111816
-        ]
-      ],
-      "score": {
-        "fact_coverage": 1.0,
-        "hit": [
-          "190",
-          "300"
-        ],
-        "missed": [],
-        "retrieval_hit": true,
-        "citation_hit": false,
-        "refused": null,
-        "cited_files": [],
         "retrieved_files": [
           "delivery.md",
           "kofeinya_zerna.md"
@@ -293,15 +659,16 @@
       "corpus": "kb",
       "mode": "no_rag",
       "answerable": true,
-      "answer": "Я не располагаю актуальной информацией о ценах на напитки в конкретных заведениях, так как у меня нет доступа к базам данных ресторанов или кафе.\n\nЧтобы узнать стоимость «Тростникового крема», рекомендую:\n\n- **Позвонить в интересующее вас заведение** — обычно в меню или на сайте указаны телефоны\n- **Проверить официальный сайт или приложение** заведения\n- **Уточнить при личном визите**\n\nЕсли вы расскажете, в каком кафе или ресторане подают этот напиток, я постараюсь помочь с другой информацией о заведении.",
+      "answer": "Я не располагаю актуальной информацией о ценах на напитки, так как у меня нет доступа к базам данных ресторанов или кафе.\n\nЧтобы узнать стоимость «Тростникового крема», рекомендую:\n\n- **Позвонить в конкретное заведение** — цены могут отличаться в зависимости от города и формата (кафе, ресторан, фастфуд)\n- **Проверить сайт или приложение** заведения\n- **Уточнить у персонала** при посещении\n\nЕсли вы имеете в виду конкретную сеть (например, «Бургер Кинг», «KFC», «Starbucks» или другое), уточните — возможно, я смогу подсказать примерный диапазон цен.",
       "retrieved": [],
       "context_tokens": 0,
       "prompt_tokens": 17,
-      "elapsed": 1.7257864760467783,
+      "elapsed": 2.7024462330155075,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [],
       "score": {
         "fact_coverage": 0.0,
         "hit": [],
@@ -312,6 +679,13 @@
         "retrieval_hit": false,
         "citation_hit": false,
         "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
         "cited_files": [],
         "retrieved_files": [],
         "passed": false
@@ -323,126 +697,25 @@
       "corpus": "kb",
       "mode": "rag",
       "answerable": true,
-      "answer": "Кофейня работает в воскресенье с 9:00 до 21:00.\n\n[файл: kofeinya_zerna.md:43]",
+      "answer": "Кофейня работает в воскресенье до 21:00 [4] «Воскресенье: 9:00 — 21:00».\nИсточник:\n[4] kofeinya_zerna.md:39-44 — Зёрна — кофейня на Малой Садовой, 14 > Часы работы > Выходные · chunk structure-001-005",
       "retrieved": [
         "kofeinya_zerna.md:32-38",
         "kofeinya_zerna.md:45-49",
         "delivery.md:10-15",
         "kofeinya_zerna.md:39-44"
       ],
-      "context_tokens": 377,
-      "prompt_tokens": 394,
-      "elapsed": 1.2953924130415544,
+      "context_tokens": 431,
+      "prompt_tokens": 448,
+      "elapsed": 1.297769687953405,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
-      "score": {
-        "fact_coverage": 1.0,
-        "hit": [
-          "9:00",
-          "21:00"
-        ],
-        "missed": [],
-        "retrieval_hit": true,
-        "citation_hit": false,
-        "refused": null,
-        "cited_files": [],
-        "retrieved_files": [
-          "delivery.md",
-          "kofeinya_zerna.md"
-        ],
-        "passed": true
-      }
-    },
-    {
-      "index": 7,
-      "question": "До какого времени кофейня работает в воскресенье?",
-      "corpus": "kb",
-      "mode": "rag_rerank",
-      "answerable": true,
-      "answer": "Кофейня «Зёрна» работает в воскресенье с 9:00 до 21:00 [kofeinya_zerna.md:39-44].",
-      "retrieved": [
-        "kofeinya_zerna.md:39-44",
-        "kofeinya_zerna.md:32-38",
-        "kofeinya_zerna.md:61-69",
-        "kofeinya_zerna.md:45-49"
-      ],
-      "context_tokens": 412,
-      "prompt_tokens": 429,
-      "elapsed": 1.0210005179978907,
-      "error": "",
-      "reranked": 17,
-      "filtered": 0,
-      "scored": [
-        [
-          "kofeinya_zerna.md:39-44",
-          3.8689262866973877
-        ],
-        [
-          "kofeinya_zerna.md:32-38",
-          1.1452758312225342
-        ],
-        [
-          "kofeinya_zerna.md:61-69",
-          -3.6168406009674072
-        ],
-        [
-          "kofeinya_zerna.md:45-49",
-          -3.915473222732544
-        ],
-        [
-          "delivery.md:10-15",
-          -4.224453926086426
-        ],
-        [
-          "kofeinya_zerna.md:77-83",
-          -6.412065029144287
-        ],
-        [
-          "kofeinya_zerna.md:1-5",
-          -7.6239848136901855
-        ],
-        [
-          "kofeinya_zerna.md:84-88",
-          -7.744081974029541
-        ],
-        [
-          "kofeinya_zerna.md:70-76",
-          -8.158921241760254
-        ],
-        [
-          "kofeinya_zerna.md:50-51",
-          -8.458175659179688
-        ],
-        [
-          "kofeinya_zerna.md:52-60",
-          -8.759190559387207
-        ],
-        [
-          "kofeinya_zerna.md:18-24",
-          -9.371140480041504
-        ],
-        [
-          "kofeinya_zerna.md:25-31",
-          -9.450605392456055
-        ],
-        [
-          "delivery.md:1-9",
-          -9.461129188537598
-        ],
-        [
-          "kofeinya_zerna.md:6-17",
-          -9.551447868347168
-        ],
-        [
-          "delivery.md:23-28",
-          -9.644654273986816
-        ],
-        [
-          "delivery.md:16-22",
-          -9.808674812316895
-        ]
+      "chunk_texts": [
+        "## Часы работы\n\n### Будни\n\n- Понедельник — пятница: 8:00 — 22:00.\n- Смена бариста начинается в 7:30.",
+        "### Праздники\n\nВ дни государственных праздников кофейня закрыта. Перед праздничными выходными\nрасписание публикуется в закреплённом сообщении Telegram-канала за сутки.",
+        "## Самовывоз\n\n- Самовывоз из кофейни на Малой Садовой, 14 — без ожидания.\n- Заказ можно забрать в течение 40 минут после приготовления, дальше напиток\n  не хранят.",
+        "### Выходные\n\n- Суббота: 9:00 — 23:00.\n- Воскресенье: 9:00 — 21:00.\n- Банковский перевод в воскресенье не работает."
       ],
       "score": {
         "fact_coverage": 1.0,
@@ -454,10 +727,18 @@
         "retrieval_hit": true,
         "citation_hit": true,
         "refused": null,
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": true,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "grounded",
         "cited_files": [
           "kofeinya_zerna.md"
         ],
         "retrieved_files": [
+          "delivery.md",
           "kofeinya_zerna.md"
         ],
         "passed": true
@@ -469,15 +750,16 @@
       "corpus": "kb",
       "mode": "no_rag",
       "answerable": true,
-      "answer": "Я не располагаю информацией о конкретной кофейне, о которой вы спрашиваете. Уточните, пожалуйста:\n\n- **Название кофейни** (если это сеть — какая именно)\n- **Город или адрес**\n\nТогда я смогу проверить актуальное расписание работы на воскресенье.",
+      "answer": "Я не располагаю информацией о конкретной кофейне, о которой вы спрашиваете. Уточните, пожалуйста:\n\n- **Название кофейни** (если это сеть — какая именно)\n- **Город или адрес**\n\nТогда я смогу проверить режим работы или подсказать, как уточнить эту информацию.",
       "retrieved": [],
       "context_tokens": 0,
       "prompt_tokens": 17,
-      "elapsed": 1.0909973710076883,
+      "elapsed": 1.1734572210116312,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [],
       "score": {
         "fact_coverage": 0.0,
         "hit": [],
@@ -488,6 +770,13 @@
         "retrieval_hit": false,
         "citation_hit": false,
         "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
         "cited_files": [],
         "retrieved_files": [],
         "passed": false
@@ -499,20 +788,26 @@
       "corpus": "kb",
       "mode": "rag",
       "answerable": true,
-      "answer": "По контексту:\n\n**Что делать:**\n- Бариста обязаны предупредить гостя о составе сиропа **до** приготовления, а не после [kofeinya_zerna.md:58-59]\n- Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или воду и не предлагает альтернативу «на глаз» [kofeinya_zerna.md:60]\n\n**Когда:**\n- До приготовления напитка — предупредить о составе сиропа [kofeinya_zerna.md:58-59]\n\nТакже по аллергии на орехи:\n- Ореховый сироп содержит фундук и миндаль, при аллергии на орехи его не предлагают, а напиток делают без него [kofeinya_zerna.md:52-53]\n- Миндаль в круассане — отдельный компонент, не «возможный след» [kofeinya_zerna.md:54]",
+      "answer": "Гостю с аллергией на орехи нужно:\n\n- Не предлагать ореховый сироп (он содержит фундук и миндаль) [2] «Ореховый сироп содержит фундук иминдаль. При аллергии на орехи его не предлагают, а напиток делают без него» [2]\n- Бариста обязан предупредить гостя о составе сиропа **до** приготовления, а не после [2] «Бариста обязаны предупредить гостя о составе сиропа **до** приготовления, а не после» [2]\n- Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или воду и не предлагает альтернативу «на глаз» [2] «Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или воду и не предлагает альтернативу «на глаз»» [2]\nИсточник:\n[2] kofeinya_zerna.md:52-60 — Зёрна — кофейня на Малой Садовой, 14 > Гости с аллергией · chunk structure-001-008",
       "retrieved": [
         "kofeinya_zerna.md:50-51",
         "kofeinya_zerna.md:52-60",
         "kofeinya_zerna.md:77-83",
         "kofeinya_zerna.md:18-24"
       ],
-      "context_tokens": 464,
-      "prompt_tokens": 482,
-      "elapsed": 2.0596711699618027,
+      "context_tokens": 518,
+      "prompt_tokens": 536,
+      "elapsed": 3.2581876850454137,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [
+        "## Гости с аллергией",
+        "- Ореховый сироп содержит фундук иминдаль. При аллергии на орехи его не\n  предлагают, а напиток делают без него.\n- Миндаль в круассане — отдельный компонент, не «возможный след».\n- Веганский кекс не содержит молока и яиц.\n- Бариста обязаны предупредить гостя о составе сиропа **до** приготовления,\n  а не после.\n- Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или\n  воду и не предлагает альтернативу «на глаз».",
+        "### Жалобы гостей\n\n1. Выслушать и поблагодарить за обратную связь.\n2. Записать имя гостя, суть жалобы и время.\n3. Предложить замену напитка или скидку 20%.\n4. Сообщить менеджеру до конца смены.",
+        "### Сиропы\n\n- Карамельный — 40 ₽ добавки.\n- Тростниковый — 40 ₽ добавки. Используется в фирменном напитке «Тростниковый крем».\n- Ореховый — 50 ₽ добавки.\n- Сиропы не входят в стоимость напитка и добавляются по желанию гостя."
+      ],
       "score": {
         "fact_coverage": 1.0,
         "hit": [
@@ -523,119 +818,17 @@
         "retrieval_hit": true,
         "citation_hit": true,
         "refused": null,
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": true,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "grounded",
         "cited_files": [
           "kofeinya_zerna.md"
         ],
         "retrieved_files": [
-          "kofeinya_zerna.md"
-        ],
-        "passed": true
-      }
-    },
-    {
-      "index": 8,
-      "question": "Что нужно сделать гостю с аллергией на орехи и когда?",
-      "corpus": "kb",
-      "mode": "rag_rerank",
-      "answerable": true,
-      "answer": "[файл:kofeinya_zerna.md:52-60]\n\nПри аллергии на орехи гостю **не предлагают** ореховый сироп, а напиток делают **без него**. Бариста обязаны предупредить гостя о составе сиропа **до** приготовления, а не после. Если гость сообщил об аллергии, бариста заменяет напиток на эспрессо или воду и не предлагает альтернативу «на глаз».",
-      "retrieved": [
-        "kofeinya_zerna.md:52-60",
-        "delivery.md:16-22",
-        "kofeinya_zerna.md:61-69",
-        "kofeinya_zerna.md:77-83"
-      ],
-      "context_tokens": 526,
-      "prompt_tokens": 544,
-      "elapsed": 1.3372245508944616,
-      "error": "",
-      "reranked": 17,
-      "filtered": 0,
-      "scored": [
-        [
-          "kofeinya_zerna.md:52-60",
-          -0.2786934971809387
-        ],
-        [
-          "delivery.md:16-22",
-          -6.027927875518799
-        ],
-        [
-          "kofeinya_zerna.md:61-69",
-          -6.248216152191162
-        ],
-        [
-          "kofeinya_zerna.md:77-83",
-          -6.32452392578125
-        ],
-        [
-          "kofeinya_zerna.md:70-76",
-          -6.829304218292236
-        ],
-        [
-          "kofeinya_zerna.md:18-24",
-          -6.975230693817139
-        ],
-        [
-          "kofeinya_zerna.md:25-31",
-          -7.282742977142334
-        ],
-        [
-          "delivery.md:10-15",
-          -7.319916248321533
-        ],
-        [
-          "kofeinya_zerna.md:39-44",
-          -7.9905104637146
-        ],
-        [
-          "kofeinya_zerna.md:6-17",
-          -8.09127426147461
-        ],
-        [
-          "delivery.md:23-28",
-          -8.160202980041504
-        ],
-        [
-          "kofeinya_zerna.md:32-38",
-          -8.179205894470215
-        ],
-        [
-          "kofeinya_zerna.md:84-88",
-          -8.2544527053833
-        ],
-        [
-          "kofeinya_zerna.md:50-51",
-          -9.037206649780273
-        ],
-        [
-          "delivery.md:1-9",
-          -9.079507827758789
-        ],
-        [
-          "kofeinya_zerna.md:45-49",
-          -9.08712387084961
-        ],
-        [
-          "kofeinya_zerna.md:1-5",
-          -9.25390625
-        ]
-      ],
-      "score": {
-        "fact_coverage": 1.0,
-        "hit": [
-          "орех",
-          "до приготовления"
-        ],
-        "missed": [],
-        "retrieval_hit": true,
-        "citation_hit": false,
-        "refused": null,
-        "cited_files": [
-          "файл:kofeinya_zerna.md"
-        ],
-        "retrieved_files": [
-          "delivery.md",
           "kofeinya_zerna.md"
         ],
         "passed": true
@@ -647,15 +840,16 @@
       "corpus": "kb",
       "mode": "no_rag",
       "answerable": true,
-      "answer": "## Что делать гостю с аллергией на орехи\n\n### **Перед визитом**\n- **Предупредить хозяина** о своей аллергии и степени тяжести (сыпь, отёк, анафилаксия)\n- Уточнить, **будут ли орехи в блюдах** — даже в скрытой форме (масла, мука, соусы, выпечка)\n- Узнать, **где готовится еда** — риск перекрёстного загрязнения на кухне\n\n### **Во время визита**\n- **Не стесняться** ещё раз напомнить о своей аллергии\n- **Не есть** то, что не уверен в составе\n- **Иметь при себе** антигистаминное средство и, если назначено врачом, адреналин (Эпипен)\n- **Наблюдать** за реакцией — первые симптомы (зуд, покалывание, отёк) могут появиться быстро\n\n### **Если произошла реакция**\n1. **Прекратить приём пищи**\n2. **Принять антигистаминное** (если есть)\n3. **Вызвать скорую**, если:\n   - Затруднено дыхание\n   - Отёк языка/горла\n   - Появилась сыпь по всему телу\n   - Тошнота, рвота, головокружение\n\n---\n\n**Важно:** аллергия на орехи — одна из самых опасных. Даже микроскопическое количество может вызвать анафилаксию. Лучше перестраховаться, чем рисковать здоровьем.",
+      "answer": "## Что делать гостю с аллергией на орехи\n\n### **До мероприятия**\n- **Предупредить организаторов** о своей аллергии (количество, вид орехов, тяжесть реакции)\n- Уточнить, будут ли подавать блюда с орехами, и попросить исключить их из меню\n- Уточнить, будут ли орехи в составе соусов, выпечке, десертах\n\n### **На месте**\n- **Проверять состав блюд** — орехи могут быть скрыты (пралине, миндальная мука, ореховое масло, соус песто)\n- Спрашивать персонал о наличии орехов в конкретном блюде\n- Избегать блюд, где орехи не указаны в меню\n\n### **Если реакция началась**\n- **Немедленно сообщить** о симптомах (зуд, отёк, затруднённое дыхание)\n- При сильной реакции — вызвать скорую помощь\n- Иметь при себе антигистаминное средство и, если назначено врачом, адреналин (эпипен)\n\n### **Важно**\n- Аллергия на орехи — одна из самых тяжёлых и может вызывать анафилаксию\n- Не стесняйтесь повторно уточнять — лучше переспросить, чем рисковать здоровьем\n\nНужна помощь с конкретной ситуацией (ресторан, вечеринка, путешествие)?",
       "retrieved": [],
       "context_tokens": 0,
       "prompt_tokens": 18,
-      "elapsed": 2.230583902914077,
+      "elapsed": 4.369402282987721,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [],
       "score": {
         "fact_coverage": 0.5,
         "hit": [
@@ -667,6 +861,13 @@
         "retrieval_hit": false,
         "citation_hit": false,
         "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
         "cited_files": [],
         "retrieved_files": [],
         "passed": false
@@ -678,129 +879,25 @@
       "corpus": "kb",
       "mode": "rag",
       "answerable": true,
-      "answer": "Минимальная сумма заказа для собственной доставки — 700 ₽. Доставка бесплатна от 1500 ₽.\n\n[delivery.md:1-9]",
+      "answer": "Минимальная сумма заказа для собственной доставки — 700 ₽, а доставка бесплатна от 1500 ₽ [1] «Минимальная сумма заказа для собственной доставки — 700 ₽» и «от 1500 ₽ — бесплатно».\nИсточник:\n[1] delivery.md:1-9 — Доставка и самовывоз — Зёрна > Зоны доставки · chunk structure-000-000",
       "retrieved": [
         "delivery.md:1-9",
         "delivery.md:10-15",
         "kofeinya_zerna.md:6-17",
         "kofeinya_zerna.md:25-31"
       ],
-      "context_tokens": 437,
-      "prompt_tokens": 459,
-      "elapsed": 1.3177653760649264,
+      "context_tokens": 491,
+      "prompt_tokens": 513,
+      "elapsed": 1.130332158994861,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
-      "score": {
-        "fact_coverage": 1.0,
-        "hit": [
-          "700",
-          "1500",
-          "150"
-        ],
-        "missed": [],
-        "retrieval_hit": true,
-        "citation_hit": true,
-        "refused": null,
-        "cited_files": [
-          "delivery.md"
-        ],
-        "retrieved_files": [
-          "delivery.md",
-          "kofeinya_zerna.md"
-        ],
-        "passed": true
-      }
-    },
-    {
-      "index": 9,
-      "question": "Какая минимальная сумма заказа для доставки и когда доставка бесплатна?",
-      "corpus": "kb",
-      "mode": "rag_rerank",
-      "answerable": true,
-      "answer": "Минимальная сумма заказа для собственной доставки — 700 ₽. Доставка бесплатна от 1500 ₽ [delivery.md:1-9].",
-      "retrieved": [
-        "delivery.md:1-9",
-        "kofeinya_zerna.md:25-31",
-        "delivery.md:16-22",
-        "delivery.md:10-15"
-      ],
-      "context_tokens": 431,
-      "prompt_tokens": 453,
-      "elapsed": 1.4187579849967733,
-      "error": "",
-      "reranked": 17,
-      "filtered": 0,
-      "scored": [
-        [
-          "delivery.md:1-9",
-          1.8634706735610962
-        ],
-        [
-          "kofeinya_zerna.md:25-31",
-          -6.254920482635498
-        ],
-        [
-          "delivery.md:16-22",
-          -6.765974521636963
-        ],
-        [
-          "delivery.md:10-15",
-          -7.007176399230957
-        ],
-        [
-          "kofeinya_zerna.md:18-24",
-          -7.475822925567627
-        ],
-        [
-          "kofeinya_zerna.md:61-69",
-          -7.539262771606445
-        ],
-        [
-          "delivery.md:23-28",
-          -7.820362091064453
-        ],
-        [
-          "kofeinya_zerna.md:77-83",
-          -8.13615894317627
-        ],
-        [
-          "kofeinya_zerna.md:6-17",
-          -8.34707260131836
-        ],
-        [
-          "kofeinya_zerna.md:39-44",
-          -8.899397850036621
-        ],
-        [
-          "kofeinya_zerna.md:70-76",
-          -9.20323657989502
-        ],
-        [
-          "kofeinya_zerna.md:84-88",
-          -9.567952156066895
-        ],
-        [
-          "kofeinya_zerna.md:32-38",
-          -9.711339950561523
-        ],
-        [
-          "kofeinya_zerna.md:50-51",
-          -10.014679908752441
-        ],
-        [
-          "kofeinya_zerna.md:45-49",
-          -10.070595741271973
-        ],
-        [
-          "kofeinya_zerna.md:1-5",
-          -10.077765464782715
-        ],
-        [
-          "kofeinya_zerna.md:52-60",
-          -10.19936466217041
-        ]
+      "chunk_texts": [
+        "# Доставка и самовывоз — Зёрна\n\n## Зоны доставки\n\n- Собственная доставка курьером кофейни: Малый проспект и прилегающие улицы.\n- Минимальная сумма заказа для собственной доставки — 700 ₽.\n- Стоимость доставки — 150 ₽, от 1500 ₽ — бесплатно.\n- Сторонние агрегаторы не используются: на их картах кофейни нет.",
+        "## Самовывоз\n\n- Самовывоз из кофейни на Малой Садовой, 14 — без ожидания.\n- Заказ можно забрать в течение 40 минут после приготовления, дальше напиток\n  не хранят.",
+        "## Меню\n\n### Напитки\n\n| Напиток | Объём | Цена |\n| --- | --- | --- |\n| Эспрессо | 30 мл | 120 ₽ |\n| Флэт уайт | 250 мл | 260 ₽ |\n| Капучино | 300 мл | 240 ₽ |\n| Раф на овсяном | 300 мл | 290 ₽ |\n| Тростниковый крем | 300 мл | 190 ₽ |",
+        "### Выпечка\n\n- Круассан с миндалём — 180 ₽.\n- Бадмин-брутч с хамоном — 320 ₽.\n- Чизкейк — 350 ₽.\n- Веганский кекс — 300 ₽."
       ],
       "score": {
         "fact_coverage": 1.0,
@@ -813,6 +910,13 @@
         "retrieval_hit": true,
         "citation_hit": true,
         "refused": null,
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": true,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "grounded",
         "cited_files": [
           "delivery.md"
         ],
@@ -829,15 +933,16 @@
       "corpus": "kb",
       "mode": "no_rag",
       "answerable": true,
-      "answer": "К сожалению, у меня нет информации о минимальной сумме заказа и условиях бесплатной доставки — эти данные зависят от конкретного магазина или сервиса.\n\n**Где можно узнать:**\n- На сайте магазина в разделе «Доставка» или «Оплата»\n- В карточке товара (обычно указано рядом с ценой доставки)\n- По телефону горячей линии магазина\n- В личном кабинете при оформлении заказа\n\nЕсли уточните, о каком магазине или сервисе идёт речь, я постараюсь помочь найти актуальную информацию.",
+      "answer": "К сожалению, у меня нет информации о минимальной сумме заказа и условиях бесплатной доставки — эти данные зависят от конкретного магазина или сервиса.\n\n**Где можно узнать:**\n- На сайте магазина в разделе «Доставка» или «Условия»\n- При оформлении заказа в корзине\n- По телефону службы поддержки\n\nЕсли вы скажете, о каком магазине или сервисе идёт речь, я постараюсь помочь с информацией, если она есть в моих данных.",
       "retrieved": [],
       "context_tokens": 0,
       "prompt_tokens": 22,
-      "elapsed": 2.088760123006068,
+      "elapsed": 2.1663951810915023,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [],
       "score": {
         "fact_coverage": 0.0,
         "hit": [],
@@ -849,6 +954,13 @@
         "retrieval_hit": false,
         "citation_hit": false,
         "refused": null,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
         "cited_files": [],
         "retrieved_files": [],
         "passed": false
@@ -860,20 +972,26 @@
       "corpus": "kb",
       "mode": "rag",
       "answerable": false,
-      "answer": "В контексте нет информации о латте на кокосовом молоке. В базе знаний есть только напиток «Раф на овсяном» (300 мл, 290 ₽) [kofeinya_zerna.md:14], но нет упоминания кокосового молока или латте на нём.",
+      "answer": "Не нашёл ответа в контексте.\n\nВ базе есть информация о кофейне «Зёрна» на Малой Садовой, 14, но в предоставленных фрагментах нет упоминания латте на кокосовом молоке. В меню [2] указаны напитки: эспрессо, флэт уайт, капучино, раф на овсяном и тростниковый крем, а в разделе о молоке [3] упоминается овсяное и миндальное молоко как альтернативы.\n\nВозможно, вы имеете в виду другой напиток или другую кофейню? Уточните, пожалуйста, о каком именно заведении идёт речь.\nИсточники (фрагменты из ответа):\n[2] kofeinya_zerna.md:6-17 — Зёрна — кофейня на Малой Садовой, 14 > Меню > Напитки · chunk structure-001-001\n[3] kofeinya_zerna.md:70-76 — Зёрна — кофейня на Малой Садовой, 14 > Правила и стандарты > Молоко · chunk structure-001-010",
       "retrieved": [
         "kofeinya_zerna.md:18-24",
         "kofeinya_zerna.md:6-17",
         "kofeinya_zerna.md:70-76",
         "kofeinya_zerna.md:25-31"
       ],
-      "context_tokens": 435,
-      "prompt_tokens": 449,
-      "elapsed": 1.6995490730041638,
+      "context_tokens": 489,
+      "prompt_tokens": 503,
+      "elapsed": 2.1626087960321456,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [
+        "### Сиропы\n\n- Карамельный — 40 ₽ добавки.\n- Тростниковый — 40 ₽ добавки. Используется в фирменном напитке «Тростниковый крем».\n- Ореховый — 50 ₽ добавки.\n- Сиропы не входят в стоимость напитка и добавляются по желанию гостя.",
+        "## Меню\n\n### Напитки\n\n| Напиток | Объём | Цена |\n| --- | --- | --- |\n| Эспрессо | 30 мл | 120 ₽ |\n| Флэт уайт | 250 мл | 260 ₽ |\n| Капучино | 300 мл | 240 ₽ |\n| Раф на овсяном | 300 мл | 290 ₽ |\n| Тростниковый крем | 300 мл | 190 ₽ |",
+        "### Молоко\n\n- Молоко взбивается до 60 °C. Выше 70 °C оно расслаивается и вкус становится\n  варёным.\n- Альтернативное молоко (овсяное, миндальное) греется отдельно и не доводится\n  до кипения.",
+        "### Выпечка\n\n- Круассан с миндалём — 180 ₽.\n- Бадмин-брутч с хамоном — 320 ₽.\n- Чизкейк — 350 ₽.\n- Веганский кекс — 300 ₽."
+      ],
       "score": {
         "fact_coverage": 1.0,
         "hit": [],
@@ -881,112 +999,19 @@
         "retrieval_hit": null,
         "citation_hit": null,
         "refused": true,
-        "cited_files": [],
-        "retrieved_files": [
+        "sources_listed": true,
+        "citation_ok": true,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [
+          "Зёрна"
+        ],
+        "grounding": "refused",
+        "cited_files": [
           "kofeinya_zerna.md"
         ],
-        "passed": true
-      }
-    },
-    {
-      "index": 10,
-      "question": "Сколько стоит латте на кокосовом молоке?",
-      "corpus": "kb",
-      "mode": "rag_rerank",
-      "answerable": false,
-      "answer": "Не нашёл ответа в контексте.\n\nВ базе есть информация о напитке «Раф на овсяном» (290 ₽) и «Тростниковый крем» (190 ₽), но конкретного латте на кокосовом молоке в меню не указано. Возможно, это сезонный или временный напиток, не внесённый в текущее меню.",
-      "retrieved": [
-        "kofeinya_zerna.md:18-24",
-        "kofeinya_zerna.md:6-17",
-        "kofeinya_zerna.md:25-31",
-        "delivery.md:1-9"
-      ],
-      "context_tokens": 456,
-      "prompt_tokens": 470,
-      "elapsed": 1.1553671760484576,
-      "error": "",
-      "reranked": 17,
-      "filtered": 0,
-      "scored": [
-        [
-          "kofeinya_zerna.md:18-24",
-          -4.291315078735352
-        ],
-        [
-          "kofeinya_zerna.md:6-17",
-          -4.40592098236084
-        ],
-        [
-          "kofeinya_zerna.md:25-31",
-          -4.601174831390381
-        ],
-        [
-          "delivery.md:1-9",
-          -5.298301696777344
-        ],
-        [
-          "kofeinya_zerna.md:61-69",
-          -6.844669818878174
-        ],
-        [
-          "delivery.md:16-22",
-          -8.240694999694824
-        ],
-        [
-          "kofeinya_zerna.md:77-83",
-          -8.401671409606934
-        ],
-        [
-          "kofeinya_zerna.md:70-76",
-          -9.387879371643066
-        ],
-        [
-          "kofeinya_zerna.md:1-5",
-          -9.633112907409668
-        ],
-        [
-          "kofeinya_zerna.md:45-49",
-          -9.688569068908691
-        ],
-        [
-          "delivery.md:10-15",
-          -9.79066276550293
-        ],
-        [
-          "kofeinya_zerna.md:39-44",
-          -9.928205490112305
-        ],
-        [
-          "kofeinya_zerna.md:84-88",
-          -9.97443962097168
-        ],
-        [
-          "kofeinya_zerna.md:50-51",
-          -9.977206230163574
-        ],
-        [
-          "delivery.md:23-28",
-          -10.064888954162598
-        ],
-        [
-          "kofeinya_zerna.md:32-38",
-          -10.231289863586426
-        ],
-        [
-          "kofeinya_zerna.md:52-60",
-          -10.38867473602295
-        ]
-      ],
-      "score": {
-        "fact_coverage": 1.0,
-        "hit": [],
-        "missed": [],
-        "retrieval_hit": null,
-        "citation_hit": null,
-        "refused": true,
-        "cited_files": [],
         "retrieved_files": [
-          "delivery.md",
           "kofeinya_zerna.md"
         ],
         "passed": true
@@ -998,15 +1023,16 @@
       "corpus": "kb",
       "mode": "no_rag",
       "answerable": false,
-      "answer": "Цена латте на кокосовом молоке зависит от места:\n\n**В кофейнях:**\n- В России: 250–450 ₽ (в Москве/СПб дороже)\n- В Европе: €3,50–€6\n- В США: $4–$7\n\n**В рецептах для дома:**\n- Кокосовое молоко (банка 400 мл): 80–150 ₽\n- Эспрессо/кофе: 30–60 ₽\n- Молоко/сливки для микдофоама: 20–40 ₽\n- Сиропы, специи: 30–50 ₽\n- **Итого: ~160–300 ₽** за порцию\n\nГде вы планируете готовить — дома или в заведении?",
+      "answer": "Цена латте на кокосовом молоке зависит от места:\n\n**В кофейнях и кафе**\n- Обычно на 20–50% дороже обычного латте (кокосовое молоко — импортный продукт, дороже коровьего)\n- В среднем: **180–350 рублей** (в Москве/СПб), **150–280 грн** (Киев), **$3–6** (США/Европа)\n\n**В фастфуде и кофейных сетях**\n- Starbucks, McCafé, «Чёрная карта» — часто в меню как опция (+50–80₽ к базовой цене)\n\n**В домашних условиях**\n- Кокосовое молоко (баночка 400 мл) стоит **80–150₽**, хватает на 2–3 порции — выходит дешевле, чем в заведении\n\nЕсли интересует конкретный город или заведение — уточните, подскажу точнее.",
       "retrieved": [],
       "context_tokens": 0,
       "prompt_tokens": 14,
-      "elapsed": 7.171414644108154,
+      "elapsed": 1.8836851180531085,
       "error": "",
       "reranked": 0,
       "filtered": 0,
       "scored": [],
+      "chunk_texts": [],
       "score": {
         "fact_coverage": 1.0,
         "hit": [],
@@ -1014,6 +1040,13 @@
         "retrieval_hit": null,
         "citation_hit": null,
         "refused": false,
+        "sources_listed": false,
+        "citation_ok": false,
+        "quote_ok": false,
+        "unbacked_citations": [],
+        "paraphrased_quotes": [],
+        "unchecked_quotes": [],
+        "grounding": "ungrounded",
         "cited_files": [],
         "retrieved_files": [],
         "passed": false
@@ -1022,54 +1055,47 @@
   ],
   "summary": {
     "rag": {
-      "questions": 5,
-      "answered": 5,
+      "questions": 10,
+      "answered": 10,
       "errors": [],
-      "fact_coverage_mean": 1.0,
-      "fact_coverage_full": 4,
-      "answerable": 4,
+      "fact_coverage_mean": 0.812,
+      "fact_coverage_full": 6,
+      "answerable": 8,
       "refusal_rate": 1.0,
-      "unanswerable": 1,
-      "retrieval_hit_rate": 1.0,
-      "citation_rate": 0.5,
-      "passed": 5,
-      "pass_rate": 1.0,
-      "prompt_tokens_mean": 447.4,
-      "elapsed_mean": 1.53,
-      "context_tokens_mean": 429.8
-    },
-    "rag_rerank": {
-      "questions": 5,
-      "answered": 5,
-      "errors": [],
-      "fact_coverage_mean": 1.0,
-      "fact_coverage_full": 4,
-      "answerable": 4,
-      "refusal_rate": 1.0,
-      "unanswerable": 1,
-      "retrieval_hit_rate": 1.0,
-      "citation_rate": 0.5,
-      "passed": 5,
-      "pass_rate": 1.0,
-      "prompt_tokens_mean": 473.8,
-      "elapsed_mean": 1.2,
-      "context_tokens_mean": 456.2
+      "unanswerable": 2,
+      "retrieval_hit_rate": 0.75,
+      "citation_rate": 0.875,
+      "sources_rate": 0.875,
+      "verified_citation_rate": 0.875,
+      "verbatim_quote_rate": 0.875,
+      "unverified_quotes": 3,
+      "grounded_rate": 0.875,
+      "passed": 8,
+      "pass_rate": 0.8,
+      "prompt_tokens_mean": 567.9,
+      "elapsed_mean": 1.65,
+      "context_tokens_mean": 550.1
     },
     "no_rag": {
-      "questions": 5,
-      "answered": 5,
+      "questions": 10,
+      "answered": 10,
       "errors": [],
-      "fact_coverage_mean": 0.125,
-      "fact_coverage_full": 0,
-      "answerable": 4,
+      "fact_coverage_mean": 0.188,
+      "fact_coverage_full": 1,
+      "answerable": 8,
       "refusal_rate": 0.0,
-      "unanswerable": 1,
+      "unanswerable": 2,
       "retrieval_hit_rate": 0.0,
       "citation_rate": 0.0,
-      "passed": 0,
-      "pass_rate": 0.0,
-      "prompt_tokens_mean": 17.6,
-      "elapsed_mean": 2.86,
+      "sources_rate": 0.0,
+      "verified_citation_rate": 0.0,
+      "verbatim_quote_rate": 0.0,
+      "unverified_quotes": 0,
+      "grounded_rate": 0.0,
+      "passed": 1,
+      "pass_rate": 0.1,
+      "prompt_tokens_mean": 17.8,
+      "elapsed_mean": 3.14,
       "context_tokens_mean": 0.0
     }
   }
