@@ -67,7 +67,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from llm_bot.client import LLMClient, LLMError
 from llm_bot.factory import build_client
-from llm_bot.rag import Retriever
+from llm_bot.rag import (
+    SOURCES_HEADING,
+    UNSUPPORTED_QUOTE_TEXT,
+    CitationAudit,
+    Grounding,
+    GroundingVerdict,
+    QuoteAudit,
+    RagEvent,
+    RagHit,
+    Retriever,
+    finalize_answer,
+    is_refusal,
+    judge_grounding,
+)
 from llm_bot.rerank import (
     DEFAULT_RERANK_CANDIDATES,
     DEFAULT_RERANK_MODEL,
@@ -101,18 +114,15 @@ def modes_for(rerank: bool) -> tuple[str, ...]:
         return ("rag", RERANK_MODE, "no_rag")
     return MODES
 
-#: Phrases that count as "I did not find it". Deliberately broad: the point is
-#: to detect a confident fabrication, and a refusal rarely uses one fixed wording
-#: ("информации об этом нет" and "нет информации" are the same statement). A bare
-#: "нет" is NOT a match on its own — it appears inside perfectly confident
-#: answers ("в кофейне нет Wi-Fi") and would turn a fabrication into a pass.
-_REFUSAL_RE = re.compile(
-    r"(не наш[её]л|не нахожу|не могу найти|не смог найти|не удалось найти"
-    r"|информаци\w*[^.\n]{0,24}?нет\b|нет информации|не содержит"
-    r"|не упоминается|не указан\w*|не знаю|не в базе|не в документах"
-    r"|отсутствует|не встречается|за рамками (?:этой |моей )?базы)",
-    re.IGNORECASE,
-)
+# The refusal test lives in ``llm_bot.rag`` and is imported, not copied. This
+# file used to carry its own regex, so a phrasing change in the runtime left the
+# report scoring the same reply differently — and a report that disagrees with
+# the bot about whether an answer was a refusal is worse than no report.
+# Deliberately broad: the point is to detect a confident fabrication, and a
+# refusal rarely uses one fixed wording ("информации об этом нет" and "нет
+# информации" are the same statement). A bare "нет" is NOT a match on its own —
+# it appears inside perfectly confident answers ("в кофейне нет Wi-Fi") and
+# would turn a fabrication into a pass.
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +173,17 @@ class Case:
     reranked: int = 0
     filtered: int = 0
     scored: tuple[tuple[str, float], ...] = ()
+    #: Text of each retrieved chunk, in the same order as ``retrieved``. Kept so
+    #: a saved run can still be checked for verbatim quotes offline: the audit
+    #: asks whether a phrase is really in the chunk it was attributed to, and
+    #: the location alone cannot answer that.
+    chunk_texts: tuple[str, ...] = ()
+    #: Outcomes of the three checks the runtime applies. Held as the verdict
+    #: objects rather than the raw reply, because ``--from_json`` has to recompute
+    #: them from ``chunk_texts`` when the saved JSON predates them.
+    citations: CitationAudit | None = None
+    quotes: QuoteAudit | None = None
+    grounding: GroundingVerdict | None = None
 
     @property
     def retrieved_files(self) -> tuple[str, ...]:
@@ -362,8 +383,52 @@ def cited_sources(answer: str) -> set[str]:
     }
 
 
+def checks(
+    case: Case,
+) -> tuple[CitationAudit | None, QuoteAudit | None, GroundingVerdict | None]:
+    """The runtime's verdict for ``case``, recomputed from the saved chunks.
+
+    Recomputed rather than trusted from the JSON on purpose. A run saved before
+    the quote mechanism existed has no stored verdict, and one saved after it has
+    one that reflects whatever the audit said *then* — neither survives an edit to
+    the audit itself. The chunk texts are in the JSON, so the checks are as
+    reproducible now as they were live.
+    """
+    if case.grounding is not None:
+        return case.citations, case.quotes, case.grounding
+    if case.mode == "no_rag" or not case.chunk_texts:
+        return case.citations, case.quotes, case.grounding
+    hits = [
+        RagHit(
+            source=location.split(":", 1)[0],
+            text=text,
+            score=0.0,
+            start_line=0,
+            end_line=0,
+            section="",
+        )
+        for location, text in zip(case.retrieved, case.chunk_texts)
+    ]
+    event = RagEvent(
+        question=case.question,
+        retrieved=case.retrieved,
+        candidates=len(hits),
+        context_tokens=case.context_tokens,
+        sources=tuple(hits),
+    )
+    final = finalize_answer(case.answer, event)
+    return final.citations, final.quotes, final.grounding
+
+
 def scored(case: Case, question: Question) -> dict[str, object]:
-    """Everything measurable about one answered case."""
+    """Everything measurable about one answered case.
+
+    Three things are checked on every answer, not asked for: a source, a citation
+    the block can back, and a quote that is verbatim in the chunk it was attributed
+    to. They were added because the ones before them were not enough — a valid
+    line range says which file, never which words, and a saved run showed the model
+    citing the right chunk while stating the fact wrong.
+    """
     coverage, hit, missed = fact_coverage(case.answer, question.expect)
     retrieval_hit = (
         source_reached(question.sources, case.retrieved)
@@ -375,7 +440,18 @@ def scored(case: Case, question: Question) -> dict[str, object]:
         if question.sources
         else None
     )
-    refused = bool(_REFUSAL_RE.search(case.answer)) if not question.answerable else None
+    refused = is_refusal(case.answer) if not question.answerable else None
+
+    citations, quotes, grounding = checks(case)
+    # The source list is appended by code, so this is a property of the reply, not
+    # a hope about the model. Checked on the text the user would see.
+    sources_listed = SOURCES_HEADING in case.answer
+    citation_ok = citations is not None and bool(citations.kept)
+    quote_ok = quotes is not None and bool(quotes.kept)
+    unbacked = tuple(citations.dropped) if citations else ()
+    paraphrased = tuple(quotes.dropped) if quotes else ()
+    unchecked = tuple(quotes.unchecked) if quotes else ()
+
     if question.answerable:
         # The answer must carry every expected fact. The retrieval check applies
         # to the retrieval arms only: in ``no_rag`` nothing is retrieved by
@@ -384,9 +460,16 @@ def scored(case: Case, question: Question) -> dict[str, object]:
         passed = not case.error and coverage == 1.0
         if case.mode != "no_rag":
             passed = passed and retrieval_hit is not False
+            # The three checks, and they count as failing. A fact read off a chunk
+            # the answer never quotes is not a fact anybody can check, and a PASS
+            # that rewards it is the number this whole task exists to correct.
+            passed = passed and sources_listed and citation_ok and quote_ok
+            passed = passed and not unbacked and not paraphrased
     else:
         # Nothing to confirm, so grounding means not inventing: no facts, no
-        # claim of having found anything.
+        # claim of having found anything. A refusal has no sources to list, so
+        # the three checks do not apply — the run has already said it found
+        # nothing.
         passed = not case.error and bool(refused) and coverage == 1.0
     return {
         "fact_coverage": round(coverage, 3),
@@ -395,6 +478,13 @@ def scored(case: Case, question: Question) -> dict[str, object]:
         "retrieval_hit": retrieval_hit,
         "citation_hit": citation_hit,
         "refused": refused,
+        "sources_listed": sources_listed,
+        "citation_ok": citation_ok,
+        "quote_ok": quote_ok,
+        "unbacked_citations": list(unbacked),
+        "paraphrased_quotes": list(paraphrased),
+        "unchecked_quotes": list(unchecked),
+        "grounding": grounding.status.value if grounding else None,
         "cited_files": sorted(cited_sources(case.answer)),
         "retrieved_files": sorted(set(case.retrieved_files)),
         "passed": passed,
@@ -454,6 +544,30 @@ def aggregate(cases: list[Case], questions: list[Question]) -> dict[str, object]
                     bool(scores[c.index]["citation_hit"])
                     for c, q in answerable
                     if q.sources
+                ]
+            ),
+            # The three checks, as rates over the answerable questions of this
+            # mode. Reported apart because they fail apart: a run can cite
+            # perfectly and still quote nothing, and a single averaged number
+            # would hide exactly the case worth seeing.
+            "sources_rate": _rate(
+                [bool(scores[c.index]["sources_listed"]) for c, _ in answerable]
+            ),
+            "verified_citation_rate": _rate(
+                [bool(scores[c.index]["citation_ok"]) for c, _ in answerable]
+            ),
+            "verbatim_quote_rate": _rate(
+                [bool(scores[c.index]["quote_ok"]) for c, _ in answerable]
+            ),
+            # Quoted fragments no citation claimed. They cannot be checked, so
+            # this is the size of the blind spot in the row above, not a pass.
+            "unverified_quotes": sum(
+                len(scores[c.index]["unchecked_quotes"]) for c, _ in answerable
+            ),
+            "grounded_rate": _rate(
+                [
+                    scores[c.index]["grounding"] == Grounding.GROUNDED.value
+                    for c, _ in answerable
                 ]
             ),
             "passed": sum(1 for s in scores.values() if s["passed"]),
@@ -592,10 +706,12 @@ def run_case(
     """Answer one question in one mode; a provider failure is recorded, not raised."""
     prefix = ""
     retrieved: tuple[str, ...] = ()
+    chunk_texts: tuple[str, ...] = ()
     context_tokens = 0
     reranked = 0
     filtered = 0
     scored_shortlist: tuple[tuple[str, float], ...] = ()
+    event = None
     if mode != "no_rag":
         assert retriever is not None
         try:
@@ -605,6 +721,10 @@ def run_case(
             reranked = event.reranked
             filtered = event.filtered
             scored_shortlist = event.scored
+            # The texts behind the locations, so a saved run can be re-checked for
+            # verbatim quotes offline. Without them the audit can only be trusted
+            # for the run that produced it, which is the one run nobody re-reads.
+            chunk_texts = tuple(hit.text for hit in event.sources)
         except Exception as exc:  # noqa: BLE001 - record, compare, do not crash
             return Case(
                 index=index,
@@ -641,13 +761,18 @@ def run_case(
         estimate_tokens(message["content"]) + MESSAGE_OVERHEAD_TOKENS
         for message in messages
     )
+    # The same post-processing the runtime applies, so the report measures the
+    # behaviour a user gets rather than the raw model output. Scored, not stored:
+    # the case keeps the model's own words, and the checks are recomputed on
+    # every run so a change to the audit is reflected in an old JSON.
+    final = finalize_answer(reply, event)
     return Case(
         index=index,
         question=question.text,
         corpus=question.corpus,
         mode=mode,
         answerable=question.answerable,
-        answer=reply,
+        answer=final.text,
         retrieved=retrieved,
         context_tokens=context_tokens,
         prompt_tokens=prompt_tokens,
@@ -655,6 +780,10 @@ def run_case(
         reranked=reranked,
         filtered=filtered,
         scored=scored_shortlist,
+        chunk_texts=chunk_texts,
+        citations=final.citations,
+        quotes=final.quotes,
+        grounding=final.grounding,
     )
 
 
@@ -810,7 +939,8 @@ def render_report(
         "## Итоги",
         "",
         "| Режим | Вопросов | Покрытие фактов | Полных | Отказов | "
-        "Попадание в выдачу | Цитации | PASS | prompt-токенов | с/вопрос |",
+        "Попадание в выдачу | Цитата подтверждена | PASS | prompt-токенов | "
+        "с/вопрос |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for mode in ordered:
@@ -824,7 +954,7 @@ def render_report(
             f"| {row['fact_coverage_full']}/{row['answerable']} "
             f"| {_pct(row['refusal_rate'])} "
             f"| {_pct(row['retrieval_hit_rate'])} "
-            f"| {_pct(row['citation_rate'])} "
+            f"| {_pct(row['verified_citation_rate'])} "
             f"| {row['passed']}/{row['questions']} ({_pct(row['pass_rate'])}) "
             f"| {row['prompt_tokens_mean']} "
             f"| {row['elapsed_mean']} |"
@@ -836,6 +966,54 @@ def render_report(
         "вопросам с ответом. «Отказы» — доля честных «не нашёл» по вопросам, "
         "которых в базе нет. Они считаются раздельно: усреднять их в одно "
         "число нельзя, сильный отказ легко спрятал бы слабые ответы.",
+    ]
+
+    lines += [
+        "",
+        "## Три проверки каждого ответа",
+        "",
+        "Три вещи проверяются кодом на каждом ответе, а не просятся у модели. "
+        "Ни одна из них не требует второй модели, поэтому вердикт воспроизводим.",
+        "",
+        "| Режим | Список источников | Цитата подтверждена блоком | Цитата дословна "
+        "в чанке | Опирается на источники | Непроверенных цитат |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for mode in ordered:
+        row = summary.get(mode)
+        if not row:
+            continue
+        lines.append(
+            f"| {_MODE_LABELS[mode]} "
+            f"| {_pct(row['sources_rate'])} "
+            f"| {_pct(row['verified_citation_rate'])} "
+            f"| {_pct(row['verbatim_quote_rate'])} "
+            f"| {_pct(row['grounded_rate'])} "
+            f"| {row['unverified_quotes']} |"
+        )
+    lines += [
+        "",
+        "«Список источников» — ответ кончается списком, который собирает код. "
+        "«Цитата подтверждена блоком» — номер фрагмента, названный в ответе, "
+        "действительно был отправлен. «Цитата дословна в чанке» — фраза в "
+        "кавычках содержится во фрагменте, к которому она отнесена, посимвольно.",
+        "",
+        "Третья проверка — та, ради которой сделаны первые две. Номер фрагмента "
+        "говорит, *откуда* факт, и ничего не говорит о том, как он сформулирован: "
+        "ответ может сослаться на верный диапазон строк и пересказать его "
+        "неверно. Проверка дословности — единственная, которая ловит это без "
+        "помощи второй модели.",
+        "",
+        "«Опирается на источники» — все три проверки выполнены: есть "
+        "подтверждённая цитата, есть дословная цитата, и ни одна не опровергнута. "
+        "Отказ здесь не считается провалом: на вопрос, ответа на который в базе "
+        "нет, правильное поведение — замолчать.",
+        "",
+        "«Непроверенных цитат» — сколько цитат в ответах не удалось сверить, "
+        "потому что ни одна ссылка на фрагмент рядом с ними не стояла. Это не "
+        "оценка и не успех: это размер слепого пятна у проверки на дословность. "
+        "Большое число означает, что третью проверку стоит чинить, а не что "
+        "ответы верны.",
     ]
 
     if sweep:
@@ -875,8 +1053,9 @@ def render_report(
         "",
         "## По вопросам",
         "",
-        "| # | Вопрос | Режим | Покрытие | Выдача | Цитация | Отказ | PASS |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| # | Вопрос | Режим | Покрытие | Выдача | Цитация | Отказ | "
+        "Источники | Цитата в чанке | Опора | PASS |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for case in sorted(cases, key=lambda c: (c.index, c.mode)):
         question = by_index[case.index]
@@ -890,6 +1069,9 @@ def render_report(
             f"| {_tick(score['retrieval_hit'] if isinstance(score['retrieval_hit'], bool) else None)} ({files}) "
             f"| {_tick(score['citation_hit'] if isinstance(score['citation_hit'], bool) else None)} "
             f"| {_tick(score['refused'] if isinstance(score['refused'], bool) else None)} "
+            f"| {_tick(bool(score['sources_listed']))} "
+            f"| {_tick(bool(score['quote_ok']))} "
+            f"| {_tick(score['grounding'] == Grounding.GROUNDED.value)} "
             f"| {_tick(bool(score['passed']))} |"
         )
 
@@ -913,6 +1095,13 @@ def render_report(
         "не попал, проходил как успешный.",
         "- «Цитация» — упомянул ли ответ источник в формате `файл:строки`, "
         "который требовал блок контекста.",
+        "- «Источники» — дописал ли код список источников в конец ответа. Это не "
+        "заслуга модели: список собирается всегда, когда что-то было отправлено.",
+        "- «Цитата в чанке» — дословно ли фраза в кавычках содержится во "
+        "фрагменте, к которому она отнесена.",
+        "- «Опора» — выполнены ли все три проверки сразу. «нет» при «да» в "
+        "соседних колонках означает, что цитата подтверждена, но пересказана "
+        "своими словами.",
         "- У неответимых вопросов ожиданий нет: PASS означает отказ, а любое "
         "конкретное число в ответе — конфабуляцию.",
         "- Полные ответы и события поиска — в `*.json` рядом с этим отчётом.",
@@ -1040,7 +1229,15 @@ def save_json(
                 ],
                 "cases": [
                     {
-                        **vars(case),
+                        # The audit objects are deliberately not saved. They are
+                        # rebuilt from ``chunk_texts`` on every read, so a run stays
+                        # re-scorable after the audit itself changes — a stored
+                        # verdict would freeze the rules of the day it was made.
+                        **{
+                            key: value
+                            for key, value in vars(case).items()
+                            if key not in {"citations", "quotes", "grounding"}
+                        },
                         "score": scored(
                             case,
                             next(
@@ -1093,6 +1290,7 @@ def load_saved_cases(path: Path) -> tuple[list[Question], list[Case]]:
                 (str(location), float(score))
                 for location, score in entry.get("scored") or ()
             ),
+            chunk_texts=tuple(str(text) for text in entry.get("chunk_texts") or ()),
         )
         for entry in payload["cases"]
     ]

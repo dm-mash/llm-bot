@@ -34,6 +34,7 @@ def _load_script():
 
 cmp_rag = _load_script()
 
+from llm_bot import rag as ragmod  # noqa: E402
 from tests.test_index_documents import FakeEmbedder  # noqa: E402
 from tests.test_rag import make_index  # noqa: E402
 
@@ -221,9 +222,9 @@ def test_cited_sources_reads_other_indexed_extensions() -> None:
 
 
 def test_refusal_detection() -> None:
-    assert cmp_rag._REFUSAL_RE.search("Я не нашёл это в базе")
-    assert cmp_rag._REFUSAL_RE.search("Информации об этом нет")
-    assert not cmp_rag._REFUSAL_RE.search("Стоит 190 ₽")
+    assert ragmod.REFUSAL_RE.search("Я не нашёл это в базе")
+    assert ragmod.REFUSAL_RE.search("Информации об этом нет")
+    assert not ragmod.REFUSAL_RE.search("Стоит 190 ₽")
 
 
 def _question(**kwargs) -> object:
@@ -307,10 +308,18 @@ def test_aggregate_keeps_quality_and_honesty_apart() -> None:
         _question(),
         _question(answerable=False, expect=(), sources=()),
     ]
+    # The grounded arm answers in the format the protocol asks for and carries
+    # the source list the code appends, so it is a genuinely backed answer and
+    # earns the 1.0 that a bare line-range citation used to earn by default.
     rag = [
         cmp_rag.Case(index=1, question="q", corpus="kb", mode="rag",
-                     answerable=True, answer="190 ₽ [kb/menu.md:1-5]",
-                     retrieved=("kb/menu.md:1-5",), prompt_tokens=100),
+                     answerable=True,
+                     answer='190 ₽ [1] «Крем: 190 ₽»\n\n'
+                            + ragmod.SOURCES_HEADING
+                            + "\n[1] kb/menu.md:1-5 — Напитки",
+                     retrieved=("kb/menu.md:1-5",),
+                     chunk_texts=("Крем: 190 ₽, объём 300 мл.",),
+                     prompt_tokens=100),
         cmp_rag.Case(index=2, question="q", corpus="kb", mode="rag",
                      answerable=False, answer="не нашёл", prompt_tokens=120),
     ]
@@ -365,7 +374,11 @@ def test_run_asks_every_question_in_both_modes(
     captured: list[dict] = []
     client = _client(
         {
-            "1": "Мы с 9:00 до 21:00 [kb/hours.md:11-15]",
+            # Answers in the format the protocol now asks for: a chunk number and
+            # the phrase copied out of that chunk. ``finalize_answer`` runs on
+            # these exactly as it runs on a live reply, so the run exercises the
+            # source list and both audits rather than bypassing them.
+            "1": 'Мы с 9:00 до 21:00 [1] «Часы работы: с 9:00 до 21:00»',
             "2": "С 9:00 до 21:00",
             "3": "не нашёл",
             "4": "250 ₽",
@@ -574,15 +587,27 @@ def test_a_wrong_chunk_fails_the_question_even_when_the_facts_are_right() -> Non
         text="q", corpus="repo", expect=("paraphrase-multilingual",),
         sources=("README.md:1304-1310",), answerable=True,
     )
+    # A grounded answer as the runtime now produces it: the source list the code
+    # appends, and a phrase quoted from the chunk the citation points at. A
+    # hand-written answer with neither cannot pass, and that is the point — this
+    # fixture used to pass on a bare line-range citation, which is the number
+    # day24 exists to correct.
+    grounded = (
+        "paraphrase-multilingual-MiniLM-L12-v2 [1] «paraphrase-multilingual-"
+        "MiniLM-L12-v2»\n\n" + ragmod.SOURCES_HEADING
+        + "\n[1] README.md:1304-1310 — Модели"
+    )
     with_answer = cmp_rag.Case(
         index=1, question="q", corpus="repo", mode="rag", answerable=True,
-        answer="paraphrase-multilingual-MiniLM-L12-v2 [README.md:1304-1310]",
+        answer=grounded,
         retrieved=("README.md:1304-1310",),
+        chunk_texts=("Модели: paraphrase-multilingual-MiniLM-L12-v2.",),
     )
     without_answer = cmp_rag.Case(
         index=1, question="q", corpus="repo", mode="rag", answerable=True,
-        answer="paraphrase-multilingual-MiniLM-L12-v2",
+        answer=grounded,
         retrieved=("README.md:949-951",),
+        chunk_texts=("Установка: pip install llm-bot.",),
     )
     assert cmp_rag.scored(with_answer, question)["retrieval_hit"] is True
     assert cmp_rag.scored(with_answer, question)["passed"] is True
@@ -1014,7 +1039,7 @@ def test_a_refusal_is_recognised_in_every_gender(phrase: str) -> None:
     refusal — and the ``не указано``-only pattern counted it as a confabulation,
     understating the ``rag_rerank`` refusal rate by one question in six.
     """
-    assert cmp_rag._REFUSAL_RE.search(phrase), phrase
+    assert ragmod.REFUSAL_RE.search(phrase), phrase
 
 
 @pytest.mark.parametrize(
@@ -1027,7 +1052,7 @@ def test_a_refusal_is_recognised_in_every_gender(phrase: str) -> None:
 )
 def test_a_confident_answer_is_not_mistaken_for_a_refusal(phrase: str) -> None:
     """The widening above must not start swallowing real answers."""
-    assert not cmp_rag._REFUSAL_RE.search(phrase), phrase
+    assert not ragmod.REFUSAL_RE.search(phrase), phrase
 
 
 # --------------------------------------------------------------------------- #
@@ -1095,3 +1120,139 @@ def test_every_pdf_span_contains_its_facts() -> None:
                 f"#{index_no}: факт {fact!r} не лежит в {question['sources']}"
             )
     assert answerable == 34, f"ожидалось 34 ответимых вопроса, а их {answerable}"
+
+
+# --------------------------------------------------------------------------- #
+# The three checks
+# --------------------------------------------------------------------------- #
+
+
+def _grounded_case(**overrides) -> "cmp_rag.Case":
+    """An answer that passes all three checks: source list, citation, quote."""
+    fields = dict(
+        index=1,
+        question="q",
+        corpus="kb",
+        mode="rag",
+        answerable=True,
+        answer='190 ₽ [1] «Крем: 190 ₽»\n\n'
+               + ragmod.SOURCES_HEADING
+               + "\n[1] kb/menu.md:1-5 — Напитки",
+        retrieved=("kb/menu.md:1-5",),
+        chunk_texts=("Крем: 190 ₽, объём 300 мл.",),
+    )
+    fields.update(overrides)
+    return cmp_rag.Case(**fields)
+
+
+def _price_question() -> "cmp_rag.Question":
+    return cmp_rag.Question(
+        text="q", corpus="kb", expect=("190",),
+        sources=("kb/menu.md:1-5",), answerable=True,
+    )
+
+
+def test_a_correct_answer_with_a_source_a_citation_and_a_quote_passes() -> None:
+    """The three things day24 asks of every answer, in one scored case."""
+    score = cmp_rag.scored(_grounded_case(), _price_question())
+
+    assert score["sources_listed"] is True
+    assert score["citation_ok"] is True
+    assert score["quote_ok"] is True
+    assert score["grounding"] == ragmod.Grounding.GROUNDED.value
+    assert score["passed"] is True
+
+
+def test_a_right_answer_cited_from_the_right_chunk_fails_without_a_quote() -> None:
+    """The gap this task exists to close.
+
+    This answer is not wrong in any way a fact check can see: every expected fact
+    is present and the citation names a line range the block really contained. It
+    failed anyway, because nothing checked the wording. Scoring it as a pass is
+    what produced a 37/40 that meant very little.
+    """
+    score = cmp_rag.scored(
+        _grounded_case(answer="190 ₽ [1]\n\n" + ragmod.SOURCES_HEADING
+                                + "\n[1] kb/menu.md:1-5 — Напитки"),
+        _price_question(),
+    )
+
+    assert score["fact_coverage"] == 1.0
+    assert score["citation_ok"] is True
+    assert score["quote_ok"] is False
+    assert score["passed"] is False
+
+
+def test_a_paraphrased_quote_fails_the_question() -> None:
+    """Plausible wording, wrong words. Only a substring test can tell, which is
+    why the check is a substring test and not a second model."""
+    score = cmp_rag.scored(
+        _grounded_case(answer='Крем стоит 190 рублей [1] «Крем стоит 190 рублей»'
+                                "\n\n" + ragmod.SOURCES_HEADING
+                                + "\n[1] kb/menu.md:1-5 — Напитки"),
+        _price_question(),
+    )
+
+    assert score["paraphrased_quotes"], "the paraphrase must be reported"
+    assert score["grounding"] == ragmod.Grounding.UNGROUNDED.value
+    assert score["passed"] is False
+
+
+def test_an_answer_with_no_source_list_fails_the_question() -> None:
+    """The list is appended by code, so this only happens when nothing was
+    retrieved — and a question with no block cannot be answered from one."""
+    score = cmp_rag.scored(
+        _grounded_case(answer='190 ₽ [1] «Крем: 190 ₽»'),
+        _price_question(),
+    )
+
+    assert score["sources_listed"] is False
+    assert score["passed"] is False
+
+
+def test_a_refusal_is_not_required_to_list_sources() -> None:
+    """An unanswerable question has no sources to list, so the three checks are
+    skipped for it — the answer already says it found nothing. Requiring a source
+    list here would score honesty as a failure."""
+    question = cmp_rag.Question(
+        text="q", corpus="kb", expect=(), sources=(), answerable=False,
+    )
+    case = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="rag", answerable=False,
+        answer="не нашёл ответ в этом контексте", prompt_tokens=10,
+    )
+
+    score = cmp_rag.scored(case, question)
+    assert score["sources_listed"] is False
+    assert score["passed"] is True
+
+
+def test_the_checks_are_recomputed_from_saved_chunks_not_trusted_from_json() -> None:
+    """A run saved before this feature must still be checkable.
+
+    ``--from_json`` exists to re-score a saved run after an edit to the scoring.
+    If the verdict were read out of the JSON, the one case that matters most —
+    a run judged by the old rules — could never be judged by the new ones.
+    """
+    case = _grounded_case(grounding=None, citations=None, quotes=None)
+    score = cmp_rag.scored(case, _price_question())
+
+    assert score["grounding"] == ragmod.Grounding.GROUNDED.value
+    assert score["passed"] is True
+
+
+def test_the_baseline_arm_is_not_demanded_to_cite_anything() -> None:
+    """``no_rag`` has no block by construction, so the three checks cannot apply.
+
+    Requiring them would score the baseline as broken instead of measuring what it
+    is, which is the whole reason it is in the table.
+    """
+    question = _price_question()
+    case = cmp_rag.Case(
+        index=1, question="q", corpus="kb", mode="no_rag", answerable=True,
+        answer="190 ₽", prompt_tokens=20,
+    )
+
+    score = cmp_rag.scored(case, question)
+    assert score["fact_coverage"] == 1.0
+    assert score["passed"] is True

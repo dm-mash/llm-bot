@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from llm_bot.factory import make_session  # noqa: E402
 from llm_bot.json_session_store import JsonSessionStore  # noqa: E402
 from llm_bot.memory_store import JsonMemoryStore  # noqa: E402
+from llm_bot.rag import Grounding  # noqa: E402
 from llm_bot.yaml_stores import (  # noqa: E402
     YamlAgentStore,
     YamlModelStore,
@@ -133,6 +134,17 @@ def run_dialogue(
         if audit is not None and audit.uncited:
             problems.append("ответ без единой цитаты")
             passed = False
+        # A turn can clear every fact check and still be a guess. The verdict is
+        # the same one the runtime used to decide whether it was safe to answer,
+        # so a dialogue that passes here behaves the same way in production.
+        quotes = session.last_quote_audit
+        verdict = session.last_grounding
+        for bad in quotes.dropped if quotes else ():
+            problems.append(f"цитата не дословна в чанке: {bad}")
+            passed = False
+        if verdict is not None and verdict.status is Grounding.UNGROUNDED:
+            problems.append("ответ не опирается на подтверждённые источники")
+            passed = False
         rows.append(
             {
                 "turn": number,
@@ -142,6 +154,8 @@ def run_dialogue(
                 "problems": problems,
                 "unconfirmed": list(audit.dropped) if audit else [],
                 "uncited": bool(audit.uncited) if audit else False,
+                "grounding": verdict.status.value if verdict else None,
+                "bad_quotes": list(quotes.dropped) if quotes else [],
                 "note": turn.note,
             }
         )
