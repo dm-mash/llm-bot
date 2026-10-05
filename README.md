@@ -1499,8 +1499,26 @@ over the 34 answerable questions:
 
 | | retrieval@1 | retrieval@4 | fact coverage | PASS |
 | --- | --- | --- | --- | --- |
-| dense only | 13/34 | 22/34 | .662 | 25/40 (.625) |
-| + cross-encoder | 20/34 | **32/34** | **.971** | **36/40 (.900)** |
+| dense only | 13/34 | 22/34 | .662 | 23/40 (.575) |
+| + cross-encoder | 20/34 | **32/34** | **.971** | **31/40 (.775)** |
+
+The retrieval columns are unaffected by later work; the `PASS` column was
+re-measured once answers also had to carry a source and a verbatim quote, and it
+fell from 36/40 to 9/40. That fall was the point, not a regression: the earlier
+`PASS` rewarded naming a line range, which says nothing about wording, so 36/40
+counted answers whose facts nobody had checked. With the stricter rule the
+source list and a confirmed citation were in every answer and a quote came back
+verbatim in only **5 of 34** — the entire cost of the rule was paid by answers
+that were probably right.
+
+That also made the source list worth trusting less than it looked. It was built
+from every chunk sent, so a four-chunk block whose answer cited two printed four
+sources. Fixed below; the numbers here predate the fix only in that column.
+
+Asking better fixed most of that. See
+[Asking for the phrase](#asking-for-the-phrase-made-the-quotes-appear) — one
+worked example in the protocol took verbatim quotes from 5/34 to 26/34 and `PASS`
+from 9/40 to 31/40, and the reranker now shows the margin it was added for.
 
 Two defaults come from those measurements. The shortlist is **20** wide, because
 recall@20 was 34/34 — that is the ceiling for the stage, and going wider would
@@ -1541,8 +1559,9 @@ least one whole word of it fits, so the model never sees a fragment cut mid
 sentence.
 
 Grounding is *asked for* by instruction: the block tells the model to answer
-**only** from the context, to cite `[file:lines]` after every fact, and to say it
-did not find an answer rather than invent one. That rule lives in the
+**only** from the context, to cite the chunk's number after every fact, to quote
+the phrase it took from that chunk, and to say it did not find an answer rather
+than invent one. That rule lives in the
 block (`_RAG_PROTOCOL` in `llm_bot/rag.py`) and nowhere else — not in
 `data/invariants.yaml`, and not in any agent's `system_prompt`. Two reasons:
 
@@ -1551,11 +1570,209 @@ block (`_RAG_PROTOCOL` in `llm_bot/rag.py`) and nowhere else — not in
 - a copy inside an agent would be a third source of truth. It already drifted
   once, which is why the agent configs no longer restate the rule.
 
+### Asking a list of questions
+
+One question is `python -m llm_bot --agent … --rag --rag-index … "вопрос"`. Ten
+of them is ten copies of the same long invocation, and the eighth is where an
+argument gets mistyped. `scripts/batch_ask.py` runs the list for you and prints
+only the answers:
+
+```
+python scripts/batch_ask.py --questions q.txt \
+    --rag-index data/emb/index_structure.json --rag-strict --rag-rerank
+```
+
+The questions file is one per line, `#` starts a comment, blank lines are
+skipped. `.yaml` and `.json` lists work too, so a `questions.yaml` from an
+earlier run is reused as it is.
+
+Each answer gets its own block, headed by the question and divided by a rule:
+
+```
+────────────────────────────────────────────────────────────────────
+7/40  С какой высоты выполняется прыжок с парашютом?
+
+С высоты 800 м [1] «прыжки проводятся с высоты 800 м».
+
+  Источники:
+    [1] Прыжок с парашютом.pdf:19-23 — page 1 · chunk structure-006-002
+```
+
+The question heads the block because a saved file of answers with no trace of
+which question each belongs to is not readable afterwards. The answer's own text
+is never restyled — its `[1]` has to keep matching the `[1]` below it, and that
+correspondence is the only thing either of them is checkable against. `--plain`
+prints the bare replies instead, for piping into something else.
+
+stderr is quiet by default: the answers, and one summary line at the end. A
+per-question marker on stderr was tried and removed — the block already carries
+its number, so the line only repeated what the next block was about to say, less
+clearly and sooner. `--progress` brings it back, which is worth having in the
+subprocess mode, where a question takes forty seconds and there is otherwise
+nothing to look at.
+
+Each answer is printed as soon as it arrives. Buffering the run and printing it
+at the end was tried first and looked like a hang: at the rate below, forty
+questions is a quarter of an hour of silence followed by a wall of text. `--out`
+writes the same blocks to a file, which is the form to read after the fact.
+
+There is no output filtering to get wrong, and that is a property of the CLI
+rather than luck: the answer goes to stdout, and every diagnostic — token
+accounting, memory, the `[rag]` chunk list, `Loading weights`, the session
+banner — goes to stderr. The script reads stdout and drops stderr. One
+consequence is worth knowing: a provider failure prints to stderr and exits
+non-zero, so it would not show up in the answers at all. The script therefore
+treats a non-empty answer with a non-zero exit as a failure, prints the stderr
+for that one question, carries on, and reports the count at the end.
+
+Each question is its own process, exactly as if the command were typed by hand.
+That is deliberate — same code, same flags, no second way of building a session
+that would drift from the CLI — and it is also why a batch is slow. Measured on a
+40-question run, of roughly 40 seconds per question:
+
+| | |
+|---|---|
+| import `llm_bot` | 0.4s |
+| load the cross-encoder | 16.4s |
+| first query (embedding model loads here) | 19.0s |
+| every query after that | 0.6s |
+
+Thirty-five seconds of forty is disk. `--reuse-models` loads both models once for
+the whole run and still builds a **new session per question**, so only the two
+immutable models are shared and nothing can leak from one question into the next:
+40 questions go from about 27 minutes to 3m17s. Verified by diffing both modes —
+they differ by the same two lines as two runs of one mode differ from each other,
+which is sampling noise, not behaviour.
+
+A batch also asks one provider the same question back to back, which is what
+trips a rate limit: one question in forty came back `429` after the client had
+already retried four times. `--retries` (2 by default) repeats those, with a
+pause, and leaves anything that would not heal to fail visibly instead of
+burning minutes on a bad index.
+
+### Three things every answer is checked for
+
+A line range says which chunk a fact came from. It says nothing about how the
+fact was worded, and that gap is where answers go wrong: the model can cite a
+real chunk, cite the right lines, and still state the number wrong, with every
+existing check passing. So the answer is checked three ways, and none of the
+three needs a second model:
+
+| | what it means | how it is verified |
+|---|---|---|
+| **a source** | the answer ends with the list of chunks it actually leaned on | `render_sources_footer` appends it in code — it is not asked for, so it cannot be forgotten |
+| **a confirmed citation** | every `[N]` names a chunk that was really sent | `audit_citations(..., handles=…)` resolves the number to the hit it was printed above |
+| **a verbatim quote** | the phrase in «» or backticks is contained, character for character, in the chunk it is attributed to | `audit_quotes` is a substring test against that chunk's text |
+
+A claim counts as grounded only when all three hold. Anything else is
+`Grounding.UNGROUNDED`, and `Session.last_grounding` says which check failed.
+
+Measured on 10 questions against the repository's own documents, and then on a
+harder near-duplicate corpus of 34 answerable ones:
+
+| | source list | citation confirmed | quote verbatim | grounded |
+|---|---|---|---|---|
+| repo + kb, 8 answerable | 7/8 | 7/8 | 7/8 | 7/8 |
+| near-duplicate corpus, dense, 34 | 31/34 | 31/34 | 26/34 | 24/34 |
+| near-duplicate corpus, + reranker | 34/34 | 34/34 | 31/34 | 29/34 |
+
+Two things about that list are worth stating outright, because both were wrong
+at first.
+
+It lists the chunks the answer **cited**, not the chunks retrieval returned. A
+four-chunk block where the model cited two does not have four sources, it has
+two, and printing the rest claims provenance the reply never had — the extra
+lines being exactly the ones a reader cannot tell apart from real support. The
+printed numbers are the chunk's own, never renumbered: a `[3]` in the text and
+`[3]` in the list must be the same chunk, even when the answer never said `[1]`.
+
+An answer that cited nothing gets no list. A refusal has no evidence, and a
+source list under «I did not find it» states the opposite of what was said.
+
+One consequence is not visible in the output and is worth knowing about. A
+follow-up turn is kept on the document the dialog is already about, by reading
+the citations out of the visible history. A handle names a position in a block
+the reader never saw, so `[2]` is not a document — the file name comes from this
+same list, which prints the location for exactly that handle. And the list is
+excluded from that reading, because otherwise the reply's own subject came back
+as the bare string `"2"` and biased the next search towards a filename that does
+not exist.
+
+The first two columns are near-perfect because code produces them. The third took
+three rewrites of the protocol to get off the floor, and it is the column the
+mechanism exists for — see below.
+
+### Asking for the phrase made the quotes appear
+
+The third check sat at **5 of 34** for a long time, which looked like a limit of
+the corpus rather than a limit of the prompt. It was the prompt. Asking for a
+phrase in the abstract produced a verbatim quote in 15 of 32 answers; the same
+protocol with one worked example produced one in 24 of 32.
+
+Four wordings, same 10 questions, 4 runs each:
+
+| protocol | quote verbatim | grounded |
+|---|---|---|
+| abstract request, no example | 15/32 (.47) | 13/32 (.41) |
+| abstract, short version | 23/32 (.72) | 14/32 (.44) |
+| placeholder example `«фраза из фрагмента» [1]` | 17/24 (.71) | 15/24 (.62) |
+| **concrete example `срок — 6 месяцев [1] «срок — 6 месяцев»`** | **21/24 (.88)** | **19/24 (.79)** |
+
+Three things are worth keeping out of that table, and one is a warning.
+
+The example has to be *concrete*. A placeholder that names the shape without
+content did score better than nothing, and nowhere near as well as a real
+example — and this repo has the scar to prove why. An earlier placeholder of
+exactly that shape, `[файл:строки]`, was copied into a saved run as
+`[файл: kofeinya_zerna.md:14]`: a citation to a file that name, whose range
+pointed at nothing.
+
+The example has to be *neutral*, since this repository carries no customer's
+documents. That is why it is a deadline and not the jump height that first
+seemed like the obvious illustration. Checked for leakage rather than assumed:
+24 answers, zero occurrences of the example's text.
+
+The example's *order* matters and is not symmetric. `«фраза» [1]` grounded
+15/24, the same words as `[1] «фраза»` grounded 19/24. The audit accepts a
+citation on either side of a quote, so this is compliance, not a blind spot.
+
+And `grounded` is not `quote verbatim`: the short protocol quoted almost as often
+as the concrete one (23/32 against 21/24) but grounded far less (14/32 against
+19/24), because quoting while still citing something the block never sent is
+worse than not quoting. A protocol that makes the model quote is not thereby a
+protocol that makes it right.
+
+The check reports what it could *not* verify too. `QuoteAudit.unchecked` holds
+quoted fragments that no citation claimed — usually the customer's own wording,
+like «Тростниковый крем». Those are neither passes nor failures, and reporting
+them is what keeps a check that skips part of its input from looking like a check
+that passes everything.
+
+### Strict mode: answer, or admit nothing
+
+`--rag-strict` replaces an ungrounded answer with a fixed refusal:
+
+```
+--rag --rag-strict
+```
+
+It is **off by default**, because it is a behaviour switch rather than a check:
+it throws away a possibly-correct answer and replaces it with «I cannot answer
+from this context. Please clarify the question». On a corpus where a fifth of
+answers carry a verbatim quote, turning it on means most questions get no answer
+at all — correct, and useless. It is worth it where a wrong price is worse than
+no price.
+
+It cannot be combined with `--rag-no-cite`, which removes the very citations and
+quotes there would be nothing to verify; that combination is refused at startup
+rather than producing a bot that only ever declines.
+
 ### Two ways to run it: with sources, without
 
-`--rag` asks the model to tag every fact with `[file:lines]` and audits those
-tags afterwards. When the sources are noise for the current task, `--rag-no-cite`
-answers from the same retrieved context without them:
+`--rag` asks the model to tag every fact with the chunk's number and to quote
+the phrase it took, then audits both afterwards. When the sources are noise for
+the current task, `--rag-no-cite` answers from the same retrieved context without
+them:
 
 ```
 --rag --rag-no-cite
@@ -1567,12 +1784,18 @@ answers from the same retrieved context without them:
 | "Answer only from this context" | on | on |
 | No-blending rule | on | on |
 | "Say you did not find it" | on | on |
-| "Tag every fact with `[file:lines]`" | on | **off** |
-| Citation audit, `[источник не подтверждён]` marker | on | **off** |
+| "Tag every fact with `[N]` and quote the phrase" | on | **off** |
+| Source list appended by code | on | **off** |
+| Citation and quote audits | on | **off** |
+| Grounding verdict | on | **off**, and `checked=False` |
 
 Nothing was deleted: the citation format lives in `_RAG_PROTOCOL`, the version
 without it in `_RAG_PROTOCOL_NO_CITATIONS`, and `Retriever(cite=False)` picks
 between them. Drop the flag to get sources back.
+
+With citations off there is nothing to verify, so the verdict says `checked=False`
+rather than blaming the answer — an unjudged answer is never counted as a good
+one, which is what keeps the two modes comparable.
 
 ### Invariant ids are not citations
 
@@ -1593,8 +1816,9 @@ the ids from the registry, so they pass through untouched and stay out of both
 uncited, which is what it is.
 
 What code *does* enforce is the citation. `audit_citations` checks every
-`[file:lines]` in the reply against the block that was actually sent — file name
-and line range — and replaces anything unsupported with
+marker in the reply against the block that was actually sent — a chunk number
+resolved through the handles the block printed, or a file name with its line
+range — and replaces anything unsupported with
 `[источник не подтверждён]`. This is not a formality. On a near-duplicate corpus
 **12 of 15** citations to one document came back with a single digit
 changed from the name on disk: the model rewrites what it copies, and nothing
@@ -1604,6 +1828,14 @@ than deleted, because a wrong source in brackets reads as a verified one. Over a
 12 turns that cited a document the block never contained — the model answering
 from its own earlier replies in history rather than from the evidence sent this
 turn. `Session.citation_audits` exposes the per-turn result.
+
+That 27/30 is the number this section used to end on, and it is worth being
+precise about what it measured: **content**, not grounding. Once the same
+dialogue is also required to carry a source and a verbatim quote, **6 of 30
+turns pass**. The gap is not twenty-four turns of wrong answers — it is turns
+whose facts were right and whose wording nobody checked. A bot trusted with a
+price cannot tell the difference, so the evaluation scores the difference rather
+than the content.
 
 Two details of the check are deliberate. A citation may name the document by
 its id alone (`[ID-250-439-931-337]`) — the model does that — and that is
