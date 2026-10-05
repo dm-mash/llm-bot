@@ -220,6 +220,7 @@ def make_session(
     rag_rerank_min_score: float | None = None,
     rag_reuse_evidence: bool = False,
     rag_cite: bool = True,
+    rag_strict: bool = False,
     retriever: Retriever | None = None,
 ) -> Session:
     """Build a :class:`Session` for the given agent, ready to chat.
@@ -413,4 +414,5 @@ def make_session(
         retriever=effective_retriever,
         rag_reuse_evidence=rag_reuse_evidence,
         rag_cite=rag_cite,
+        rag_strict=rag_strict,
     )

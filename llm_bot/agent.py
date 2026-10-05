@@ -34,12 +34,15 @@ from llm_bot.invariants import (
 from llm_bot.mcp_tools import DEFAULT_MAX_ROUNDS, MCPEvent, MCPRouter
 from llm_bot.memory import MemoryEvent, MemoryLayers, extract_memory
 from llm_bot.rag import (
+    NO_ANSWER_TEXT,
     CitationAudit,
+    Grounding,
+    GroundingVerdict,
+    QuoteAudit,
     RagEvent,
     Retriever,
-    audit_citations,
+    finalize_answer,
     sources_from_text,
-    strip_citations,
 )
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.task_state import (
@@ -249,6 +252,7 @@ class Session:
         retriever: Retriever | None = None,
         rag_reuse_evidence: bool = False,
         rag_cite: bool = True,
+        rag_strict: bool = False,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
@@ -271,11 +275,19 @@ class Session:
         self._retriever = retriever
         self._rag_events: list[RagEvent] = []
         self._citation_audits: list[CitationAudit] = []
+        self._quote_audits: list[QuoteAudit] = []
         # Evidence this dialog has already seen, kept only when the owner asks
         # for it. Off by default: the block is rebuilt per turn on purpose, and
         # remembering it would undo that.
         self._rag_reuse_evidence = rag_reuse_evidence
         self._rag_cite = rag_cite
+        # Replace an answer nothing in the block backs with a refusal. Off by
+        # default because it is a behaviour change, not a check: it turns a
+        # possibly-correct answer into "I cannot answer this". Worth exactly
+        # that on a bot that must not invent prices, and not worth it while
+        # measuring how often it would fire.
+        self._rag_strict = rag_strict
+        self._groundings: list[GroundingVerdict] = []
         self._rag_earlier: list[str] = []
         # Round budget: an explicit value wins; otherwise the router's
         # ``max_rounds`` (configurable via the ``max_rounds`` key of the MCP
@@ -463,6 +475,26 @@ class Session:
     def citation_audits(self) -> list[CitationAudit]:
         """One citation check per grounded turn, in order."""
         return list(self._citation_audits)
+
+    @property
+    def quote_audits(self) -> list[QuoteAudit]:
+        """One quote check per grounded turn, in order."""
+        return list(self._quote_audits)
+
+    @property
+    def groundings(self) -> list[GroundingVerdict]:
+        """One verdict per grounded turn, in order."""
+        return list(self._groundings)
+
+    @property
+    def last_grounding(self) -> GroundingVerdict | None:
+        """The most recent verdict, or ``None``."""
+        return self._groundings[-1] if self._groundings else None
+
+    @property
+    def last_quote_audit(self) -> QuoteAudit | None:
+        """The most recent quote check, or ``None``."""
+        return self._quote_audits[-1] if self._quote_audits else None
 
     def _invariant_ids(self) -> tuple[str, ...]:
         """Ids rendered as ``[STACK-1]`` in the prompt — never source citations."""
@@ -974,27 +1006,31 @@ class Session:
                 context_tokens = count_messages_tokens(messages)
 
         # Every citation in the answer has to be backed by the block that was
-        # actually sent. Done before the reply reaches memory and the session
-        # store, so a rewritten source number is not persisted as "what we told
-        # the customer" and then reused as evidence on the next turn.
+        # actually sent, and every quote has to be verbatim in the chunk it was
+        # attributed to. Done before the reply reaches memory and the session
+        # store, so a rewritten source number or a paraphrase is not persisted as
+        # "what we told the customer" and then reused as evidence next turn.
+        #
+        # ``finalize_answer`` is the single implementation, shared with
+        # ``scripts/compare_rag.py``: the benchmark has to score the behaviour the
+        # bot actually has, not a second idea of what a backed answer is.
         if rag_event is not None and rag_event.retrieved:
-            if self._rag_cite:
-                reply, audit = audit_citations(
-                    reply,
-                    rag_event.retrieved,
-                    also_backed=self._rag_earlier if self._rag_reuse_evidence else (),
-                    ignore=self._invariant_ids(),
-                )
-                self._citation_audits.append(audit)
-                if self._rag_reuse_evidence and audit.clean:
-                    self._rag_earlier.extend(rag_event.retrieved)
-                if audit.dropped:
-                    logger.warning(
-                        "RAG citations not in the retrieved block: %s",
-                        ", ".join(audit.dropped),
-                    )
-            else:
-                reply = strip_citations(reply, ignore=self._invariant_ids())
+            final = finalize_answer(
+                reply,
+                rag_event,
+                cite=self._rag_cite,
+                invariant_ids=self._invariant_ids(),
+            )
+            reply = final.text
+            if final.citations is not None:
+                self._citation_audits.append(final.citations)
+            if final.quotes is not None:
+                self._quote_audits.append(final.quotes)
+            self._groundings.append(final.grounding)
+
+            if self._rag_reuse_evidence and (
+                final.citations is None or final.citations.clean
+            ):
                 # Reusing earlier evidence is gated on a clean audit because a
                 # citation contradicting the answer is what makes a block unsafe
                 # to lean on again. A reply with no citations contradicts
@@ -1002,8 +1038,39 @@ class Session:
                 # --rag-no-cite on for readability would quietly change what
                 # gets retrieved on the follow-up turn, and the two modes would
                 # no longer be comparable.
-                if self._rag_reuse_evidence:
-                    self._rag_earlier.extend(rag_event.retrieved)
+                self._rag_earlier.extend(rag_event.retrieved)
+
+            if final.citations is not None and final.citations.dropped:
+                logger.warning(
+                    "RAG citations not in the retrieved block: %s",
+                    ", ".join(final.citations.dropped),
+                )
+            if final.quotes is not None and final.quotes.dropped:
+                logger.warning(
+                    "RAG quotes not in the cited chunk: %s",
+                    ", ".join(final.quotes.dropped),
+                )
+
+            if final.grounding.status is Grounding.UNGROUNDED:
+                if self._rag_strict:
+                    # Drop the answer and say the useful thing instead. The
+                    # source list goes with it: naming chunks for a claim that
+                    # has just been withdrawn reads as support for it.
+                    reply = NO_ANSWER_TEXT
+                    logger.warning(
+                        "RAG strict: claim with no supported citation or quote, "
+                        "replaced with a refusal (unsupported=%s bad_quotes=%s)",
+                        ", ".join(final.grounding.unsupported) or "-",
+                        ", ".join(final.grounding.bad_quotes) or "-",
+                    )
+                elif not self._rag_cite:
+                    # Without a verdict there is nothing to judge by, so a
+                    # --rag-no-cite run would silently opt out of grounding
+                    # altogether. Said out loud in the log instead.
+                    logger.info(
+                        "RAG: grounding not checked, citations are off; "
+                        "quote the sources to be checkable"
+                    )
 
         # Mirror the assistant reply into the short-term (current dialog) layer.
         if self._memory is not None:

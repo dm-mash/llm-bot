@@ -39,6 +39,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path, PurePath
 from collections.abc import Sequence
 from typing import Any
@@ -50,14 +51,25 @@ from .tokens import MESSAGE_OVERHEAD_TOKENS, estimate_tokens
 #: Section marker + protocol, rendered above the chunks.
 _RAG_HEADER = "Контекст из локальной базы знаний:"
 _RAG_PROTOCOL = (
-    "Отвечай ТОЛЬКО по этому контексту. Для каждого факта укажи источник "
-    "в формате [файл:строки]. Если в контексте нет ответа — прямо скажи, "
-    "что не нашёл ответ, и ничего не додумывай."
+    "Отвечай ТОЛЬКО по этому контексту. Каждый фрагмент в контексте помечен "
+    "номером в квадратных скобках. После каждого факта приведи дословную фразу "
+    "из этого фрагмента в кавычках, а затем укажи номер — например: срок — "
+    "6 месяцев [1] «срок — 6 месяцев». Не переписывай имя файла. Если в "
+    "контексте нет ответа — прямо скажи, что не нашёл ответ, уточни, что именно "
+    "нужно, и ничего не додумывай."
 )
+# The worked example in that rule is not decoration. Asked to "quote a phrase"
+# in the abstract, the model produced one verbatim quote in 15 of 32 answers;
+# shown the shape, in 24 of 32. It matters that the example is concrete rather
+# than a placeholder: `«фраза из фрагмента» [1]` scored 17 of 24, and an earlier
+# placeholder of this kind is what produced `[файл: kofeinya_zerna.md:14]` in a
+# saved run — a citation naming nothing that could be retrieved. The example is
+# neutral on purpose, and was checked for being copied verbatim into answers
+# (24 answers, 0 occurrences).
 
 #: Same rule with the citation clause removed, for when sources are not shown.
 #: The grounding and the "say you did not find it" half stay: only the demand
-#: to tag every fact with ``[file:lines]`` goes away.
+#: to tag every fact with its chunk number goes away.
 #:
 #: Merely dropping that demand is not enough. The model answers "20 минут
 #: [file.pdf:19]", loses the brackets, and then narrates the same source in
@@ -65,11 +77,14 @@ _RAG_PROTOCOL = (
 #: the clause has to forbid the source in words too. Prose cannot be stripped
 #: afterwards without mangling the answer, which makes this line the only thing
 #: standing between the flag and a reply that still reads like it has sources.
+#: The quoted fragment goes with it: a quote with no number is an unbacked claim
+#: wearing quotation marks.
 _RAG_PROTOCOL_NO_CITATIONS = (
     "Отвечай ТОЛЬКО по этому контексту. Если в контексте нет ответа — прямо скажи, "
-    "что не нашёл ответ, и ничего не додумывай. "
-    "Не указывай источники: ни в скобках, ни словами. Не называй файл, документ, "
-    "его номер, страницу или диапазон строк — ответь только по существу."
+    "что не нашёл ответ, уточни, что именно нужно, и ничего не додумывай. "
+    "Не указывай источники: ни номера фрагментов, ни имена файлов, ни цитаты в "
+    "кавычках. Не называй документ, его номер, страницу или диапазон строк — "
+    "ответь только по существу."
 )
 
 #: Second rule, added after a near-duplicate corpus exposed a specific failure:
@@ -95,6 +110,13 @@ DEFAULT_MAX_CONTEXT_RATIO = 0.25
 
 #: Chars per token in the local estimator (``llm_bot.tokens`` divides by 4).
 CHARS_PER_TOKEN = 4
+
+#: Replacement for a quoted fragment the pointed-at chunk does not contain. Kept
+#: as a marker rather than deleted, for the reason the citation marker is kept: a
+#: confident sentence with its quote silently removed reads as a fact the sources
+#: back.
+UNSUPPORTED_QUOTE_TEXT = "цитата не подтверждена"
+UNSUPPORTED_QUOTE = f"[{UNSUPPORTED_QUOTE_TEXT}]"
 
 #: How many chunks to retrieve per question. The day-21 benchmark puts a
 #: single good chunk at rank 1 for roughly 60% of queries, and recall@3 is only
@@ -146,6 +168,14 @@ class RagEvent:
     #: the top-k cut. This is what a threshold sweep is computed from, so the
     #: sweep in the benchmark report stays reproducible offline.
     scored: tuple[tuple[str, float], ...] = field(default=())
+    #: The hits that were actually sent, in block order, with everything a
+    #: source needs to be shown: name, section, ``chunk_id`` and body text.
+    #: ``retrieved`` above is only the locations, which is enough to validate a
+    #: citation but not to print a source line or to check a quote against the
+    #: chunk it claims to come from. Narrowed by :meth:`Retriever.render` to the
+    #: hits the budget kept, so a handle can never point at evidence that was not
+    #: sent.
+    sources: tuple[RagHit, ...] = field(default=())
 
 
 def rag_budget_tokens(
@@ -210,10 +240,43 @@ class CitationAudit:
 
     kept: tuple[str, ...] = ()
     dropped: tuple[str, ...] = ()
+    #: Handles the answer actually leaned on, in the order they first appear.
+    #: Retrieval sent more than the answer used — on a four-chunk block the model
+    #: cited two — and a source list that repeats the whole shortlist claims
+    #: provenance the answer never had.
+    used_handles: tuple[int, ...] = ()
     #: The block was sent and the answer cited nothing at all. Nothing to
     #: replace, so the text is left alone, but a factual turn with no source is
     #: exactly the case the protocol exists for and it must not pass silently.
     uncited: bool = False
+
+    @property
+    def clean(self) -> bool:
+        return not self.dropped
+
+
+@dataclass
+class QuoteAudit:
+    """Which quoted fragments the chunk they are attributed to really contains.
+
+    Same shape as :class:`CitationAudit` on purpose: the two checks answer the
+    same question about different evidence — a citation says *which* chunk, a
+    quote says *which words* — so the verdict, the CLI line and the benchmark all
+    read them the same way.
+    """
+
+    kept: tuple[str, ...] = ()
+    dropped: tuple[str, ...] = ()
+    #: Quoted fragments that could not be checked because no citation claimed
+    #: them. Reported rather than dropped silently: a check that quietly skips
+    #: half its input is indistinguishable from a check that passes everything,
+    #: and the size of this number is what says which one it is.
+    unchecked: tuple[str, ...] = ()
+    #: No quote in the answer was confirmed verbatim. Set on every path, including
+    #: the ones where the answer contains no quotes at all: "nothing to check" and
+    #: "nothing checked" are the same risk here, and a flag that was only set on
+    #: the one path that had quotes reported an unquoted answer as fine.
+    uncited: bool = True
 
     @property
     def clean(self) -> bool:
@@ -237,15 +300,22 @@ def audit_citations(
     *,
     also_backed: Sequence[str] = (),
     ignore: Sequence[str] = (),
+    handles: Sequence[str] = (),
 ) -> tuple[str, CitationAudit]:
     """Replace citations in ``text`` that the block at ``locations`` cannot back.
 
-    The protocol asks for ``[file:lines]``, and the model mostly complies — but
+    The protocol asks for the chunk's number, and the model mostly complies — but
     it rewrites what it copies. On a corpus of near-duplicate documents 12 of 15
     citations to one file came back with a single digit changed from the name on
     disk: the digits moved and nothing noticed. So a citation is checked against
     what was actually sent, both the file name and the line range, and anything
     else is replaced with :data:`UNSUPPORTED_CITATION`.
+
+    ``handles`` is the block's locations in printed order, so ``handles[n-1]`` is
+    what ``[n]`` names. A number is resolved to the hit it points at and judged by
+    that hit's real name and range, which is the point of printing a number: the
+    model never has to reproduce a file name to be credited, and a name it still
+    tries to reproduce anyway is checked the same way as before.
 
     ``ignore`` holds brackets that are *not* source citations and must survive
     untouched. The prompt renders every invariant as ``- [STACK-1] (kind) ...``,
@@ -260,6 +330,13 @@ def audit_citations(
         parsed = _parse_location(location)
         if parsed is not None:
             known.append(parsed)
+    by_handle: dict[str, str] = {}
+    #: First handle per file, for a citation that named a file instead of a number.
+    handle_of_name: dict[str, int] = {}
+    for number, location in enumerate(handles, 1):
+        if _parse_location(location) is not None:
+            by_handle[str(number)] = location
+            handle_of_name.setdefault(location.split(":", 1)[0], number)
     # A citation may name a document by its id alone, as in ``[ID-123-456]``.
     # That is the same source, not a different one, so it is accepted when the
     # id belongs to exactly one document in play: if two of them carried the same
@@ -281,6 +358,7 @@ def audit_citations(
 
     kept: list[str] = []
     dropped: list[str] = []
+    used: list[int] = []
     skipped = {item.strip() for item in ignore}
 
     def replace(match: re.Match[str]) -> str:
@@ -293,15 +371,30 @@ def audit_citations(
             return match.group(0)
         start = match.group(2)
         end = match.group(3) or start
-        supported = False
+        pointed = by_handle.get(cited)
+        if pointed is not None:
+            # A handle stands for the whole hit it was printed above, so it is
+            # supported as long as that hit was really sent — there is no range
+            # to re-derive and no name to get wrong. Logged as the full location
+            # so ``kept`` reads the same whichever form the model chose.
+            kept.append(pointed)
+            if int(cited) not in used:
+                used.append(int(cited))
+            return match.group(0)
+        matched: str | None = None
         for name, first, last in known:
             if not names_match(cited, name):
                 continue
             if start is None or (int(start) >= first and int(end) <= last):
-                supported = True
+                matched = name
                 break
-        if supported:
+        if matched is not None:
             kept.append(cited)
+            # A citation that named a file still points at one of the printed
+            # chunks, so it belongs in the source list under that chunk's number.
+            number = handle_of_name.get(matched)
+            if number is not None and number not in used:
+                used.append(number)
             return match.group(0)
         dropped.append(cited)
         return UNSUPPORTED_CITATION
@@ -310,6 +403,7 @@ def audit_citations(
     return cleaned, CitationAudit(
         kept=tuple(kept),
         dropped=tuple(dropped),
+        used_handles=tuple(used),
         uncited=not kept and not dropped,
     )
 
@@ -344,16 +438,299 @@ def strip_citations(text: str, *, ignore: Sequence[str] = ()) -> str:
     return cleaned.strip()
 
 
+#: Stem of the source list, exported so checks and parsers look for it instead of
+#: repeating the wording. A test asserting on a hardcoded string breaks when
+#: someone improves the wording; one that greps for this constant keeps measuring
+#: the thing it was written for. It is a stem, not a full heading, because the
+#: list has two forms and detection must hold for both — see
+#: :func:`render_sources_footer`.
+SOURCES_HEADING = "Источник"
+
+
+def render_sources_footer(
+    sources: Sequence[RagHit], used: Sequence[int] = ()
+) -> str:
+    """Return the source list for the chunks the answer leaned on.
+
+    Built by code rather than asked from the model. The measurement is why: the
+    block asks for a chunk number, yet on a saved run only 9 of 20 answers carried
+    any citation at all, and the ones that did were the ones where the model
+    happened to copy the shape faithfully. A file name with spaces and
+    non-ASCII letters is a bad thing to make correctness depend on — the run also
+    produced ``[файл: report.pdf:14]``, the protocol's own placeholder with the
+    name glued on, which names no retrievable chunk. Nothing here depends on the
+    model cooperating, so "every answer carries its sources" stops being a request
+    and becomes a property of the reply.
+
+    Only ``used`` is listed, not everything that was sent. Retrieval returns a
+    shortlist and the answer leans on part of it: a four-chunk block where the
+    model cited one chunk does not have four sources, it has one. Printing the
+    rest claims provenance the answer never had, and the extra lines are exactly
+    the ones a reader cannot tell apart from real support.
+
+    The number is the chunk's own handle, never renumbered — a ``[3]`` in the
+    text and ``[3]`` here must be the same chunk, since that correspondence is
+    the only way a reader can check anything. The cost is that a one-source
+    answer reads "Источник [2]" while having nothing else, which looks like an
+    off-by-one rather than a reference. So the wording carries the reference
+    instead of relying on the list position: singular for one source, and an
+    explicit note that the numbers are the ones used in the answer for several.
+    Neither form renumbers anything.
+
+    An answer that cited nothing gets no list. A refusal has no evidence, and a
+    source list under «I did not find it» says the opposite.
+    """
+    if not sources or not used:
+        return ""
+    chosen = [
+        (number, sources[number - 1])
+        for number in sorted({n for n in used if 1 <= n <= len(sources)})
+    ]
+    lines = ["", _source_line(chosen)]
+    return "\n".join(lines)
+
+
+def _source_line(chosen: Sequence[tuple[int, RagHit]]) -> str:
+    """One rendered entry per used chunk, under the right heading."""
+    rendered = []
+    for number, hit in chosen:
+        parts = [f"[{number}] {hit.location}"]
+        if hit.section:
+            parts.append(f"— {hit.section}")
+        if hit.chunk_id:
+            parts.append(f"· chunk {hit.chunk_id}")
+        rendered.append(" ".join(parts))
+    # Only the heading differs between one source and several; every entry keeps
+    # the same shape so the handle reads as a reference in both. The singular
+    # exists because a lone «[2]» under a plural heading looks like an off-by-one
+    # rather than the chunk number the answer actually used.
+    if len(rendered) == 1:
+        return f"{SOURCES_HEADING}:\n" + rendered[0]
+    return f"{SOURCES_HEADING}и (фрагменты из ответа):\n" + "\n".join(rendered)
+
+
+#: Quote forms a verbatim phrase may take. «» is what the prompt asks for; the
+#: straight pair is accepted because models switch to it unprompted, and the
+#: backtick pair because a measured run showed the model quoting code spans in a
+#: corpus where every fact *is* a code span or a number — a check blind to that
+#: reports "the model does not quote" about answers that quote constantly.
+#: Minimum length is per-form: an identifier is one character shorter than prose.
+_QUOTE_FORMS: tuple[tuple[int, str, str], ...] = (
+    (3, "«", "»"),
+    (3, '"', '"'),
+    (2, "`", "`"),
+)
+
+
+def _norm_quote(value: str) -> str:
+    """Fold a quote and a chunk body to a form that can be compared.
+
+    Case, surrounding punctuation, non-breaking spaces and hyphenation are the
+    only differences a faithful paraphrase of a quote can have, so they are
+    normalised away. Everything else is left alone: a quote that only matches
+    after heavy normalisation is not evidence, it is a coincidence of numbers.
+    """
+    value = value.replace("\u00a0", " ").replace("\u2011", "-").replace("\u2013", "-")
+    value = value.replace("\u2014", "-").strip().strip(".,;:!?")
+    # Markdown emphasis is formatting, not wording. A model reproducing the
+    # source's own ``**`` and ``_`` has quoted it exactly, and scoring that as a
+    # paraphrase would teach the auditor to fail correct answers.
+    value = re.sub(r"[*_`]+", "", value)
+    return re.sub(r"\s+", " ", value).casefold()
+
+
+def _quotes_in(text: str) -> list[tuple[str, int, int]]:
+    """Every quoted fragment as ``(body, start, end)`` spans of ``text``."""
+    found: list[tuple[str, int, int]] = []
+    for minimum, opener, closer in _QUOTE_FORMS:
+        pattern = (
+            rf"{re.escape(opener)}"
+            rf"([^{re.escape(closer)}\n]{{{minimum},200}})"
+            rf"{re.escape(closer)}"
+        )
+        for match in re.finditer(pattern, text):
+            found.append((match.group(1), match.start(), match.end()))
+    return sorted(found, key=lambda item: item[1])
+
+
+#: A citation that *follows* a quote only tags it when almost nothing sits
+#: between them — only spaces and punctuation, no words. "«фраза» [1]" and
+#: "«фраза», [1]" tag the quote; "Продукт «Название» стоит [1]" does not, because
+#: there the marker belongs to the sentence and the quoted word is the
+#: customer's own. Distancing the two is what keeps a name the customer typed
+#: from being scored as a claim the chunk has to contain.
+_QUOTE_CITATION_MAX_GAP = 12
+
+
+def _owners(
+    text: str, markers: list[tuple[int, str]], start: int, end: int
+) -> tuple[str, ...]:
+    """The citations this quote span could belong to, best guess first.
+
+    More than one when the quote sits between two markers, which is what the
+    model does: ``[1] «фраза» [2]`` for a phrase drawn from the second chunk. A
+    single positional rule fails half of those — the phrase is verbatim in one
+    chunk and absent from the other, so choosing by position alone marks a
+    correct quote as unbacked. The candidates are returned in preference order
+    and the caller settles it by looking in them, which keeps the property that
+    matters: a phrase in none of them is still refused.
+    """
+    before = [name for position, name in markers if position < start]
+    found: list[str] = []
+    if before:
+        found.append(before[-1])
+    # A marker may also tag the quote by following it, but only immediately: a
+    # marker a sentence later belongs to that sentence.
+    for position, name in markers:
+        if position <= end:
+            continue
+        gap = text[end:position]
+        if len(gap) > _QUOTE_CITATION_MAX_GAP:
+            break
+        if any(character.isalpha() for character in gap):
+            break
+        found.append(name)
+        break
+    return tuple(found)
+
+
+def audit_quotes(
+    text: str,
+    sources: Sequence[RagHit],
+    *,
+    ignore: Sequence[str] = (),
+) -> tuple[str, QuoteAudit]:
+    """Replace quoted fragments that the pointed-at chunk does not contain.
+
+    A citation says *which* chunk a claim came from; it says nothing about the
+    wording. The model can cite a correct chunk and still state the fact wrongly,
+    and the line-range check passes either way. So the protocol also asks for the
+    phrase itself, and this checks that the phrase is really in the chunk — which
+    is the one claim in an answer that can be settled without a model.
+
+    Only quotes a citation owns are considered, and a citation may sit on either
+    side: measured, the model wrote ``[1] «фраза»`` about as often as
+    ``«фраза» [1]``, so reading the marker only backwards silently skipped half
+    of them. A quoted product name in the user's own question («Тростниковый
+    крем») is not evidence and not a failure; a quoted fragment the model
+    attributes to a chunk is a claim about that chunk, and if the words are not
+    there it has to be marked.
+
+    ``ignore`` works as in :func:`audit_citations`: brackets that are not sources
+    have no chunk to be checked against, and the quotes under them are left alone.
+    """
+    if not sources:
+        return text, QuoteAudit()
+    by_handle = {str(number): hit for number, hit in enumerate(sources, 1)}
+    skipped = {item.strip() for item in ignore}
+
+    # Citation spans first, so each quote can be attributed to the nearest one
+    # on either side of it.
+    markers = [
+        (match.start(), match.group(1).strip())
+        for match in _CITATION_RE.finditer(text)
+        if match.group(1).strip() not in skipped
+    ]
+    if not markers:
+        return text, QuoteAudit()
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    unchecked: list[str] = []
+    out: list[str] = []
+    cursor = 0
+    for body, start, end in _quotes_in(text):
+        if start < cursor:
+            # Already inside a quote that was checked as a whole. Checking the
+            # inner span as well would emit the text twice, once from each.
+            continue
+        candidates = [
+            hit for hit in (by_handle.get(name) for name in _owners(text, markers, start, end))
+            if hit is not None
+        ]
+        if not candidates:
+            # No citation claims this quote, so it is not a claim about a chunk —
+            # it may be the customer's own wording. Left exactly as written, and
+            # counted, so the report can show how much went unverified.
+            unchecked.append(body)
+            continue
+        needle = _norm_quote(body)
+        target = next(
+            (hit for hit in candidates if needle in _norm_quote(hit.text)), None
+        )
+        out.append(text[cursor:start])
+        if target is not None:
+            kept.append(body)
+            out.append(text[start:end])
+        else:
+            dropped.append(body)
+            out.append(UNSUPPORTED_QUOTE)
+        cursor = end
+    if not out:
+        return text, QuoteAudit(
+            kept=tuple(kept),
+            dropped=tuple(dropped),
+            unchecked=tuple(unchecked),
+            uncited=not kept,
+        )
+    out.append(text[cursor:])
+    return "".join(out), QuoteAudit(
+        kept=tuple(kept),
+        dropped=tuple(dropped),
+        unchecked=tuple(unchecked),
+        uncited=not kept,
+    )
+
+
+def _handles_to_files(footer: str) -> dict[str, str]:
+    """``handle -> file name`` from the source list this module wrote.
+
+    Parsed rather than pattern-matched against the citation regex, because the
+    list puts the handle in brackets and the document *outside* them —
+    ``[2] kb/hours.md:11-15`` — which is the point of the format.
+    """
+    mapping: dict[str, str] = {}
+    for line in footer.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("["):
+            continue
+        handle, _, rest = stripped[1:].partition("]")
+        rest = rest.strip().lstrip(":").strip()
+        location = re.split(r"\s+[—·]", rest, maxsplit=1)[0].strip()
+        if handle.strip().isdigit() and location:
+            mapping[handle.strip()] = location.split(":", 1)[0]
+    return mapping
+
+
 def sources_from_text(text: str, *, limit: int = 2) -> list[str]:
-    """File names cited in ``text``, most recent first, as bare names.
+    """Documents cited in ``text``, most recent first, as bare file names.
 
     Used to keep a follow-up question on the document the dialog is already
     about. Order is left as found — the caller wants the first documents that
     were cited, not a frequency ranking, because a bot repeats the same file.
+
+    Two things about the modern reply shape are handled here. A chunk handle
+    names a position in a block the reader never saw, so ``[2]`` is not a
+    document and must never be passed on as one — the file name comes from the
+    source list the code appended, which prints the location for exactly that
+    handle. And the list itself is skipped: it repeats handles rather than
+    documents, so reading it as citations put the literal string ``"2"`` into
+    the next turn's retrieval bias.
     """
+    body, _, footer = text.partition(SOURCES_HEADING)
+    printed = _handles_to_files(footer)
     names: list[str] = []
-    for match in _CITATION_RE.finditer(text):
-        name = match.group(1).strip()
+    for match in _CITATION_RE.finditer(body):
+        cited = match.group(1).strip()
+        if cited.isdigit():
+            # A handle with no entry in the source list names nothing we can
+            # retrieve. Passing "2" on as a document biases the next turn's
+            # search towards a filename that does not exist.
+            if cited not in printed:
+                continue
+            name = printed[cited]
+        else:
+            name = cited
         if name and name not in names:
             names.append(name)
         if len(names) >= limit:
@@ -361,8 +738,19 @@ def sources_from_text(text: str, *, limit: int = 2) -> list[str]:
     return names
 
 
-def _hit_source_line(hit: RagHit) -> str:
+def _hit_source_line(hit: RagHit, handle: int = 0) -> str:
+    """Header line for one hit: ``[1] file:11-15 — section``.
+
+    The number is what the model is asked to cite. A file name with spaces and
+    non-ASCII letters is a bad thing to ask a model to retype: measured on a
+    near-duplicate corpus the model produced ``[файл: report.pdf:14]`` — the
+    protocol's own placeholder, copied literally, with the name tacked on — and
+    the audit could not match it. A number has no such failure mode, and the full
+    location stays in the block for the reader and for the audit.
+    """
     section = f" — {hit.section}" if hit.section else ""
+    if handle:
+        return f"[{handle}] {hit.location}{section}"
     return f"[{hit.location}]{section}"
 
 
@@ -558,7 +946,12 @@ class Retriever:
                     section=str(meta.get("section") or meta.get("title") or ""),
                     text=str(record.get("text", "")),
                     score=float(score),
-                    chunk_id=str(record.get("chunk_id", "")),
+                    chunk_id=str(
+                        meta.get("chunk_id")
+                        or record.get("chunk_id")
+                        or record.get("id")
+                        or ""
+                    ),
                 )
             )
         event = RagEvent(
@@ -569,6 +962,7 @@ class Retriever:
             reranked=reranked,
             filtered=filtered,
             scored=scored,
+            sources=tuple(hits),
         )
         return hits, event
 
@@ -599,6 +993,7 @@ class Retriever:
             context_tokens=(
                 MESSAGE_OVERHEAD_TOKENS + estimate_tokens(block) if block else 0
             ),
+            sources=tuple(kept),
         )
 
     def _fit(self, hits: list[RagHit]) -> tuple[str, int]:
@@ -621,7 +1016,7 @@ class Retriever:
         # is left. The char-per-token estimate is approximate, so shorten in a
         # loop until the rendered block really fits — a block that overshoots the
         # budget is exactly the kind of silent overflow the cap exists to stop.
-        source = _hit_source_line(hits[0])
+        source = _hit_source_line(hits[0], 1)
         full = hits[0].text.strip()
         room = budget * CHARS_PER_TOKEN - len(self._head()) - len(source) - 2
         while room > 0:
@@ -644,8 +1039,8 @@ class Retriever:
         protocol = _RAG_PROTOCOL if self.cite else _RAG_PROTOCOL_NO_CITATIONS
         return f"{_RAG_HEADER}\n{protocol}\n{_RAG_NO_BLENDING}\n"
 
-    def _hit_text(self, hit: RagHit) -> str:
-        return f"{_hit_source_line(hit)}\n{hit.text.strip()}"
+    def _hit_text(self, hit: RagHit, handle: int) -> str:
+        return f"{_hit_source_line(hit, handle)}\n{hit.text.strip()}"
 
     def _texts(self, hits: Sequence[RagHit]) -> list[str]:
         """Each hit as ``header`` + body.
@@ -663,7 +1058,7 @@ class Retriever:
         sibling's file name directly above the text, which is what the
         no-blending rule is about. Kept out of the block, deliberately.
         """
-        return [self._hit_text(hit) for hit in hits]
+        return [self._hit_text(hit, handle) for handle, hit in enumerate(hits, 1)]
 
     def _block(self, hits: list[RagHit]) -> str:
         return self._block_from_texts(self._texts(hits))
@@ -678,3 +1073,210 @@ class Retriever:
     @staticmethod
     def _size(block: str) -> int:
         return MESSAGE_OVERHEAD_TOKENS + estimate_tokens(block)
+
+# --------------------------------------------------------------------------- #
+# Refusals and grounding
+# --------------------------------------------------------------------------- #
+
+#: The reply declined to answer from the block. Lived here since the benchmark
+#: kept its own copy, which meant the CLI and the report could disagree about
+#: whether one and the same answer was a refusal — and a disagreement about that
+#: is exactly what makes a grounding number meaningless.
+REFUSAL_RE = re.compile(
+    r"(не наш[её]л|не нахожу|не могу найти|не смог найти|не удалось найти"
+    r"|информаци\w*[^.\n]{0,24}?нет\b|нет информации|не содержит"
+    r"|не упоминается|не указан\w*|не знаю|не в базе|не в документах"
+    r"|отсутствует|не встречается|за рамками (?:этой |моей )?базы)",
+    re.IGNORECASE,
+)
+
+#: What the bot says instead of a claim it cannot back. Fixed wording on
+#: purpose: it is the one sentence that must be recognisable by the same
+#: :func:`is_refusal` the benchmark uses, and free wording cannot be.
+NO_ANSWER_TEXT = "Не могу ответить по этому контексту. Уточните, пожалуйста, вопрос."
+
+
+def is_refusal(text: str) -> bool:
+    """``True`` when ``text`` declines rather than answers.
+
+    Deliberately the same predicate the benchmark scores with. A second
+    implementation is how a report ends up claiming a refusal rate the runtime
+    would never produce.
+    """
+    return bool(REFUSAL_RE.search(text))
+
+
+class Grounding(str, Enum):
+    """What a reply did with the block it was given."""
+
+    #: Facts, each with a chunk number, and every quoted phrase found verbatim in
+    #: the chunk it was attributed to. The only verdict that counts as an answer.
+    GROUNDED = "grounded"
+    #: Declined. Not a failure — the point of the protocol is that a block
+    #: without the answer produces this.
+    REFUSED = "refused"
+    #: Answered anyway, with nothing checkable behind it.
+    UNGROUNDED = "ungrounded"
+
+    def __bool__(self) -> bool:
+        """So ``if session.last_grounding:`` reads as "there was a verdict"."""
+        return True
+
+
+@dataclass(frozen=True)
+class GroundingVerdict:
+    """The verdict plus the evidence behind it, for the CLI and the report."""
+
+    status: Grounding
+    #: Chunks cited and confirmed against the block.
+    supported: tuple[str, ...] = ()
+    #: Chunks the block cannot back.
+    unsupported: tuple[str, ...] = ()
+    #: Quotes found verbatim in the chunk they were attributed to.
+    quotes: tuple[str, ...] = ()
+    #: Quotes the cited chunk does not contain.
+    bad_quotes: tuple[str, ...] = ()
+    #: The block was sent, the model answered, and it cited nothing. Recorded
+    #: because it is the common case: 11 of 20 answers on a saved run.
+    uncited: bool = False
+    #: It cited a chunk and quoted nothing from it. A separate flag from
+    #: :attr:`uncited` because it is the more confusing one: the answer carries
+    #: sources, names them correctly, reads as if it were checked, and the claim
+    #: in it has not been compared against a single word of the evidence. With
+    #: only :attr:`uncited` in the verdict, the diagnostic for this state had
+    #: nothing to print and said nothing at all.
+    unquoted: bool = False
+    #: ``False`` when there was nothing to check — citations were switched off,
+    #: so the answer is neither backed nor caught out. Kept separate from
+    #: :attr:`clean` so an unjudged answer is never counted as a good one.
+    checked: bool = True
+
+    @property
+    def clean(self) -> bool:
+        return self.checked and not self.unsupported and not self.bad_quotes
+
+
+def judge_grounding(
+    reply: str,
+    event: RagEvent | None,
+    *,
+    citations: CitationAudit | None = None,
+    quotes: QuoteAudit | None = None,
+) -> GroundingVerdict:
+    """Decide whether ``reply`` is backed by the block it was sent.
+
+    Based on what can be checked without a model, on purpose. A reranker score
+    cannot be used for this: measured on a corpus where the trap question's
+    highest-scoring chunk is wrong, its score is ``+0.7`` while a correct chunk
+    for a different question sits at ``-4.0``. The two populations overlap, so
+    any threshold either drops good answers or lets bad ones through. Whether the
+    model actually quoted the chunk it cites is checkable exactly, and that is
+    the strongest signal available without asking another model to grade the
+    first one.
+
+    Refusal is checked before anything else, because a reply that declined is
+    correct by definition and must not be punished for carrying no citation.
+    """
+    if event is None or not event.sources:
+        # No block was sent, so nothing can be grounded in one. Not a refusal —
+        # the caller only reaches this with RAG on and retrieval empty, which
+        # :meth:`Retriever.render` already treats as an answerable-with-nothing.
+        return GroundingVerdict(Grounding.UNGROUNDED)
+    if is_refusal(reply):
+        return GroundingVerdict(Grounding.REFUSED)
+
+    supported = tuple(citations.kept) if citations else ()
+    unsupported = tuple(citations.dropped) if citations else ()
+    kept_quotes = tuple(quotes.kept) if quotes else ()
+    bad_quotes = tuple(quotes.dropped) if quotes else ()
+    uncited = bool(citations.uncited) if citations else not supported
+    unquoted = bool(quotes.uncited) if quotes else not kept_quotes
+
+    return GroundingVerdict(
+        # A refusal-shaped answer aside, a claim counts only if it points at a
+        # chunk that was really sent *and* backs the claim with words from it.
+        status=(
+            Grounding.GROUNDED
+            if supported and kept_quotes and not unsupported and not bad_quotes
+            else Grounding.UNGROUNDED
+        ),
+        supported=supported,
+        unsupported=unsupported,
+        quotes=kept_quotes,
+        bad_quotes=bad_quotes,
+        uncited=uncited,
+        unquoted=unquoted,
+    )
+
+
+@dataclass(frozen=True)
+class FinalAnswer:
+    """A reply after the retrieved block has had its say about it.
+
+    ``citations`` and ``quotes`` are ``None`` when nothing was checked — the
+    caller asked for no sources, so there is no evidence to verify. That is not
+    the same as an empty audit, which means the answer was checked and carried
+    neither a citation nor a quote, and the report must not confuse the two.
+    """
+
+    text: str
+    citations: CitationAudit | None
+    quotes: QuoteAudit | None
+    grounding: GroundingVerdict
+
+
+def finalize_answer(
+    reply: str,
+    event: RagEvent | None,
+    *,
+    cite: bool = True,
+    invariant_ids: Sequence[str] = (),
+) -> FinalAnswer:
+    """Check a reply against the block it was sent, and return it ready to show.
+
+    The one place this happens. :class:`~llm_bot.agent.Session` calls it before a
+    reply is remembered or persisted, and ``scripts/compare_rag.py`` calls it on
+    the answers it collects. Both used to be able to hold their own idea of what a
+    backed answer looks like, which is how a report ends up scoring the bot's
+    behaviour instead of the bot's.
+
+    Order matters and is the whole point: citations first, because a quote is
+    attributed to a chunk by the marker in front of it; then quotes, against the
+    hits those markers resolved to; then the source list, appended rather than
+    asked for so it cannot be forgotten.
+    """
+    if event is None or not event.sources:
+        return FinalAnswer(
+            reply, None, None, GroundingVerdict(Grounding.UNGROUNDED, checked=False)
+        )
+
+    if not cite:
+        # Nothing to verify: without a citation and a quote there is no evidence
+        # to check, so the verdict says so rather than blaming the answer.
+        return FinalAnswer(
+            strip_citations(reply, ignore=invariant_ids),
+            None,
+            None,
+            GroundingVerdict(Grounding.UNGROUNDED, checked=False),
+        )
+
+    handles = [hit.location for hit in event.sources]
+    text, citations = audit_citations(
+        reply,
+        # The chunks that were sent, not the ones retrieval returned. A hit can
+        # be retrieved and then dropped for the token budget, and a citation to a
+        # chunk the model never saw is exactly the failure this audit exists for.
+        handles,
+        ignore=invariant_ids,
+        handles=handles,
+    )
+    text, quotes = audit_quotes(text, event.sources, ignore=invariant_ids)
+    text += render_sources_footer(
+        event.sources, citations.used_handles if citations else ()
+    )
+    return FinalAnswer(
+        text,
+        citations,
+        quotes,
+        judge_grounding(reply, event, citations=citations, quotes=quotes),
+    )

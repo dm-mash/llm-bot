@@ -34,6 +34,13 @@ class _FakeSession:
         self.history.append({"role": "assistant", "content": "reply-ok"})
         return "reply-ok"
 
+    @property
+    def last_grounding(self) -> None:
+        # Mirrors ``Session.last_grounding`` (llm_bot/agent.py), read by
+        # ``_print_grounding``. Nothing is retrieved in this fake, so there is
+        # no verdict to report.
+        return None
+
 
 class _TaskSession(_FakeSession):
     """Fake session exposing a task machine, like ``Session`` does.

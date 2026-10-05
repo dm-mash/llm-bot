@@ -14,10 +14,17 @@ from llm_bot.factory import make_session
 from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.rag import (
     DEFAULT_MAX_CONTEXT_RATIO,
+    NO_ANSWER_TEXT,
+    UNSUPPORTED_QUOTE_TEXT,
+    Grounding,
     RagEvent,
     RagHit,
     Retriever,
+    audit_quotes,
+    finalize_answer,
     rag_budget_tokens,
+    render_sources_footer,
+    sources_from_text,
 )
 from llm_bot.stores import AgentConfig, ModelConfig
 from llm_bot.tokens import estimate_tokens
@@ -293,7 +300,8 @@ def test_block_states_the_protocol_and_cites_sources(index_path: Path) -> None:
     block, event = retriever(index_path, top_k=1).render(QUESTIONS["hours"])
     assert "Отвечай ТОЛЬКО по этому контексту" in block
     assert "не нашёл ответ" in block
-    assert "[kb/hours.md:11-15] — Часы работы" in block
+    assert "дословную фразу" in block
+    assert "[1] kb/hours.md:11-15 — Часы работы" in block
     assert "с 8:00 до 22:00" in block
     assert event.dropped == 0
     assert event.context_tokens == estimate_tokens(block) + 4
@@ -516,14 +524,22 @@ def test_citations_can_be_switched_off_without_losing_the_grounding_rules(
     on, _ = retriever(index_path, top_k=1).render(QUESTIONS["hours"])
     off, _ = retriever(index_path, top_k=1, cite=False).render(QUESTIONS["hours"])
 
-    assert ragmod._RAG_PROTOCOL in on and "укажи источник" in on
+    # Asserts the demand and its worked example, not the exact wording: the
+    # wording was rewritten once to raise the quote rate, and a test that froze
+    # the sentence would have turned that measurement into an obstacle.
+    assert ragmod._RAG_PROTOCOL in on
+    assert "укажи номер" in on
+    assert "«срок — 6 месяцев»" in on
     assert ragmod._RAG_PROTOCOL_NO_CITATIONS in off
-    assert "укажи источник" not in off
-    # Removing the demand for [file:lines] was measured to be insufficient: the
+    assert "укажи этот номер" not in off
+    # Removing the demand for the handle was measured to be insufficient: the
     # model drops the brackets and then narrates the source in prose. The
     # no-cite clause has to forbid naming it in words as well.
-    assert "ни словами" in off
+    assert "ни имена файлов" in off
     assert "его номер" in off
+    # A quote with no number is an unbacked claim wearing quotation marks, so it
+    # goes with the handle.
+    assert "ни цитаты в кавычках" in off
     for block in (on, off):
         assert ragmod._RAG_NO_BLENDING in block
         assert "ничего не додумывай" in block
@@ -685,13 +701,24 @@ def test_session_injects_the_block_and_keeps_it_out_of_history(
         tmp_path, transport, retriever=retriever(index_path, top_k=1)
     )
 
-    assert session.chat(QUESTIONS["hours"]) == "Мы с 8:00 до 22:00."
+    assert session.chat(QUESTIONS["hours"]).startswith("Мы с 8:00 до 22:00.")
 
     blocks = [b for b in _systems(payloads[0]) if "Контекст из локальной базы" in b]
     assert len(blocks) == 1
-    assert "[kb/hours.md:11-15]" in blocks[0]
+    assert "[1] kb/hours.md:11-15 — Часы работы" in blocks[0]
     assert session.rag_events[-1].question == QUESTIONS["hours"]
     assert "kb/hours.md" in session.last_rag_event.retrieved[0]
+    # The block's handles must address the hits that were actually sent, or a
+    # [1] in the reply can point at evidence the model never saw.
+    sent = session.last_rag_event.sources
+    assert [hit.location for hit in sent] == list(session.last_rag_event.retrieved)
+    # This answer named no chunk, so it gets no source list: the footer states
+    # what the reply leaned on, and an uncited reply leaned on nothing. It must
+    # also stay out of the context, where the model could read its own answer
+    # back and start copying the footer's shape.
+    reply = session.chat("ещё раз")
+    assert ragmod.SOURCES_HEADING not in reply
+    assert not any("Источники:" in b for b in _systems(payloads[1]))
 
 
 def test_session_keeps_the_dialog_on_the_document_it_already_cited(
@@ -1173,3 +1200,512 @@ def test_strip_citations_tidies_the_spacing_it_leaves() -> None:
     assert ragmod.strip_citations("С 8:00 до 22:00 [kb/hours.md:1-2].") == (
         "С 8:00 до 22:00."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Verbatim quotes
+# --------------------------------------------------------------------------- #
+
+
+def test_a_quote_the_chunk_does_not_contain_is_marked(index_path: Path) -> None:
+    """A citation says which chunk; only the quote says which words.
+
+    Measured, this is the pair the citation check alone misses: on a corpus of
+    near-duplicate documents the model cited the right file with the right lines
+    and still stated the price wrong, because nothing looked at the wording. So
+    the protocol now asks for the phrase, and a phrase that is not in the chunk
+    it is attributed to is replaced rather than passed on as a fact.
+    """
+    hit = retriever(index_path, top_k=1).retrieve(QUESTIONS["hours"])[0][0]
+    assert "с 8:00 до 22:00" in hit.text
+
+    reply, audit = audit_quotes(
+        'Часы [1]: «Часы работы: с 8:00 до 23:00».',
+        [hit],
+    )
+
+    assert UNSUPPORTED_QUOTE_TEXT in reply
+    assert "Часы работы: с 8:00 до 23:00" not in reply
+    assert audit.dropped == ("Часы работы: с 8:00 до 23:00",)
+
+
+def test_a_quote_that_is_verbatim_in_the_chunk_survives(index_path: Path) -> None:
+    """The check is a substring test, not a paraphrase test, and must behave
+    like one: quoting correctly is what earns the answer, so the only thing
+    standing between a good reply and the marker must be the model's own care."""
+    hit = retriever(index_path, top_k=1).retrieve(QUESTIONS["hours"])[0][0]
+    reply, audit = audit_quotes('Часы [1]: «с 8:00 до 22:00».', [hit])
+
+    assert audit.kept == ("с 8:00 до 22:00",)
+    assert UNSUPPORTED_QUOTE_TEXT not in reply
+
+
+def test_a_quoted_name_from_the_question_is_not_a_claim_about_a_chunk(
+    index_path: Path,
+) -> None:
+    """«Тростниковый крем» is the user's own wording, not evidence.
+
+    Only quotes the model attributes to a citation are checked. Otherwise the
+    audit would fail every answer that names the product the customer asked
+    about, and a check that cries wolf gets switched off.
+    """
+    hit = retriever(index_path, top_k=1).retrieve(QUESTIONS["hours"])[0][0]
+    reply, audit = audit_quotes('Напиток «Тростниковый крем» — это [1].', [hit])
+
+    assert reply == 'Напиток «Тростниковый крем» — это [1].'
+    assert not audit.dropped
+    assert not audit.kept
+
+
+# --------------------------------------------------------------------------- #
+# Grounding
+# --------------------------------------------------------------------------- #
+
+
+def test_an_answer_with_a_confirmed_quote_is_grounded(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """The three things day24 asks of every answer, and this turn has all of
+    them: a source, a citation, and a quote that is really in that chunk."""
+    transport, _ = _capturing_transport(
+        "Часы [1]: с 8:00 до 22:00 — «Часы работы: с 8:00 до 22:00»."
+    )
+    session = _make_session(
+        tmp_path, transport, retriever=retriever(index_path, top_k=1)
+    )
+    session.chat(QUESTIONS["hours"])
+
+    verdict = session.last_grounding
+    assert verdict is not None
+    assert verdict.status is Grounding.GROUNDED
+    assert verdict.quotes == ("Часы работы: с 8:00 до 22:00",)
+    assert verdict.clean
+
+
+def test_an_answer_without_a_quote_is_ungrounded_even_with_a_good_citation(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """A valid [1] and no quote means the claim itself was never checked.
+
+    This is the state 11 of 20 answers on a saved run were in, and it is exactly
+    what a citation-only rule counts as success.
+    """
+    transport, _ = _capturing_transport("Часы [1]: с 8:00 до 22:00.")
+    session = _make_session(
+        tmp_path, transport, retriever=retriever(index_path, top_k=1)
+    )
+    reply = session.chat(QUESTIONS["hours"])
+
+    assert session.last_grounding.status is Grounding.UNGROUNDED
+    # The source list is code-built, so it is there even with no quote.
+    assert ragmod.SOURCES_HEADING in reply
+
+
+def test_a_refusal_is_not_punished_for_carrying_no_citation(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """Declining is the correct behaviour when the block has no answer.
+
+    Judged before the audits, so a refusal is never reported as ungrounded for
+    the thing it is right about.
+    """
+    transport, _ = _capturing_transport(
+        "Не нашёл ответ в этом контексте. Уточните, пожалуйста, что нужно."
+    )
+    session = _make_session(
+        tmp_path, transport, retriever=retriever(index_path, top_k=1)
+    )
+    session.chat("где душ")
+
+    assert session.last_grounding.status is Grounding.REFUSED
+
+
+def test_strict_mode_withdraws_an_answer_nothing_backs(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """--rag-strict replaces the claim, rather than shipping it with a marker.
+
+    A price or a limit stated wrongly is the failure this whole mechanism is
+    for, so the flag's job is to make the reply say nothing rather than to make
+    it say something with a warning attached.
+    """
+    transport, _ = _capturing_transport("Часы [1]: с 8:00 до 23:00.")
+    session = _make_session(
+        tmp_path,
+        transport,
+        retriever=retriever(index_path, top_k=1),
+        rag_strict=True,
+    )
+    reply = session.chat(QUESTIONS["hours"])
+
+    assert reply == NO_ANSWER_TEXT
+    assert "23:00" not in reply
+    # The footer went with the claim: sources for a withdrawn answer would read
+    # as support for it.
+    assert "Источники:" not in reply
+    assert session.last_grounding.status is Grounding.UNGROUNDED
+
+
+def test_strict_mode_leaves_a_grounded_answer_alone(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """Strict must not be a blanket refusal. The whole point of judging on the
+    quote rather than on a score is that a correct answer is distinguishable."""
+    transport, _ = _capturing_transport(
+        "Часы [1]: с 8:00 до 22:00 — «Часы работы: с 8:00 до 22:00»."
+    )
+    session = _make_session(
+        tmp_path,
+        transport,
+        retriever=retriever(index_path, top_k=1),
+        rag_strict=True,
+    )
+    reply = session.chat(QUESTIONS["hours"])
+
+    assert reply.startswith("Часы [1]: с 8:00 до 22:00")
+    assert ragmod.SOURCES_HEADING in reply
+
+
+def test_a_quote_in_backticks_is_checked_too() -> None:
+    """Measured, not assumed: on a run over technical documents the model quoted
+    in backticks, not «». An audit blind to that reports "the model does not
+    quote" about answers that quote constantly — and every fact in such a corpus
+    is a code span or a number anyway.
+    """
+    hit = RagHit(
+        "kb/limits.md", 1, 5, "Лимиты", "Лимит `max_summary_ratio` = 0.3.", 1.0, "c1"
+    )
+    reply, audit = audit_quotes("По умолчанию `max_summary_ratio` = 0.3 [1].", [hit])
+
+    assert audit.kept == ("max_summary_ratio",)
+    assert UNSUPPORTED_QUOTE_TEXT not in reply
+
+
+def test_markdown_emphasis_inside_a_quote_is_not_a_paraphrase() -> None:
+    """Reproducing the source's own `**` is quoting it exactly.
+
+    The scorer strips emphasis for the same reason; an audit that failed correct
+    answers would be switched off, and a switched-off audit protects nothing.
+    """
+    hit = RagHit(
+        "kb/limits.md", 1, 5, "Лимиты", "Правило **жёсткое**: 30% лимита.", 1.0, "c1"
+    )
+    reply, audit = audit_quotes("Правило «**жёсткое**: 30% лимита» [1].", [hit])
+
+    assert audit.kept, audit
+    assert UNSUPPORTED_QUOTE_TEXT not in reply
+
+
+def test_a_quote_is_attributed_to_a_citation_that_follows_it() -> None:
+    """Measured both ways: the model wrote `[1] «фраза»` about as often as
+    `«фраза» [1]`. Reading the marker only backwards silently skipped half."""
+    hit = RagHit(
+        "kb/hours.md", 11, 15, "Часы", "Часы работы: с 8:00 до 22:00.", 1.0, "c1"
+    )
+
+    assert audit_quotes("«с 8:00 до 22:00» [1].", [hit])[1].kept
+    assert audit_quotes("[1]. Часы: «с 8:00 до 22:00».", [hit])[1].kept
+
+
+def test_a_nested_quote_is_not_emitted_twice() -> None:
+    """A «…`code`…» span matches both the guillemets and the backticks.
+
+    Checking the inner span as well would splice the same words into the reply a
+    second time, which is a corruption the user reads, not a metric that moves.
+    """
+    hit = RagHit("kb/limits.md", 1, 5, "Лимиты", "Лимит `ratio` = 0.3.", 1.0, "c1")
+    reply, audit = audit_quotes("«Лимит `ratio` = 0.3.» [1]", [hit])
+
+    assert reply.count("ratio") == 1
+    assert audit.kept == ("Лимит `ratio` = 0.3.",)
+
+
+def test_an_uncheckable_quote_is_counted_rather_than_silently_skipped() -> None:
+    """A quote with a marker a sentence away is not the model's claim about a
+    chunk — it is usually the customer's own wording. Leaving it alone is right;
+    leaving it *unmentioned* would let a check that examines a third of its input
+    report as one that examines all of it."""
+    hit = RagHit("kb/hours.md", 11, 15, "Часы", "Часы работы: с 8:00 до 22:00.", 1.0, "c1")
+    reply, audit = audit_quotes("Напиток «Тростниковый крем» стоит [1]", [hit])
+
+    assert audit.unchecked == ("Тростниковый крем",)
+    assert not audit.dropped
+    assert reply == "Напиток «Тростниковый крем» стоит [1]"
+
+
+def test_the_footer_names_the_chunk_id_not_only_the_line_range() -> None:
+    """A line range moves every time the file is re-indexed; the id does not."""
+    footer = render_sources_footer(
+        [RagHit("kb/hours.md", 11, 15, "Часы работы", "Часы", 1.0, "structure-003-001")],
+        (1,),
+    )
+
+    assert "[1] kb/hours.md:11-15 — Часы работы" in footer
+    assert "chunk structure-003-001" in footer
+    assert ragmod.SOURCES_HEADING in footer
+    # One source gets a singular heading. A lone «[2]» under «Источники» reads as
+    # an off-by-one rather than as the chunk number the answer used.
+    assert "Источник:" in footer
+
+
+def test_the_footer_lists_only_the_chunks_the_answer_cited() -> None:
+    """Retrieval returns a shortlist; the answer leans on part of it.
+
+    Measured on a real session: a four-chunk block, an answer citing two of them,
+    and a footer naming all four as sources. The extra lines are the ones a reader
+    cannot tell apart from real support, and they claim provenance the answer never
+    had — the reply asserts two facts and points at two documents.
+    """
+    hits = [
+        RagHit(f"kb/doc{n}.md", 1, 5, f"Раздел {n}", f"Факт {n}.", 0.9, f"c{n}")
+        for n in (1, 2, 3, 4)
+    ]
+    event = RagEvent(
+        question="q",
+        retrieved=tuple(hit.location for hit in hits),
+        candidates=4,
+        sources=tuple(hits),
+    )
+
+    final = finalize_answer("Высота 800 м [1]. Разница — 250 м [2].", event)
+    footer = final.text.split(ragmod.SOURCES_HEADING, 1)[1]
+
+    assert "[1] kb/doc1.md:1-5" in footer
+    assert "[2] kb/doc2.md:1-5" in footer
+    assert "doc3.md" not in footer
+    assert "doc4.md" not in footer
+
+
+def test_the_footer_keeps_the_numbers_the_answer_used() -> None:
+    """Renumbering the list would break the only correspondence the reader has:
+    a ``[3]`` in the text has to mean ``[3]`` in the list, even when the answer
+    never mentioned [1]."""
+    hits = [
+        RagHit(f"kb/doc{n}.md", 1, 5, "", f"Факт {n}.", 0.9, f"c{n}")
+        for n in (1, 2, 3)
+    ]
+    event = RagEvent(
+        question="q",
+        retrieved=tuple(hit.location for hit in hits),
+        candidates=3,
+        sources=tuple(hits),
+    )
+
+    footer = finalize_answer("Факт [3].", event).text.split(ragmod.SOURCES_HEADING, 1)[1]
+
+    assert "[3] kb/doc3.md:1-5" in footer
+    assert "[1]" not in footer and "[2]" not in footer
+
+
+def test_a_refusal_carries_no_source_list() -> None:
+    """«I did not find it» followed by a source list says the opposite.
+
+    The list was built from everything that was sent, so a refusal listed the
+    documents it had failed to find the answer in — presented as though they
+    backed a claim that was never made.
+    """
+    hit = RagHit("kb/hours.md", 11, 15, "Часы работы", "Часы работы: с 8:00 до 22:00.", 1.0, "c1")
+    event = RagEvent(
+        question="где душ", retrieved=(hit.location,), candidates=1, sources=(hit,)
+    )
+
+    final = finalize_answer("Не нашёл ответ в этом контексте. Уточните, пожалуйста.", event)
+
+    assert ragmod.SOURCES_HEADING not in final.text
+    assert final.grounding.status is Grounding.REFUSED
+
+
+def test_a_citation_to_a_chunk_that_was_never_sent_is_rejected() -> None:
+    """Retrieval returns a shortlist; the budget may drop from it before sending.
+
+    Checking against the shortlist rather than what was sent means a hit the
+    model never saw passes as evidence — and a fact it could only have known from
+    somewhere else is exactly what the audit is for.
+    """
+    dropped = RagHit("kb/dropped.md", 1, 5, "Прочее", "Выдуманная высота 999 м.", 9.9, "d1")
+    sent = RagHit("kb/sent.md", 19, 27, "Прыжок", "Прыжок с высоты 800 м.", 0.6, "c1")
+    event = RagEvent(
+        question="с какой высоты",
+        retrieved=(dropped.location, sent.location),
+        candidates=2,
+        sources=(sent,),
+    )
+
+    final = finalize_answer("С высоты 999 м [kb/dropped.md:1-5].", event)
+
+    assert final.citations.dropped == ("kb/dropped.md",)
+    assert ragmod.UNSUPPORTED_CITATION_TEXT in final.text
+    assert final.grounding.status is Grounding.UNGROUNDED
+
+
+def test_no_chunks_or_no_citations_means_no_footer() -> None:
+    """An empty source list under a heading would promise evidence and show none."""
+    assert render_sources_footer([]) == ""
+    hit = RagHit("kb/hours.md", 11, 15, "Часы", "Часы", 1.0, "c1")
+    assert render_sources_footer([hit]) == ""
+    assert render_sources_footer([hit], ()) == ""
+
+
+def test_finalize_answer_is_the_one_place_a_reply_is_checked() -> None:
+    """The benchmark calls this too. Two implementations is how a report ends up
+    scoring the bot's idea of a backed answer instead of the bot's."""
+    event = RagEvent(
+        question="часы работы",
+        retrieved=("kb/hours.md:11-15",),
+        candidates=1,
+        context_tokens=10,
+        sources=(
+            RagHit(
+                "kb/hours.md", 11, 15, "Часы", "Часы работы: с 8:00 до 22:00.",
+                1.0,
+                "c1",
+            ),
+        ),
+    )
+
+    final = finalize_answer("Часы [1]: «с 8:00 до 22:00».", event)
+
+    assert final.citations is not None
+    assert final.citations.kept == ("kb/hours.md:11-15",)
+    assert final.quotes is not None and final.quotes.kept == ("с 8:00 до 22:00",)
+    assert final.grounding.status is Grounding.GROUNDED
+    assert ragmod.SOURCES_HEADING in final.text
+
+
+def test_finalize_answer_reports_an_unjudged_reply_as_unchecked() -> None:
+    """With citations off there is nothing to verify, and an unjudged answer must
+    not be mistaken for a checked one."""
+    event = RagEvent(
+        question="q",
+        retrieved=("kb/hours.md:11-15",),
+        candidates=1,
+        sources=(RagHit("kb/hours.md", 11, 15, "Часы", "Часы", 1.0, "c1"),),
+    )
+
+    final = finalize_answer("Часы [kb/hours.md:11-15].", event, cite=False)
+
+    assert final.citations is None
+    assert final.quotes is None
+    assert final.grounding.checked is False
+    assert final.grounding.status is Grounding.UNGROUNDED
+    assert "kb/hours.md" not in final.text
+
+
+def test_the_verdict_says_which_check_failed_when_nothing_is_wrong_with_it() -> None:
+    """The answer from a real session: right sources, right citation, no quote.
+
+    It was reported as ungrounded with no reason attached, because every reason
+    list came back empty — a citation was confirmed, so nothing was unsupported,
+    and nothing was paraphrased, so nothing was bad. The failure was real
+    (no phrase to check the wording against) and the diagnostic was silent about
+    it, which is the one combination that cannot be acted on.
+    """
+    hit = RagHit("kb/jump.pdf", 19, 27, "page 1", "Прыжок с высоты 800 метров.", 1.0, "c1")
+    event = RagEvent(
+        question="с какой высоты",
+        retrieved=(hit.location,),
+        candidates=1,
+        sources=(hit,),
+    )
+
+    verdict = finalize_answer("С высоты 800 м [1].", event).grounding
+
+    assert verdict.status is Grounding.UNGROUNDED
+    assert verdict.supported == (hit.location,)
+    assert not verdict.unsupported and not verdict.bad_quotes
+    # The reason has to be nameable, or the state is indistinguishable from a
+    # bug in the checker.
+    assert verdict.unquoted is True
+    assert verdict.uncited is False
+
+
+def test_a_quoted_phrase_that_contradicts_the_chunk_passes_the_quote_check() -> None:
+    """A limit this task cannot close, pinned so it is not forgotten.
+
+    The model states 900 m and quotes the chunk's 800 m correctly. The quote is
+    verbatim, so every deterministic check passes — and the answer is still wrong.
+    Catching it needs a second model to judge meaning, which is exactly what this
+    mechanism avoids. Recorded as a known ceiling rather than left as a surprise.
+    """
+    hit = RagHit("kb/jump.pdf", 19, 27, "page 1", "Прыжок с высоты 800 метров.", 1.0, "c1")
+    event = RagEvent(
+        question="с какой высоты", retrieved=(hit.location,), candidates=1, sources=(hit,)
+    )
+
+    verdict = finalize_answer("С высоты 900 м [1] «Прыжок с высоты 800 метров».", event).grounding
+
+    assert verdict.status is Grounding.GROUNDED
+
+
+def test_a_handle_resolves_to_its_document_when_following_the_subject() -> None:
+    """A follow-up turn is kept on the document the dialog is already about.
+
+    A chunk handle names a position in a block the customer never saw, so
+    ``[2]`` is not a document. The name lives in the source list the code
+    appended, and reading the reply without it put the literal string ``"2"``
+    into the next turn's retrieval bias — a filename that does not exist.
+    """
+    hits = [
+        RagHit("kb/dive.md", 1, 15, "page 1", "Урок дайвинга проходит во Владивостоке.", 0.9, "c1"),
+        RagHit("kb/jump.pdf", 19, 27, "page 1", "Прыжок с высоты 800 м.", 0.8, "c2"),
+    ]
+    event = RagEvent(
+        question="где проходит урок дайвинга",
+        retrieved=tuple(hit.location for hit in hits),
+        candidates=2,
+        sources=tuple(hits),
+    )
+
+    reply = finalize_answer(
+        "Урок дайвинга проходит во Владивостоке [1].", event
+    ).text
+
+    assert "[1]" in reply and "Источник" in reply
+    assert sources_from_text(reply, limit=2) == ["kb/dive.md"]
+
+
+def test_the_source_list_is_not_mistaken_for_the_model_citing_documents() -> None:
+    """The list is our output, and it repeats handles rather than documents.
+
+    Read as citations it contributed a bare handle to every follow-up turn's
+    retrieval bias, on top of whatever the model actually cited — so a reply that
+    cited nothing yields no subject at all rather than one made of our own output.
+    """
+    hits = [RagHit("kb/dive.md", 1, 15, "page 1", "Урок дайвинга.", 0.9, "c1")]
+    footer = render_sources_footer(hits, (1,))
+
+    assert sources_from_text("Ответ без единой ссылки." + footer, limit=2) == []
+
+
+def test_a_handle_with_nothing_to_resolve_it_is_dropped_not_passed_on() -> None:
+    """Returning ``"2"`` would bias the next turn towards a missing filename,
+    which is worse than admitting this turn named no document."""
+    assert sources_from_text("Ответ [2] без списка источников.", limit=2) == []
+
+
+def test_a_quote_between_two_citations_is_resolved_by_which_chunk_holds_it() -> None:
+    """The model writes ``[1] «фраза» [2]`` for a phrase taken from the second.
+
+    A positional rule marks those wrong: the phrase is verbatim in one chunk and
+    absent from the other, so guessing by proximity fails half of them — on a real
+    session it turned «Владивосток. Дайвинг-клуб» into «цитата не подтверждена»
+    when it sat in the block right there. The candidates are tried in order and
+    the one that actually contains the phrase decides, which keeps the property
+    that matters: absent from all of them, it is still refused.
+    """
+    first = RagHit("kb/dive.md", 16, 29, "page 1", "Количество участников: 2.", 0.9, "c1")
+    second = RagHit("kb/dive.md", 1, 15, "page 1", "Место проведения: Владивосток.", 0.8, "c2")
+    event = RagEvent(
+        question="где проходит",
+        retrieved=(first.location, second.location),
+        candidates=2,
+        sources=(first, second),
+    )
+
+    good = finalize_answer('Проходит во Владивостоке [1] «Место проведения: Владивосток» [2].', event)
+    assert good.quotes.kept == ("Место проведения: Владивосток",)
+    assert good.grounding.status is Grounding.GROUNDED
+
+    bad = finalize_answer('Проходит во Владивостоке [1] «Владивосток. Выдумка» [2].', event)
+    assert bad.quotes.dropped == ("Владивосток. Выдумка",)
+    assert bad.grounding.status is Grounding.UNGROUNDED

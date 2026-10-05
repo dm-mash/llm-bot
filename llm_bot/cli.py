@@ -38,7 +38,7 @@ from llm_bot.gigachat import build_gigachat_client
 from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.memory_store import JsonMemoryStore
 from llm_bot.profiles import profile_prompt_block
-from llm_bot.rag import DEFAULT_MAX_CONTEXT_RATIO, DEFAULT_TOP_K
+from llm_bot.rag import DEFAULT_MAX_CONTEXT_RATIO, DEFAULT_TOP_K, Grounding
 from llm_bot.rerank import DEFAULT_RERANK_CANDIDATES
 from llm_bot.task_state import TaskStage
 from llm_bot.yaml_stores import (
@@ -266,6 +266,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     group.add_argument(
+        "--rag-strict",
+        action="store_true",
+        help=(
+            "Replace an answer whose citation or quote the retrieved block "
+            "cannot back with 'I cannot answer from this context'. Off by "
+            "default: it discards a possibly-correct answer, so it is a "
+            "behaviour switch, not a check. Requires --rag and not "
+            "--rag-no-cite, which removes the very citations there is "
+            "nothing left to judge."
+        ),
+    )
+    group.add_argument(
         "--rag-max-tokens",
         type=int,
         default=None,
@@ -351,6 +363,40 @@ class _DetailPrinter:
             body = json.dumps(details.body, ensure_ascii=False, indent=2)
             for line in body.splitlines():
                 print(f"           {line}", file=sys.stderr)
+
+
+def _print_grounding(session: Session) -> None:
+    """Report what the retrieved block backed, on stderr, after each reply.
+
+    A user reading the answer cannot tell whether ``[1]`` was verified or slipped
+    through, and that is the whole question this mechanism exists to answer. Only
+    printed when something was wrong, so a clean dialog stays quiet.
+    """
+    verdict = session.last_grounding
+    if verdict is None or verdict.status is Grounding.GROUNDED:
+        return
+    if verdict.status is Grounding.REFUSED:
+        return
+    print("[rag] ответ не опирается на источники:", file=sys.stderr)
+    # Every branch has to say something. A verdict without a stated reason is the
+    # one diagnostic that cannot be acted on, and this state — correct sources,
+    # no quote to check them against — used to print nothing at all.
+    if verdict.unsupported:
+        print(f"       не подтверждены фрагменты: {', '.join(verdict.unsupported)}",
+              file=sys.stderr)
+    if verdict.bad_quotes:
+        print(f"       цитаты не найдены дословно: {', '.join(verdict.bad_quotes)}",
+              file=sys.stderr)
+    if verdict.unquoted:
+        # The common case, and the one most likely to look like a false alarm:
+        # the answer is probably right, but nothing in it was compared with the
+        # words of the chunk it names.
+        print("       ответ процитировал источники, но не привёл ни одной фразы "
+              "из них дословно", file=sys.stderr)
+        print("       (источники верны, формулировку проверить нечем — "
+              "цитируйте фрагмент в кавычках)", file=sys.stderr)
+    if verdict.uncited:
+        print("       ответ не процитировал ни одного фрагмента", file=sys.stderr)
 
 
 def _new_session_id(agent_name: str) -> str:
@@ -511,6 +557,7 @@ def _run_agent_chat(
     rag_rerank_candidates: int | None = None,
     rag_rerank_min_score: float | None = None,
     rag_no_cite: bool = False,
+    rag_strict: bool = False,
 ) -> int:
     """Run an agent-based session; either one shot or an interactive loop."""
     agent_store = YamlAgentStore()
@@ -546,6 +593,7 @@ def _run_agent_chat(
             rag_rerank_candidates=rag_rerank_candidates,
             rag_rerank_min_score=rag_rerank_min_score,
             rag_cite=not rag_no_cite,
+            rag_strict=rag_strict,
         )
     except ValueError as exc:
         # Configuration mistakes (bad --mcp name, missing config file, ...)
@@ -1105,6 +1153,7 @@ def _interactive_loop(session: Session) -> int:
                 continue
             try:
                 print(session.chat(raw))
+                _print_grounding(session)
             except InvariantViolationError as exc:
                 print(exc.refusal)
                 if exc.matched_pattern:
@@ -1483,6 +1532,21 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --rag-no-cite requires --rag.", file=sys.stderr)
         return 2
 
+    if args.rag_strict and not args.rag:
+        print("error: --rag-strict requires --rag.", file=sys.stderr)
+        return 2
+
+    if args.rag_strict and args.rag_no_cite:
+        # --rag-no-cite asks for no citations and no quotes, so there is nothing
+        # to check and strict mode would refuse every single answer. Failing here
+        # beats a bot that only ever says "I cannot answer".
+        print(
+            "error: --rag-strict cannot be combined with --rag-no-cite: without "
+            "citations and quotes there is nothing to verify.",
+            file=sys.stderr,
+        )
+        return 2
+
     detail_listener = _DetailPrinter() if args.details else None
 
     if args.agent:
@@ -1518,6 +1582,7 @@ def main(argv: list[str] | None = None) -> int:
             rag_rerank_candidates=args.rag_rerank_candidates,
             rag_rerank_min_score=args.rag_rerank_min_score,
             rag_no_cite=args.rag_no_cite,
+            rag_strict=args.rag_strict,
         )
 
     # Legacy path.
