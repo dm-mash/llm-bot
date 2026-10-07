@@ -93,6 +93,9 @@ class Reranker:
         *,
         batch_size: int = 32,
     ) -> None:
+        from llm_bot.progress import quiet_loading
+
+        quiet_loading()
         from sentence_transformers import CrossEncoder
 
         try:

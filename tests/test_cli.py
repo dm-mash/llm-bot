@@ -13,6 +13,8 @@ from llm_bot.cli import (
 from llm_bot.client import LLMError
 from llm_bot.task_state import TaskStage, TaskState, TaskStateMachine
 
+from llm_bot.rag import Grounding, GroundingVerdict
+
 
 class _FakeAgent:
     def __init__(self, name: str) -> None:
@@ -575,3 +577,96 @@ def test_interactive_loop_auto_turns_after_detected_move(capsys, monkeypatch):
     assert "Этап задачи изменился" in session.chat_calls[1]
     assert "авто-ход (этап 'execution')" in err
     assert session.task.state.stage is TaskStage.EXECUTION
+
+# --------------------------------------------------------------------------- #
+# Grounding output must not contradict itself
+# --------------------------------------------------------------------------- #
+
+
+def test_an_answer_that_cited_nothing_gets_one_line_not_two(capsys):
+    """Real output from a run that answered perfectly:
+
+    «ответ процитировал источники, но не привёл ни одной фразы» followed by
+    «ответ не процитировал ни одного фрагмента» — both true of the same reply and
+    mutually exclusive. The first line claims sources were cited when none were.
+
+    ``unquoted`` is "no quote was kept" and ``uncited`` is "no citation at all";
+    the second is the stronger statement and the only one that applies, so the
+    first has to stand down.
+    """
+    from llm_bot.cli import _print_grounding
+
+    class _S:
+        last_grounding = GroundingVerdict(
+            status=Grounding.UNGROUNDED,
+            supported=(),
+            unsupported=(),
+            quotes=(),
+            bad_quotes=(),
+            uncited=True,
+            unquoted=True,
+        )
+
+    _print_grounding(_S())
+    err = capsys.readouterr().err
+
+    assert "не процитировал ни одного фрагмента" in err
+    assert "процитировал источники, но" not in err
+
+
+def test_cited_but_unquoted_still_says_so(capsys):
+    from llm_bot.cli import _print_grounding
+
+    class _S:
+        last_grounding = GroundingVerdict(
+            status=Grounding.UNGROUNDED,
+            supported=("kb/a.pdf:1-5",),
+            unsupported=(),
+            quotes=(),
+            bad_quotes=(),
+            uncited=False,
+            unquoted=True,
+        )
+
+    _print_grounding(_S())
+    err = capsys.readouterr().err
+
+    assert "процитировал источники, но" in err
+    assert "не процитировал ни одного фрагмента" not in err
+
+
+def test_a_blank_line_separates_the_answer_from_the_prompt(capsys, monkeypatch):
+    """The answer above ends with a source list and the diagnostics land on
+    stderr, so without a gap the next ">" continues the same block and the
+    boundary between what was said and what is being typed disappears."""
+    from llm_bot import cli
+
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr("builtins.input", lambda prompt="> ": "вопрос")
+
+    cli._read_input("> ")
+
+    captured = capsys.readouterr()
+    assert captured.err.startswith("\n"), repr(captured.err)
+    # Only the gap — a second one would be noise of its own.
+    assert captured.err.count("\n") == 1
+
+
+def test_loading_a_model_does_not_print_a_progress_bar(capsys):
+    """``Loading weights: 100%|…|`` is tqdm from sentence-transformers, on
+    stderr, and it appeared on every run of every script whether or not anyone
+    asked for a progress bar — overwriting a line in an otherwise plain chat."""
+    from llm_bot.progress import quiet_loading
+
+    quiet_loading()  # idempotent: the loaders call it on every construction
+
+    import os
+
+    assert os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] == "1"
+
+    from llm_bot.rerank import Reranker
+
+    Reranker()
+    err = capsys.readouterr().err
+    assert "Loading weights" not in err
+    assert "it/s" not in err

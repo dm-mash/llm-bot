@@ -387,7 +387,7 @@ def _print_grounding(session: Session) -> None:
     if verdict.bad_quotes:
         print(f"       цитаты не найдены дословно: {', '.join(verdict.bad_quotes)}",
               file=sys.stderr)
-    if verdict.unquoted:
+    if verdict.unquoted and not verdict.uncited:
         # The common case, and the one most likely to look like a false alarm:
         # the answer is probably right, but nothing in it was compared with the
         # words of the chunk it names.
@@ -527,6 +527,11 @@ def _print_memory(session: Session) -> None:
         f"добавлено фактов: {written}",
         f"токены классификации: {event.total_tokens}",
     ]
+    # What was rejected and why is the useful half of this line. Per fact it is
+    # noise — six lines over a conversation is the expected shape, not a problem —
+    # so the count is shown here and the reasons live behind -v.
+    if event.rejected:
+        parts.append(f"отброшено без доказательства: {len(event.rejected)}")
     total = getattr(session, "total_memory_extractions", 0)
     if total:
         parts.append(f"(всего ходов с извлечением: {total})")
@@ -799,6 +804,11 @@ def _read_input(
         EOFError: On end-of-input (Ctrl-D).
         KeyboardInterrupt: On Ctrl-C.
     """
+    # A blank line before the prompt. The answer above it ends with a source
+    # list and a couple of diagnostics on stderr, and without the gap the next
+    # ">" continues the same block — the boundary between what was said and what
+    # is being typed stops being visible.
+    print(file=sys.stderr)
     if sys.stdin.isatty():
         try:
             from prompt_toolkit import prompt as pt_prompt

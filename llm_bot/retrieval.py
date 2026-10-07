@@ -72,6 +72,9 @@ class Embedder:
     def __init__(
         self, name: str = DEFAULT_EMBEDDING_MODEL, local_only: bool = False
     ) -> None:
+        from llm_bot.progress import quiet_loading
+
+        quiet_loading()
         from sentence_transformers import SentenceTransformer
 
         try:
