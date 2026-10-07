@@ -37,8 +37,19 @@ logger = logging.getLogger(__name__)
 Layer = Literal["short", "working", "long"]
 
 # Section markers rendered into the prompt so the model can distinguish layers.
-_LONG_HEADER = "Долговременная память (профиль, решения, знания):"
-_WORKING_HEADER = "Рабочая память (данные текущей задачи):"
+# The wording matters more than it looks. With a bare header the memory block
+# reads as one more context, and the model duly quotes from it: in a 14-turn run
+# every answer came back quoting the customer's own stored words in «…», which
+# the quote audit then had to reject one turn at a time. Memory is what the user
+# said, not a document, so both blocks say so up front and tell the model not to
+# source anything from them.
+_NOT_A_SOURCE = (
+    "Это не источник. Это слова самого пользователя из прошлых ходов, "
+    "не документы: не цитируй их кавычками и не указывай номера источников "
+    "на них. Опирайся на них как на контекст разговора."
+)
+_LONG_HEADER = "Долговременная память (профиль, решения, знания). " + _NOT_A_SOURCE
+_WORKING_HEADER = "Рабочая память (данные текущей задачи). " + _NOT_A_SOURCE
 
 
 @dataclass(frozen=True)
@@ -50,11 +61,18 @@ class MemoryEntry:
         value: The fact's content.
         source: Where the fact came from (``"user"``, ``"assistant"``,
             ``"system"``, ``"derive"``).
+        evidence: The user's own words the fact was taken from. Set by
+            automatic extraction, where it is what the fact was allowed to
+            exist on the strength of.
+        turn: Ordinal number of the dialogue turn the fact came from, so a
+            stored fact can be pointed back at the place it was said.
     """
 
     key: str
     value: str
     source: str = "assistant"
+    evidence: str = ""
+    turn: int = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -136,9 +154,18 @@ class _PersistentKeyValueMemory:
         raise NotImplementedError
 
     # -- public API --------------------------------------------------------- #
-    def remember(self, key: str, value: str, source: str = "assistant") -> None:
+    def remember(
+        self,
+        key: str,
+        value: str,
+        source: str = "assistant",
+        evidence: str = "",
+        turn: int = 0,
+    ) -> None:
         """Write *value* under *key*, then persist the whole layer."""
-        self._entries[key] = MemoryEntry(key=key, value=value, source=source)
+        self._entries[key] = MemoryEntry(
+            key=key, value=value, source=source, evidence=evidence, turn=turn
+        )
         self._save(self._entries)
 
     def recall(self, key: str) -> str | None:
@@ -284,16 +311,28 @@ class MemoryLayers:
         return target.recall(key)
 
     # -- named helpers (still explicit about the destination) --------------- #
-    def remember_working(self, key: str, value: str, source: str = "assistant") -> None:
+    def remember_working(
+        self,
+        key: str,
+        value: str,
+        source: str = "assistant",
+        evidence: str = "",
+        turn: int = 0,
+    ) -> None:
         """Explicitly store a fact in the working (current-task) layer."""
-        self.working.remember(key, value, source=source)
+        self.working.remember(key, value, source=source, evidence=evidence, turn=turn)
         logger.debug("[memory] working[%s] = %r", key, value)
 
     def remember_long_term(
-        self, key: str, value: str, source: str = "assistant"
+        self,
+        key: str,
+        value: str,
+        source: str = "assistant",
+        evidence: str = "",
+        turn: int = 0,
     ) -> None:
         """Explicitly store a fact in the long-term (profile/decisions) layer."""
-        self.long.remember(key, value, source=source)
+        self.long.remember(key, value, source=source, evidence=evidence, turn=turn)
         logger.debug("[memory] long_term[%s] = %r", key, value)
 
     def forget_working(self, key: str) -> None:
@@ -354,6 +393,11 @@ class MemoryEvent:
 
     working_written: list[str] = field(default_factory=list)
     long_term_written: list[str] = field(default_factory=list)
+    #: Facts the classifier proposed that did not survive verification, with the
+    #: reason. This is the number that says whether automatic extraction can be
+    #: trusted at all: a classifier that invents facts shows up here rather than
+    #: in a report about the bot being wrong much later.
+    rejected: list[tuple[str, str]] = field(default_factory=list)
     request_tokens: int = 0
     reply_tokens: int = 0
     recognized: bool = True
@@ -363,6 +407,16 @@ class MemoryEvent:
         """Total tokens spent on this extraction call."""
         return self.request_tokens + self.reply_tokens
 
+    @property
+    def verified_rate(self) -> float:
+        """Share of proposed facts that reached memory (1.0 when none proposed)."""
+        proposed = len(self.working_written) + len(self.long_term_written) + len(
+            self.rejected
+        )
+        if not proposed:
+            return 1.0
+        return (len(self.working_written) + len(self.long_term_written)) / proposed
+
 
 _EXTRACT_PROMPT = (
     "You are an agent memory classifier. You are given a fragment of a dialogue. "
@@ -371,9 +425,13 @@ _EXTRACT_PROMPT = (
     "in-progress decisions). It only survives within this session.\n"
     "- long_term: user profile, their preferences, and long-lived "
     "decisions/agreements they stated. It carries across sessions.\n\n"
-    "Return ONLY JSON, no explanations, no markdown:\n"
-    '{{"working": {{"key": "value", ...}}, "long_term": {{"key": "value", ...}}}}\n'
-    "An empty layer is an empty object. Keys are short, meaningful, in Russian or "
+    "Return ONLY JSON, no explanations, no markdown. Every fact is an object with "
+    "the fact itself and the words it came from:\n"
+    '{{"working": {{"key": {{"value": "...", "evidence": "..."}}}}, '
+    '"long_term": {{"key": {{"value": "...", "evidence": "..."}}}}}}\n'
+    '"evidence" MUST be a verbatim substring of what the USER wrote in this '
+    "dialogue — copy the words exactly, do not translate, reword or fix them. An "
+    "empty layer is an empty object. Keys are short, meaningful, in Russian or "
     "English.\n\n"
     "Rules that override the layer descriptions above:\n"
     "- Store ONLY what the USER asserted. Never turn the assistant's own answers, "
@@ -386,8 +444,53 @@ _EXTRACT_PROMPT = (
     "from that exchange unless the user asserted a preference, a constraint or a "
     "fact about themselves.\n"
     "- Prefer an empty layer over a fact you cannot attribute to the user.\n\n"
+    "A fact whose evidence is not in the user's words will be dropped, so "
+    '"evidence" is not a formality: it is the only thing that keeps a fact.\n\n'
     "Dialogue:\n{transcript}"
 )
+
+
+@dataclass(frozen=True)
+class MemoryAudit:
+    """What survived verification on one extraction, and what did not.
+
+    The kept list is what was written; the rejected list carries the reason
+    because "the fact was dropped" is useless for improving anything, while
+    "dropped: no evidence in the user's words" says which failure to look for.
+    """
+
+    kept: tuple[str, ...] = ()
+    rejected: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def clean(self) -> bool:
+        return not self.rejected
+
+    def __len__(self) -> int:
+        return len(self.kept) + len(self.rejected)
+
+
+def _normalise(text: str) -> str:
+    """Collapse whitespace and case so a copied quote can be located.
+
+    Nothing else is loosened: punctuation stays, because stripping it would let
+    "budget is 400" match a user who wrote "budget is 4000", and a memory that
+    survives on a technicality is worse than one that was dropped.
+    """
+    return " ".join(text.split()).casefold()
+
+
+def _verified(value: object, evidence: object, spoken: str) -> bool:
+    """True when *evidence* is a verbatim substring of what the user said.
+
+    The classifier is the one doing the copying, so this only checks that it did
+    not invent the quote — which is the whole failure mode: a fact the user never
+    stated, written into a layer that is injected into every later turn.
+    """
+    if not isinstance(value, str) or not isinstance(evidence, str):
+        return False
+    needle = _normalise(evidence)
+    return bool(needle) and needle in spoken
 
 
 def extract_memory(
@@ -395,6 +498,7 @@ def extract_memory(
     user_msg: dict[str, str],
     reply: str,
     chat: Callable[[list[dict[str, str]]], str],
+    turn: int = 0,
 ) -> MemoryEvent:
     """Classify a completed turn into working / long-term facts and store them.
 
@@ -403,6 +507,9 @@ def extract_memory(
     :meth:`MemoryLayers.remember_working` / :meth:`MemoryLayers.remember_long_term`
     (so the destination is always explicit). Existing entries with the same key
     are overwritten.
+
+    *turn* is recorded on every written fact so a stored value can be traced back
+    to the turn it was taken from.
 
     Returns a :class:`MemoryEvent` describing what was written and the tokens the
     classifier call cost (for diagnostics / token accounting).
@@ -421,49 +528,84 @@ def extract_memory(
     output = chat(request)
     reply_tokens = count_message_tokens({"role": "assistant", "content": output})
 
-    payload: dict[str, dict[str, str]] = {}
+    payload: dict[str, dict[str, Any]] = {}
     recognized = True
     try:
         parsed = _parse_json_object(output)
         raw_working = parsed.get("working")
         raw_long = parsed.get("long_term")
         if isinstance(raw_working, dict):
-            payload["working"] = _stringify(raw_working)
+            payload["working"] = raw_working
         if isinstance(raw_long, dict):
-            payload["long_term"] = _stringify(raw_long)
-    except Exception:  # noqa: BLE001 - never break a turn on extraction failure
+            payload["long_term"] = raw_long
+    except Exception as exc:  # noqa: BLE001 - never break a turn on extraction
         recognized = False
-        logger.warning("[memory] не удалось распознать ответ классификатора: %r",
-                       output)
+        # Not the whole reply. It runs to hundreds of characters of JSON, and the
+        # interesting part is why it did not parse — one real reply was missing a
+        # closing brace, and the log buried that under six invented facts about
+        # the customer. The full text goes to the debug log instead.
+        logger.warning(
+            "[memory] ответ классификатора не разобран (%s): %s…",
+            type(exc).__name__,
+            output[:120],
+        )
+        logger.debug("[memory] полный ответ классификатора: %r", output)
 
+    # Only the user's own words may become durable. A fact the user never stated
+    # used to be written on the classifier's word alone and then injected into
+    # every later turn: a turn of small talk could leave «аллергия на орехи» in
+    # the profile forever, and nothing downstream could tell it from something
+    # the customer actually said.
+    spoken = _normalise(user_msg.get("content", ""))
     working_written: list[str] = []
     long_term_written: list[str] = []
-    for key, value in payload.get("working", {}).items():
-        memory.remember_working(key, value, source="derive")
-        working_written.append(key)
-    for key, value in payload.get("long_term", {}).items():
-        memory.remember_long_term(key, value, source="derive")
-        long_term_written.append(key)
+    rejected: list[tuple[str, str]] = []
+    for layer, target, written in (
+        ("working", memory.remember_working, working_written),
+        ("long_term", memory.remember_long_term, long_term_written),
+    ):
+        for key, raw in payload.get(layer, {}).items():
+            name = str(key)
+            label = f"{layer}:{name}"
+            if not isinstance(raw, dict):
+                rejected.append((label, "нет доказательства"))
+                continue
+            value, evidence = raw.get("value"), raw.get("evidence")
+            if not _verified(value, evidence, spoken):
+                rejected.append((label, "доказательства нет в словах пользователя"))
+                continue
+            target(name, str(value), source="derive", evidence=str(evidence), turn=turn)
+            written.append(name)
+
+    # Not a warning per fact. A single turn can produce half a dozen, and they
+    # printed over the conversation while being the expected outcome: the
+    # classifier reaching for facts the user never said is what the check is for.
+    # The count is on the normal memory line; the detail belongs to -v.
+    for label, reason in rejected:
+        logger.debug("[memory] факт отброшен (%s): %s", label, reason)
+    if rejected:
+        logger.info(
+            "[memory] отброшено фактов без доказательства: %d", len(rejected)
+        )
 
     event = MemoryEvent(
         working_written=working_written,
         long_term_written=long_term_written,
+        rejected=rejected,
         request_tokens=request_tokens,
         reply_tokens=reply_tokens,
         recognized=recognized,
     )
     logger.debug(
-        "[memory] extract -> working=%d long=%d, %d tokens, recognized=%s",
+        "[memory] extract -> working=%d long=%d отброшено=%d, %d tokens, "
+        "recognized=%s",
         len(working_written),
         len(long_term_written),
+        len(rejected),
         event.total_tokens,
         recognized,
     )
     return event
-
-
-def _stringify(mapping: dict[str, Any]) -> dict[str, str]:
-    return {str(k): str(v) for k, v in mapping.items()}
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

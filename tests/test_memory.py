@@ -267,17 +267,47 @@ def _chat_returns_classifier_output(output):
 def test_extract_memory_classifies_into_layers(tmp_path):
     layers, _ = _make_layers(tmp_path)
     chat = _chat_returns_classifier_output(
-        '{"working": {"goal": "build x"}, "long_term": {"name": "Alice"}}'
+        '{"working": {"goal": {"value": "build x", "evidence": "задача X"}}, '
+        '"long_term": {"name": {"value": "Alice", "evidence": "меня зовут Алиса"}}}'
     )
     event = extract_memory(
-        layers, {"role": "user", "content": "задача X"}, "reply", chat
+        layers,
+        {"role": "user", "content": "задача X, меня зовут Алиса"},
+        "reply",
+        chat,
     )
     assert event.working_written == ["goal"]
     assert event.long_term_written == ["name"]
+    assert event.rejected == []
+    assert event.verified_rate == 1.0
     assert event.recognized is True
     assert event.total_tokens >= 0
     assert layers.working.recall("goal") == "build x"
     assert layers.long.recall("name") == "Alice"
+
+
+def test_a_malformed_classifier_reply_is_reported_briefly(tmp_path, caplog):
+    """The reply runs to hundreds of characters and the reason it failed is the
+    interesting part. One real reply missed a closing brace, and the log printed
+    six invented facts about the customer instead — noise that reads like a
+    memory bug."""
+    layers, _ = _make_layers(tmp_path)
+    broken = ('{"working": {}, "long_term": {"a": {"value": "от 14 лет", '
+              '"evidence": "от 14 лет"}, "b": {"value": "6 месяцев", '
+              '"evidence": "Сертификат действует 6 месяцев"}}')
+
+    with caplog.at_level("WARNING"):
+        event = extract_memory(
+            layers, {"role": "user", "content": "полетать можно?"}, "ответ",
+            _chat_returns_classifier_output(broken),
+        )
+
+    assert event.recognized is False
+    assert event.working_written == [] and event.long_term_written == []
+    (line,) = [r for r in caplog.records if "не разобран" in r.message]
+    assert len(line.getMessage()) < 220
+    assert "JSONDecodeError" in line.getMessage()
+    assert len(layers.long) == 0
 
 
 def test_extract_memory_ignores_garbage(tmp_path):
@@ -395,8 +425,10 @@ def test_session_auto_extract_fills_working_and_long(tmp_path):
                 "choices": [
                     {"message": {"role": "assistant",
                                  "content": (
-                                     '{"working": {"goal": "build x"}, '
-                                     '"long_term": {"name": "Alice"}}'
+                                     '{"working": {"goal": {"value": "build x", '
+                                     '"evidence": "построй X"}}, '
+                                     '"long_term": {"name": {"value": "Alice", '
+                                     '"evidence": "меня зовут Алиса"}}}'
                                  )}}
                 ]
             },
@@ -405,7 +437,7 @@ def test_session_auto_extract_fills_working_and_long(tmp_path):
     transport = httpx.MockTransport(handler)
     session = _make_session("s1", _agent_config(), transport, tmp_path)
 
-    session.chat("построй X")
+    session.chat("построй X, меня зовут Алиса")
     # Auto-extract wrote to working and long-term layers explicitly.
     assert session.memory.working.recall("goal") == "build x"
     assert session.memory.long.recall("name") == "Alice"
@@ -432,3 +464,196 @@ def test_session_auto_extract_can_be_disabled(tmp_path):
     assert session.last_memory_event is None
     assert len(session.memory.working) == 0
     assert len(session.memory.long) == 0
+
+# --------------------------------------------------------------------------- #
+# Verification: only the user's own words become durable facts
+# --------------------------------------------------------------------------- #
+
+
+def test_a_fact_the_user_never_stated_is_dropped(tmp_path):
+    """The observed failure: small talk produced «аллергия на орехи» and «две
+    недели», neither of which anybody said. Once written to the long-term layer
+    they are injected into every later turn, so the classifier's word is all
+    that ever stands between a polite invention and a permanent fact.
+    """
+    layers, _ = _make_layers(tmp_path)
+    chat = _chat_returns_classifier_output(
+        '{"working": {}, "long_term": {'
+        '"allergies": {"value": "орехи", "evidence": "аллергия на орехи"}, '
+        '"tenure": {"value": "две недели", "evidence": "работаю две недели"}}}'
+    )
+    event = extract_memory(
+        layers, {"role": "user", "content": "привет, как дела?"}, "отлично", chat
+    )
+
+    assert event.long_term_written == []
+    assert event.rejected == [
+        ("long_term:allergies", "доказательства нет в словах пользователя"),
+        ("long_term:tenure", "доказательства нет в словах пользователя"),
+    ]
+    assert event.verified_rate == 0.0
+    assert len(layers.long) == 0
+
+
+def test_an_assistants_own_conclusion_is_not_a_user_fact(tmp_path):
+    """The reply may well be correct. It is still the assistant talking, and a
+    correct answer is not something the user asserted about themselves."""
+    layers, _ = _make_layers(tmp_path)
+    chat = _chat_returns_classifier_output(
+        '{"working": {}, "long_term": {'
+        '"allergies": {"value": "орехи", "evidence": "аллергия на орехи"}}}'
+    )
+    event = extract_memory(
+        layers,
+        {"role": "user", "content": "что посоветуешь?"},
+        "У гостя аллергия на орехи, не советуйте миндаль.",
+        chat,
+    )
+
+    assert event.long_term_written == []
+    assert event.rejected[0][0] == "long_term:allergies"
+    assert len(layers.long) == 0
+
+
+def test_a_bare_value_with_no_evidence_is_dropped(tmp_path):
+    """The old shape must not slip through as a silent downgrade: a classifier
+    answering with plain strings has not verified anything."""
+    layers, _ = _make_layers(tmp_path)
+    chat = _chat_returns_classifier_output(
+        '{"working": {"goal": "build x"}, "long_term": {"name": "Alice"}}'
+    )
+    event = extract_memory(
+        layers, {"role": "user", "content": "задача X"}, "reply", chat
+    )
+
+    assert event.working_written == []
+    assert event.long_term_written == []
+    assert [reason for _, reason in event.rejected] == ["нет доказательства"] * 2
+    assert len(layers.working) == 0
+    assert len(layers.long) == 0
+
+
+def test_evidence_may_reach_across_line_breaks(tmp_path):
+    """The quote is copied out of a multi-line reply; only whitespace and case
+    may differ from the message the user actually sent."""
+    layers, _ = _make_layers(tmp_path)
+    chat = _chat_returns_classifier_output(
+        '{"working": {}, "long_term": {'
+        '"budget": {"value": "400", "evidence": "БЮДЖЕТ   —\\nдо 400 рублей"}}}'
+    )
+    event = extract_memory(
+        layers,
+        {"role": "user", "content": "Бюджет —\nдо 400 рублей на всё вместе."},
+        "ok",
+        chat,
+    )
+
+    assert event.long_term_written == ["budget"]
+    assert event.rejected == []
+    assert layers.long.recall("budget") == "400"
+
+
+def test_verified_rate_reports_a_mixed_round(tmp_path):
+    """Precision is only useful on the rounds where something was proposed —
+    a silent classifier must not look perfect."""
+    layers, _ = _make_layers(tmp_path)
+    chat = _chat_returns_classifier_output(
+        '{"working": {"goal": {"value": "party", "evidence": "я устраиваю"}}, '
+        '"long_term": {"name": {"value": "Alice", "evidence": "Alice"}}}'
+    )
+    event = extract_memory(
+        layers, {"role": "user", "content": "я устраиваю день рождения"}, "ok", chat
+    )
+
+    assert event.long_term_written == []
+    assert event.verified_rate == 0.5
+
+
+def test_a_stored_fact_points_back_at_the_words_it_came_from(tmp_path):
+    """Provenance is what makes a stored fact arguable: without it the only way
+    to answer «why does it think I said that?» is to delete everything."""
+    layers, _ = _make_layers(tmp_path)
+    chat = _chat_returns_classifier_output(
+        '{"working": {}, "long_term": {'
+        '"budget": {"value": "400", "evidence": "до 400 рублей"}}}'
+    )
+    event = extract_memory(
+        layers,
+        {"role": "user", "content": "Бюджет — до 400 рублей"},
+        "ok",
+        chat,
+        turn=7,
+    )
+
+    entry = layers.long.snapshot()["budget"]
+    assert entry.evidence == "до 400 рублей"
+    assert entry.turn == 7
+    assert entry.source == "derive"
+    assert event.long_term_written == ["budget"]
+    assert event.rejected == []
+
+
+def test_the_memory_block_says_it_is_not_a_source(tmp_path):
+    """Memory reads as one more context, and the model quotes from it.
+
+    Measured on a 14-turn coffee dialogue: with memory on, every answer came
+    back wrapping the customer's own stored words in «…» and pointing source
+    numbers at them. The quote audit rejected all of it — the system did not
+    accept the lie — but the model was producing it on every single turn, and
+    the audit cannot stop it from trying. Memory is what the user said, not a
+    document, and the block has to say so where the model reads it.
+    """
+    layers, _ = _make_layers(tmp_path)
+    layers.remember_working("budget", "до 400", evidence="до 400 рублей", turn=3)
+
+    block = layers.prefix_messages()[0]["content"]
+
+    assert "не источник" in block.lower()
+    assert "не цитируй" in block.lower()
+    # The rule has to sit next to the data, not in a separate system message the
+    # model may never attend to.
+    assert "до 400" in block
+    assert block.index("не цитируй") < block.index("до 400")
+
+
+def test_a_stored_fact_is_tagged_with_the_turn_it_came_from(tmp_path):
+    """Provenance pointed one turn into the future.
+
+    The tag was read off ``_history``, a message list, not a turn counter: it
+    read 1 on turn 1, then 3 on turn 2 — so at turn 2 memory already held facts
+    attributed to turn 3, a turn the user had not reached. A fact you cannot
+    point back at is worse than one without a number, because the number looks
+    authoritative.
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:  # main reply
+            return _ok_response()
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": (
+                        '{"working": {"fact": {"value": "yes", '
+                        '"evidence": "проверка"}}, "long_term": {}}'
+                    )}}
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    session = _make_session("s1", _agent_config(), transport, tmp_path)
+
+    session.chat("проверка раз")
+    assert session.memory.working.snapshot()["fact"].turn == 1
+
+    session.chat("проверка два")
+    session.chat("проверка три")
+
+    # The tag must be the turn the words were said on, and must not run ahead
+    # of the conversation.
+    assert session.memory.working.snapshot()["fact"].turn == 3
+    turns = [e.working_written for e in session._memory_events]
+    assert turns == [["fact"], ["fact"], ["fact"]]
