@@ -724,3 +724,76 @@ def test_detail_listener_usage_is_none_when_absent():
 
     assert len(listener.responses) == 1
     assert listener.responses[0].usage is None
+
+# --------------------------------------------------------------------------- #
+# content as a list of blocks (reasoning models)
+# --------------------------------------------------------------------------- #
+
+
+def _block_response(content):
+    import httpx
+    import json as _json
+
+    return httpx.Response(
+        200,
+        json={
+            "id": "x", "model": "labs-leanstral-1-5",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": content}}],
+        },
+        request=httpx.Request("POST", "https://example.test/v1/chat/completions"),
+    )
+
+
+def test_reasoning_blocks_are_flattened_to_their_text(httpx_mock=None):
+    """Real failure, whole answer lost:
+
+    ``LLM API returned empty content`` on a reply that was fully present. The
+    model answers with ``content`` as a list of typed blocks — a ``thinking``
+    block then a ``text`` block — and the client only ever read a string, so a
+    correct answer was reported as an empty one.
+    """
+    import httpx
+
+    from llm_bot.client import LLMClient, LLMConfig
+
+    def handler(request):
+        return _block_response([
+            {"type": "thinking",
+             "thinking": [{"type": "text", "text": "размышление, не ответ"}]},
+            {"type": "text", "text": "При аллергии нельзя ореховый сироп."},
+        ])
+
+    client = LLMClient(
+        config=LLMConfig(base_url="https://example.test/v1", api_key="k",
+                         model="m"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert client.chat([{"role": "user", "content": "вопрос"}]) == \
+        "При аллергии нельзя ореховый сироп."
+
+
+def test_the_thinking_block_is_not_shown_to_the_user(httpx_mock=None):
+    """The scratchpad must not become the reply: it is reasoning, and printing it
+    is publishing it."""
+    import httpx
+
+    from llm_bot.client import LLMClient, LLMConfig
+
+    def handler(request):
+        return _block_response([
+            {"type": "thinking",
+             "thinking": [{"type": "text", "text": "СЕКРЕТНЫЙ ЧЕРНОВИК"}]},
+            {"type": "text", "text": "Ответ."},
+        ])
+
+    client = LLMClient(
+        config=LLMConfig(base_url="https://example.test/v1", api_key="k",
+                         model="m"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    out = client.chat([{"role": "user", "content": "вопрос"}])
+    assert out == "Ответ."
+    assert "СЕКРЕТНЫЙ ЧЕРНОВИК" not in out

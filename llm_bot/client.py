@@ -549,6 +549,28 @@ class LLMClient:
         if isinstance(content, str) and content.strip():
             return content
 
+        # Reasoning models answer with ``content`` as a list of typed blocks
+        # rather than a string:
+        #   [{"type": "thinking", "thinking": [...]},
+        #    {"type": "text", "text": "…"}]
+        # Everything downstream here assumes a string — token counting, the
+        # citation audit, the invariant auditor — so the blocks have to be
+        # flattened before anything else runs. Only ``text`` blocks are the
+        # answer; ``thinking`` is the model's scratchpad and putting it in front
+        # of a user would be publishing its reasoning.
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "text":
+                    continue
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+            if parts:
+                return "\n\n".join(parts)
+
         # Fallback: prefer the first reasoning-style field that has visible text.
         for key in sorted(message):
             if "reason" in key.lower():
