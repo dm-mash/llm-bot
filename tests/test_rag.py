@@ -22,6 +22,7 @@ from llm_bot.rag import (
     Retriever,
     audit_quotes,
     finalize_answer,
+    is_refusal,
     rag_budget_tokens,
     render_sources_footer,
     sources_from_text,
@@ -715,9 +716,12 @@ def test_session_injects_the_block_and_keeps_it_out_of_history(
     # This answer named no chunk, so it gets no source list: the footer states
     # what the reply leaned on, and an uncited reply leaned on nothing. It must
     # also stay out of the context, where the model could read its own answer
-    # back and start copying the footer's shape.
+    # back and start copying the footer's shape. The chunks *were* sent here, so
+    # the reply carries the "went unused" note rather than the "none found" one.
     reply = session.chat("ещё раз")
     assert ragmod.SOURCES_HEADING not in reply
+    assert ragmod.UNUSED_SOURCES_NOTE in reply
+    assert ragmod.NO_SOURCES_NOTE not in reply
     assert not any("Источники:" in b for b in _systems(payloads[1]))
 
 
@@ -839,7 +843,7 @@ def test_an_empty_index_still_answers(tmp_path: Path) -> None:
     session = _make_session(
         tmp_path, transport, retriever=retriever(make_index(tmp_path, []))
     )
-    assert session.chat("вопрос") == "ничего не нашёл"
+    assert session.chat("вопрос") == f"ничего не нашёл\n\n{ragmod.NO_SOURCES_NOTE}"
     assert not any("Контекст из локальной базы" in b for b in _systems(payloads[0]))
     assert session.rag_events[-1].candidates == 0
 
@@ -1214,7 +1218,12 @@ def test_a_quote_the_chunk_does_not_contain_is_marked(index_path: Path) -> None:
     near-duplicate documents the model cited the right file with the right lines
     and still stated the price wrong, because nothing looked at the wording. So
     the protocol now asks for the phrase, and a phrase that is not in the chunk
-    it is attributed to is replaced rather than passed on as a fact.
+    it is attributed to is counted rather than passed on as verified.
+
+    The words stay in the reply. Replacing them with a placeholder used to leave
+    «[цитата не подтверждена]» standing in the middle of a sentence, which reads
+    as a broken bot and destroys the sentence it was reporting on. finalize_answer
+    turns the count into one line beside the source list.
     """
     hit = retriever(index_path, top_k=1).retrieve(QUESTIONS["hours"])[0][0]
     assert "с 8:00 до 22:00" in hit.text
@@ -1224,8 +1233,7 @@ def test_a_quote_the_chunk_does_not_contain_is_marked(index_path: Path) -> None:
         [hit],
     )
 
-    assert UNSUPPORTED_QUOTE_TEXT in reply
-    assert "Часы работы: с 8:00 до 23:00" not in reply
+    assert "Часы работы: с 8:00 до 23:00" in reply
     assert audit.dropped == ("Часы работы: с 8:00 до 23:00",)
 
 
@@ -1709,3 +1717,625 @@ def test_a_quote_between_two_citations_is_resolved_by_which_chunk_holds_it() -> 
     bad = finalize_answer('Проходит во Владивостоке [1] «Владивосток. Выдумка» [2].', event)
     assert bad.quotes.dropped == ("Владивосток. Выдумка",)
     assert bad.grounding.status is Grounding.UNGROUNDED
+
+
+# --------------------------------------------------------------------------- #
+# "Sources always": an answer with no sources says which of the two gaps it is
+# --------------------------------------------------------------------------- #
+
+
+def test_a_note_never_reads_as_the_start_of_a_source_list() -> None:
+    """The stem every parser looks for must not be a word a note opens with.
+
+    Otherwise ``scripts/batch_ask.py`` splits the answer at the note and renders
+    the note itself as a source line — a parser fix per call site instead of one
+    wording decision.
+    """
+    for note in (ragmod.NO_SOURCES_NOTE, ragmod.UNUSED_SOURCES_NOTE):
+        assert ragmod.SOURCES_HEADING not in note
+
+
+def _sent(hit: RagHit) -> RagEvent:
+    """One retrieval that sent one chunk."""
+    return RagEvent(
+        question="вопрос",
+        retrieved=(hit.location,),
+        candidates=1,
+        sources=(hit,),
+    )
+
+
+def test_no_retrieval_at_all_carries_no_note() -> None:
+    """Nothing was searched, so claiming documents were not found would be false."""
+    final = ragmod.finalize_answer("обычный ответ", None)
+
+    assert final.text == "обычный ответ"
+    assert ragmod.sources_note_reason(final.text) is None
+
+
+def test_nothing_retrieved_says_the_documents_were_not_found() -> None:
+    final = ragmod.finalize_answer(
+        "мой ответ без опоры",
+        RagEvent(question="вопрос", retrieved=(), candidates=0),
+    )
+
+    assert ragmod.sources_note_reason(final.text) == ragmod.NOTE_NOT_FOUND
+    assert final.text.startswith("мой ответ без опоры")
+
+
+def test_sent_chunks_left_uncited_say_they_went_unused() -> None:
+    """The other gap, and the one worth keeping visible: the model had the
+    evidence in front of it and did not lean on any of it."""
+    event = _sent(RagHit("kb/a.md", 1, 3, "Часы", "Часы работы.", 1.0, "c1"))
+    final = ragmod.finalize_answer("Часы работы.", event)
+
+    assert ragmod.sources_note_reason(final.text) == ragmod.NOTE_UNUSED
+
+
+def test_a_refusal_still_declares_which_gap_it_was() -> None:
+    """A refusal says "I did not find it" but not whether documents were in front
+    of it. The reader needs that, and it is what keeps "sources always" true when
+    the correct answer is to decline.
+
+    The note claims no support, so it cannot contradict the refusal the way a
+    source list would — that is why the exemption this replaces was wrong.
+    """
+    event = _sent(RagHit("kb/a.md", 1, 3, "Часы", "Часы работы.", 1.0, "c1"))
+    final = ragmod.finalize_answer(ragmod.NO_ANSWER_TEXT, event)
+
+    assert ragmod.sources_note_reason(final.text) == ragmod.NOTE_UNUSED
+    assert "Источник:" not in final.text
+
+
+def test_a_cited_answer_carries_no_note() -> None:
+    event = _sent(RagHit("kb/a.md", 1, 3, "Часы", "Часы работы.", 1.0, "c1"))
+    final = ragmod.finalize_answer("Часы работы [1] «Часы работы».", event)
+
+    assert ragmod.sources_note_reason(final.text) is None
+    assert "Источник" in final.text
+
+
+def test_the_bots_own_refusal_reads_as_a_refusal() -> None:
+    """The contract NO_ANSWER_TEXT's docstring states, made testable.
+
+    Strict mode replaces every unbacked answer with this sentence. If the detector
+    missed it, the benchmark would score correct behaviour as a confident
+    ungrounded answer — the refusal rate would be understated and the mode would
+    look like a regression it is not.
+    """
+    assert is_refusal(NO_ANSWER_TEXT)
+
+
+def test_notes_are_told_apart_by_reason() -> None:
+    assert ragmod.sources_note_reason(ragmod.NO_SOURCES_NOTE) == ragmod.NOTE_NOT_FOUND
+    assert ragmod.sources_note_reason(ragmod.UNUSED_SOURCES_NOTE) == ragmod.NOTE_UNUSED
+
+
+# --------------------------------------------------------------------------- #
+# The model writing its own source list
+# --------------------------------------------------------------------------- #
+
+
+IMITATED = (
+    "Да, страховка включена в стоимость прыжка. [1]\n\n"
+    "Для прыжка в тандеме: страховка 500 руб. отдельно. [4]\n\n"
+    "Источники (фрагменты из ответа):\n"
+    "[1] Прыжок с парашютом.pdf:1-9 — page 1 · chunk structure-006-000\n"
+    "[4] Прыжок в тандеме.pdf:1-10 — page 1 · chunk structure-005-000\n"
+    "Источники (фрагменты из ответа):\n"
+    "[1] Релаксация в фитобочке с обертыванием.pdf:1-9 — page 1 · chunk structure-007-000\n"
+    "[4] Прыжок с парашютом.pdf:28-35 — page 1 · chunk structure-006-004"
+)
+
+
+def test_a_source_list_the_model_invented_is_removed() -> None:
+    """Two source lists in one answer, and the reader cannot tell which to
+    believe.
+
+    Real run, question about insurance: the model wrote its own footer in the
+    shape the protocol shows it, and the code appended the true one after it. The
+    invented list named «Релаксация в фитобочке» — a document about a float
+    session that had nothing to do with the answer. Both lists looked right, and
+    the invented one was audited as if it were the model's citations.
+    """
+    hits = (
+        RagHit("kb/Прыжок с парашютом.pdf", 1, 9, "page 1",
+               "Страховка включена.", 1.0, "c1"),
+        RagHit("kb/Релаксация в фитобочке.pdf", 1, 9, "page 1",
+               "Полотенце включено.", 1.0, "c2"),
+        RagHit("kb/Дайвинг.pdf", 1, 9, "page 1",
+               "Инструктор включён.", 1.0, "c3"),
+        RagHit("kb/Прыжок в тандеме.pdf", 1, 10, "page 1",
+               "Страховка 500 руб.", 1.0, "c4"),
+    )
+    final = ragmod.finalize_answer(
+        IMITATED,
+        RagEvent(
+            question="а есть страховка",
+            retrieved=tuple(h.location for h in hits),
+            candidates=len(hits),
+            sources=hits,
+        ),
+    )
+
+    assert "Релаксация в фитобочке" not in final.text
+    assert "Источники" not in final.text.split(ragmod.SOURCES_HEADING)[0]
+    # Exactly one list, and it is the one this code printed.
+    assert final.text.count(ragmod.SOURCES_HEADING) == 1
+    assert "Прыжок с парашютом.pdf" in final.text
+    assert "Прыжок в тандеме.pdf" in final.text
+
+
+def test_stripping_leaves_an_answer_with_no_list_alone() -> None:
+    clean = "Страховка включена в стоимость. [1]\n\nВсё."
+    assert ragmod.strip_imitated_footer(clean) == clean
+
+
+def test_a_word_about_sources_in_the_prose_is_not_a_list() -> None:
+    """The heading pattern must not eat prose: «см. раздел Источники: ...» is a
+    sentence about documents, not a list of them."""
+    text = "См. раздел Источники: там перечислены цены.\nКонец."
+    assert ragmod.strip_imitated_footer(text) == text
+
+
+# --------------------------------------------------------------------------- #
+# The model repeats itself
+# --------------------------------------------------------------------------- #
+
+
+def _four_chunks() -> RagEvent:
+    hits = tuple(
+        RagHit(f"kb/d{i}.md", 1, 5, "стр", f"текст {i}", 1.0, f"c{i}")
+        for i in range(4)
+    )
+    return RagEvent(
+        question="вопрос",
+        retrieved=tuple(h.location for h in hits),
+        candidates=4,
+        sources=hits,
+    )
+
+
+LOOPED = "[1] «карамельный сироп».\n\n" * 30
+
+
+def test_a_reply_that_repeats_one_line_is_refused() -> None:
+    """The model fell into a loop and the audit turned it into 31 copies of a
+    marker. What made it unrecoverable is that this text goes into the history:
+    the next turn reads a page of identical lines as the most recent thing in
+    context, which is exactly the pattern the model is already in. Refusing keeps
+    a short honest sentence in the history instead."""
+    final = ragmod.finalize_answer(LOOPED, _four_chunks())
+
+    assert "карамельный" not in final.text
+    assert final.text.startswith(ragmod.NO_ANSWER_TEXT)
+    assert ragmod.sources_note_reason(final.text) == ragmod.NOTE_UNUSED
+    assert final.grounding.checked is True
+
+
+def test_the_loop_guard_does_not_fire_on_a_real_answer() -> None:
+    """It has to be tight. A list of similar items, a table and a reply that
+    repeats a caveat are all normal answers, and refusing them would be worse
+    than the loop it guards against."""
+    table = "\n".join(f"| {i} | напиток | 100 ₽ |" for i in range(1, 21))
+    caveat = "Важно: это верно на март.\n\nВажно: это верно на март."
+    listed = "\n".join(f"- карамельный сироп, {i} ₽" for i in range(1, 21))
+
+    assert ragmod.looks_looped(table) is False
+    assert ragmod.looks_looped(caveat) is False
+    assert ragmod.looks_looped(listed) is False
+    assert ragmod.looks_looped(LOOPED) is True
+
+
+def test_a_short_repetition_is_not_treated_as_a_loop() -> None:
+    """Ten copies of a line is a bad habit; thirty is a loop. The threshold is
+    set where it only catches the case that actually ruined a run."""
+    assert ragmod.looks_looped("[1] «фраза».\n" * 10) is False
+    assert ragmod.looks_looped("[1] «фраза».\n" * 12) is True
+
+
+# --------------------------------------------------------------------------- #
+# A repeated problem is one problem, not six
+# --------------------------------------------------------------------------- #
+
+
+def test_six_identical_diagnostics_read_as_one_line_with_a_count() -> None:
+    """The model repeats a sentence, so it repeats its citation and its quote,
+    and the audit then reported «цитата не подтверждена» six times over.
+
+    Every line that printed the raw list repeated the same non-information, and
+    the count of lines said nothing except how long the loop was. What a reader
+    needs is which problems happened and how many times.
+    """
+    assert ragmod.summarise(["цитата"] * 6) == ["цитата (6×)"]
+    assert ragmod.summarise(["цитата", "цитата"]) == ["цитата (2×)"]
+    assert ragmod.summarise([]) == []
+    assert ragmod.summarise(["а", "б", "а"]) == ["а (2×)", "б"]
+
+
+def test_adjacent_markers_are_collapsed_into_one_with_a_count() -> None:
+    """When the model repeats a fragment inside one line, the audit leaves a
+    string of identical markers side by side. The marker is there so an
+    unverified claim cannot read as verified, and a run of them does the
+    opposite — the eye skips straight past it. The count stays, because how many
+    claims went unsupported is part of what the answer has to disclose."""
+    wall = ("[источник не подтверждён] " * 6).strip()
+
+    out = ragmod.collapse_repeated_markers(wall)
+
+    assert out.count("[источник не подтверждён]") == 1
+    assert "×6" in out
+
+
+def test_markers_on_separate_claims_are_never_merged() -> None:
+    """Each bullet is its own claim with its own citation, so each keeps its own
+    marker. Merging them would say one claim was unverified when four were —
+    which is the number the reader actually needs."""
+    listed = (
+        "- Полёты по выходным дням [2] [источник не подтверждён]\n"
+        "- Перенос даты из-за погоды [2] [источник не подтверждён]\n"
+        "- Не рекомендуется при слабом вестибулярном аппарате [2] "
+        "[источник не подтверждён]\n"
+        "- Сертификат действует 6 месяцев [2] [источник не подтверждён]"
+    )
+
+    out = ragmod.collapse_repeated_markers(listed)
+
+    assert out.count("[источник не подтверждён]") == 4
+    assert "×" not in out
+
+
+def test_a_single_marker_and_different_ones_are_left_alone() -> None:
+    once = "Факт [1] [источник не подтверждён]. Ещё [2] [цитата не подтверждена]."
+    assert ragmod.collapse_repeated_markers(once) == once
+
+
+def test_a_quote_marker_copied_from_history_is_not_read_as_a_citation() -> None:
+    """Real log line, real cause.
+
+    «RAG citations not in the retrieved block: цитата не подтверждена» — six
+    times, with the text of a *quote* marker in the list of dropped *citations*.
+    The answer had never named such a document. The model had quoted back a
+    marker from the previous turn, and the citation audit treated the marker as
+    a citation to an unknown document, then relabelled it: the text ended up
+    saying «источник не подтверждён» about a quote that had already been
+    rejected. Two different problems reported as one, pointing at the wrong one.
+    """
+    handles = ("kb/a.pdf:1-8",)
+    reply = "Воздух несёт вас вверх [1] [цитата не подтверждена]."
+
+    text, audit = ragmod.audit_citations(reply, handles, handles=handles)
+
+    assert audit.dropped == ()
+    assert audit.kept == ("kb/a.pdf:1-8",)
+    assert text == reply, "маркер должен остаться маркером, а не сменить смысл"
+
+
+def test_both_of_the_audit_markers_are_recognised_when_copied_back() -> None:
+    for marker in (ragmod.UNSUPPORTED_CITATION, ragmod.UNSUPPORTED_QUOTE):
+        text, audit = ragmod.audit_citations(
+            f"Прошлое утверждение [1] {marker}.", ("kb/a.pdf:1-8",),
+            handles=("kb/a.pdf:1-8",),
+        )
+        assert audit.dropped == (), marker
+        assert text == f"Прошлое утверждение [1] {marker}."
+
+
+def test_wording_attached_to_a_rejected_citation_is_marked_too() -> None:
+    """The citation was marked but the wording and its quote were not, so the
+    reader saw invented text carrying an invented quote with one bracket beside
+    it.
+
+    Real question about a paraglider: the answer explained how a paraglider works
+    (no engine, control lines, running down a hill), claimed flights happen at
+    weekends, and gave a six-month validity period. The document it cited says
+    none of that — only that there is one participant and where the field is. The
+    quote check had nothing to work with, because the citation it belonged to had
+    already been rejected, and so it passed it by default.
+    """
+    hit = RagHit("kb/Полёт на паралёте.pdf", 1, 8, "page 1",
+                 "Поздравляем! Количество участников: 1.", 1.0, "c")
+    event = RagEvent(question="а на параплате это что?",
+                     retrieved=(hit.location,), candidates=1, sources=(hit,))
+    reply = (
+        "Это когда вы летите с парашютом, который сам не имеет мотора [2] "
+        "«ветер несёт вас в воздухе». Полёты по выходным дням [2] «выходные». "
+        "Сертификат действует 6 месяцев [2] «6 месяцев»."
+    )
+
+    final = ragmod.finalize_answer(reply, event)
+
+    # The wording is the model's own and stays readable. What changes is that the
+    # answer is no longer allowed to pass as checked: the count is stated, and the
+    # citations that failed are marked, so a reader is told rather than misled.
+    assert "6 месяцев" in final.text
+    assert ragmod.UNSUPPORTED_CITATION in final.text
+    assert "Формулировки проверены частично" in final.text
+    # Every claim in this answer was an unattributed quote, so once they are all
+    # rejected there is nothing but markers left — and leading debris is stripped.
+    # What the reader gets is the honest sentence, not a page of placeholders.
+    assert ragmod.UNUSED_SOURCES_NOTE in final.text
+    assert final.grounding.status is ragmod.Grounding.UNGROUNDED
+
+
+def test_a_quote_beside_a_valid_citation_is_not_swept_up_by_the_new_rule() -> None:
+    """The regression this rule could cause.
+
+    Marking uncited quotes is only safe because it is gated on a citation having
+    failed. An answer whose citations all check out must come through untouched,
+    or every ordinary reply gets flagged.
+    """
+    hit = RagHit("kb/a.pdf", 1, 5, "стр", "Количество участников: 1.", 1.0, "c")
+    event = RagEvent(question="сколько участников", retrieved=(hit.location,),
+                     candidates=1, sources=(hit,))
+    reply = 'Количество участников: 1 [1] «Количество участников: 1».'
+
+    final = ragmod.finalize_answer(reply, event)
+
+    assert final.grounding.status is ragmod.Grounding.GROUNDED
+    assert ragmod.UNSUPPORTED_QUOTE not in final.text
+    assert ragmod.UNSUPPORTED_CITATION not in final.text
+
+
+def test_a_copied_hit_line_without_a_heading_is_removed() -> None:
+    """Real case, from a manual session.
+
+    The reply carried ``[4] Чудеса на виражах.pdf:17-24`` as its own source line,
+    and the footer the code printed said the same handle was ``:1-10``. Two line
+    ranges for one source, side by side, with the invented one reading as
+    authoritative — because the model copies the per-hit header it was shown
+    above every chunk. The heading-based strip did not catch it: there was no
+    heading.
+    """
+    reply = (
+        "Старт с аэродрома Новонежино [4].\n\n"
+        "[4] Чудеса на виражах.pdf:17-24 — page 1 · chunk structure-011-002"
+    )
+    hits = tuple(
+        RagHit(f"kb/Док {i}.pdf", 1, 10, "page 1", f"текст {i}", 1.0, f"c{i}")
+        for i in range(1, 4)
+    )
+    hit = RagHit("kb/Чудеса на виражах.pdf", 1, 10, "page 1",
+                 "Место проведения: аэродром Новонежино", 1.0, "c4")
+    sources = hits + (hit,)
+    event = RagEvent(question="а откуда старт",
+                     retrieved=tuple(h.location for h in sources),
+                     candidates=len(sources), sources=sources)
+
+    final = ragmod.finalize_answer(reply, event)
+
+    assert "17-24" not in final.text
+    assert final.text.count(":1-10") == 1, "осталась ровно одна, настоящая строка"
+
+
+def test_prose_with_a_file_name_or_a_line_range_is_not_stripped() -> None:
+    """Only the block's own header shape: ``[N] file:lines — section``. Prose that
+    happens to mention a document, or a citation followed by numbers, is an
+    answer and must survive."""
+    prose = "См. также Чудеса на виражах.pdf — там детали. Правило [4] в строках 17-24."
+    assert ragmod.strip_imitated_footer(prose) == prose
+
+
+def test_a_document_title_in_quotes_is_a_name_not_a_claim() -> None:
+    """Real reply, two near-identical certificates in one corpus:
+
+    «Уточните, какой именно документ вас интересует — [цитата не подтверждена]
+    или [цитата не подтверждена]?»
+
+    The model was naming the two documents so the user could pick, and both names
+    were replaced by the audit marker. Read as a defect rather than as a question,
+    and the question itself was destroyed — which is the only thing the sentence
+    was for.
+    """
+    hits = (
+        RagHit("kb/Чудеса на виражах.pdf", 1, 10, "page 1", "Поздравляем!", 1.0, "c1"),
+        RagHit("kb/Полёт на паралёте.pdf", 1, 8, "page 1", "Поздравляем!", 1.0, "c2"),
+    )
+    event = RagEvent(question="на самолете?",
+                     retrieved=tuple(h.location for h in hits),
+                     candidates=2, sources=hits)
+    reply = (
+        "Уточните, какой именно документ вас интересует — «Чудеса на виражах» [1] "
+        "или «Полёт на паралёте» [2]?"
+    )
+
+    out = ragmod.finalize_answer(reply, event).text
+
+    assert "«Чудеса на виражах»" in out
+    assert "«Полёт на паралёте»" in out
+    assert ragmod.UNSUPPORTED_QUOTE not in out
+
+
+def test_a_quote_that_is_not_a_title_is_still_marked() -> None:
+    """The exemption is for names only. Wording the chunk does not contain stays
+    marked, including in the same answer as a document title."""
+    hits = (
+        RagHit("kb/Чудеса на виражах.pdf", 1, 10, "page 1", "Поздравляем!", 1.0, "c1"),
+    )
+    event = RagEvent(question="вопрос", retrieved=(hits[0].location,),
+                     candidates=1, sources=hits)
+    reply = "Документ «Чудеса на виражах» [1] говорит, что «ветер несёт вверх» [1]."
+
+    out = ragmod.finalize_answer(reply, event).text
+
+    # A title is not a claim and is left alone; wording the chunk does not contain
+    # is the model's own and also stays readable — but it is counted, so the reply
+    # cannot be mistaken for a verified one.
+    assert "«Чудеса на виражах»" in out
+    assert "«ветер несёт вверх»" in out
+    assert "Формулировки проверены частично" in out
+
+
+def test_naming_a_document_does_not_count_as_evidence() -> None:
+    """The exemption that stopped «Чудеса на виражах» being replaced by a marker
+    opened a hole: the title went into ``kept``, and ``kept_quotes`` is what the
+    grounding verdict requires. A reply that cited one wrong chunk, proved
+    nothing, and only named a document then came back GROUNDED — so the CLI
+    printed no warning at all, and the wrong answer looked clean.
+
+    Real case: «Полёт на самолёте как наблюдатель возможен [4]» where [4] pointed at
+    a parachuting document, with no quote anywhere, and no ``[rag]`` line.
+    """
+    hits = (
+        RagHit("kb/Чудеса на виражах.pdf", 1, 24, "page 1",
+               "участник не пилотирует самолёт", 1.0, "c4"),
+        RagHit("kb/Прыжок с парашютом.pdf", 1, 9, "page 1",
+               "свободный полёт", 1.0, "c2"),
+    )
+    event = RagEvent(question="ну на самолете всё-таки",
+                     retrieved=tuple(h.location for h in hits),
+                     candidates=2, sources=hits)
+    reply = ("Полёт на самолёте как наблюдатель возможен [2]. "
+             "Уточните, какой документ — «Чудеса на виражах» или другой?")
+
+    final = ragmod.finalize_answer(reply, event)
+
+    assert "«Чудеса на виражах»" in final.text
+    assert ragmod.UNSUPPORTED_QUOTE not in final.text
+    # And it is still an unproven answer.
+    assert final.quotes.kept == ()
+    assert final.grounding.status is ragmod.Grounding.UNGROUNDED
+
+
+# --------------------------------------------------------------------------- #
+# Handles as ranges and lists
+# --------------------------------------------------------------------------- #
+
+
+HANDLES = ("a.pdf:1-2", "b.pdf:1-2", "c.pdf:1-2", "d.pdf:1-2")
+
+
+def test_a_range_of_handles_is_read_as_several_chunks() -> None:
+    """Real log line: «citations not in the retrieved block: 1-3, 1,3».
+
+    The model cited ``[1-3]`` and ``[1,3]`` meaning chunks 1 and 3. Both were
+    parsed as a *single* document whose name is the string ``1-3`` — a document
+    that does not exist — so a correct attribution came back unconfirmed, and the
+    chunks it named were missing from the source list too.
+    """
+    for text, wanted in (
+        ("Ограничения [1-3]", (1, 2, 3)),      # a range covers everything between
+        ("Оба [1,3]", (1, 3)),                 # a list names exactly these
+        ("С пробелом [1, 3]", (1, 3)),
+    ):
+        out, audit = ragmod.audit_citations(text, HANDLES, handles=HANDLES)
+        assert audit.dropped == (), text
+        assert audit.used_handles == wanted, text
+        assert out == text, text
+
+
+def test_a_range_backwards_reads_the_same() -> None:
+    out, audit = ragmod.audit_citations("Всё [3-1]", HANDLES, handles=HANDLES)
+    assert audit.dropped == ()
+    assert audit.used_handles == (1, 2, 3)
+
+
+def test_a_range_naming_a_chunk_that_was_not_sent_is_still_rejected() -> None:
+    """The new form must not become a way through: a range is a claim about
+    several chunks, and if one of them was never sent the bracket is wrong."""
+    out, audit = ragmod.audit_citations("Всё [1-5]", HANDLES, handles=HANDLES)
+
+    assert audit.dropped == ("5",)
+    assert audit.used_handles == (1, 2, 3, 4)
+    assert ragmod.UNSUPPORTED_CITATION in out
+
+
+def test_a_line_range_is_not_mistaken_for_a_handle_range() -> None:
+    """``file.pdf:17-24`` is one document with a range of lines, not handles 17
+    through 24. Getting this wrong would reject every correct file citation."""
+    locations = ("Чудеса на виражах.pdf:1-24",)
+    out, audit = ragmod.audit_citations(
+        "Фрагмент [Чудеса на виражах.pdf:17-24]", locations, handles=locations
+    )
+    assert audit.dropped == ()
+    assert out == "Фрагмент [Чудеса на виражах.pdf:17-24]"
+
+
+def test_an_answer_does_not_open_with_marker_debris() -> None:
+    """Real reply:
+
+    ``[1] [цитата не подтверждена] [1]`` then a bare fragment, then the answer.
+
+    The model started mid-thought with citation brackets; the audits replaced the
+    quote inside them and left a line with no words in it, above the answer. It
+    reads as a broken interface, and it is the first thing in the reply.
+    """
+    debris = (
+        "[1] [цитата не подтверждена] [1]\n\n"
+        "[6] «Ореховый — 50 ₽ добавки» [6]\n\n"
+        "Проблема: ореховый сироп."
+    )
+
+    assert ragmod._strip_leading_debris(debris).startswith("[6] «Ореховый")
+    assert ragmod._strip_leading_debris(debris).startswith(
+        "[6] «Ореховый")
+
+
+def test_debris_stripping_leaves_prose_where_it_is() -> None:
+    """Only leading lines, and only lines with no words at all. A line with a
+    single word is content, and debris in the middle of a reply is not the defect
+    being fixed here — eating it would be a guess."""
+    assert ragmod._strip_leading_debris("[1] Проблема тут.\n[2]") == \
+        "[1] Проблема тут.\n[2]"
+    assert ragmod._strip_leading_debris(
+        "Первая строка.\n\n[1] [1]\n\nВторая."
+    ) == "Первая строка.\n\n[1] [1]\n\nВторая."
+
+
+def test_evidence_front_loaded_above_the_answer_is_removed() -> None:
+    """Real reply, first turn of the coffee dialogue:
+
+    ``[1] «Ореховый сироп содержит фундук и миндаль…» [1]`` and
+    ``[6] «Ореховый — 50 ₽ добавки» [6]``, and only then the prose.
+
+    The model checks its evidence and prints it before it starts writing. Every
+    word in those lines is already in the source list the code appends, so they
+    repeat what the reader is shown anyway — and above the answer they make a
+    correct reply look like it failed to start.
+    """
+    reply = (
+        "[1] «Ореховый сироп содержит фундук и миндаль» [1]\n\n"
+        "[6] «Ореховый — 50 ₽ добавки» [6]\n\n"
+        "Проблема в сиропе. Он содержит орехи [1].\n\n"
+        "Что делать:\n- Не предлагать [1]"
+    )
+
+    out = ragmod._drop_standalone_evidence(reply)
+
+    assert out.startswith("Проблема в сиропе.")
+    assert "50 ₽ добавки» [6]" not in out
+    # The citation inside the prose stays; it is the answer's own evidence.
+    assert "содержит орехи [1]" in out
+
+
+def test_an_answer_made_only_of_evidence_lines_is_left_alone() -> None:
+    """Stripping it would leave nothing to show, so the lines stay and the
+    grounding note says what went wrong instead."""
+    only = "[1] «текст» [1]\n[2] «ещё» [2]"
+    assert ragmod._drop_standalone_evidence(only) == only
+
+
+def test_an_ordinary_reply_is_untouched() -> None:
+    reply = "Проблема в сиропе. [1] «фраза»"
+    assert ragmod._drop_standalone_evidence(reply) == reply
+
+
+def test_finalize_answer_can_be_applied_twice() -> None:
+    """The note was printed twice, stacked.
+
+    A turn that reuses evidence from earlier sends its reply back through this
+    function, and the note appended the first time is still in the text — so the
+    reader got two identical lines. Reported from a run whose whole answer was a
+    refusal: «Документы не использованы — ответ не подтверждён.» immediately
+    followed by the same sentence.
+    """
+    hits = (RagHit("kb/a.pdf", 1, 5, "стр", "текст", 1.0, "c"),)
+    event = RagEvent(question="дд", retrieved=(hits[0].location,),
+                     candidates=1, sources=hits)
+    reply = "Я не нашёл ответа на «дд» в базе знаний кофейни."
+
+    once = ragmod.finalize_answer(reply, event).text
+    twice = ragmod.finalize_answer(once, event).text
+
+    assert once.count(ragmod.UNUSED_SOURCES_NOTE) == 1
+    assert twice.count(ragmod.UNUSED_SOURCES_NOTE) == 1

@@ -219,6 +219,42 @@ def _fit_words(text: str, limit: int) -> str:
 
 #: ``[file.md]`` or ``[file.md:12-18]`` — the citation shapes the protocol asks
 #: for. Only square brackets: the corpus has file names with parentheses and
+def _cited_handles(cited: str) -> list[int] | None:
+    """Handles a citation names, or ``None`` when it names a document instead.
+
+    The model cites ``[3]`` but also ``[1-3]`` and ``[1,3]``, meaning several
+    chunks. Those were being read as one document whose name is the string
+    ``1-3``, so a correct attribution came back as «источник не подтверждён» —
+    with the chunks it named missing from the footer as well. A line range
+    (``файл.pdf:17-24``) is not a handle list: the hyphen there belongs to the
+    colon, which is why only text with no colon is considered.
+    """
+    text = cited.strip()
+    if ":" in text:
+        return None
+    if not re.fullmatch(r"[0-9,\s]+(?:[-–—][0-9]+)?", text):
+        return None
+    numbers: list[int] = []
+    for part in re.split(r"[,]", text):
+        part = part.strip()
+        if not part:
+            continue
+        bounds = re.split(r"[-–—]", part)
+        try:
+            values = [int(b) for b in bounds if b.strip()]
+        except ValueError:
+            return None
+        if not values:
+            return None
+        if len(values) == 1:
+            numbers.append(values[0])
+        elif values[0] <= values[1]:
+            numbers.extend(range(values[0], values[1] + 1))
+        else:
+            numbers.extend(range(values[1], values[0] + 1))
+    return numbers or None
+
+
 #: colons is common in them, so this stays deliberately narrow. The line range
 #: is captured separately because it has to be checked, not just displayed.
 _CITATION_RE = re.compile(
@@ -232,6 +268,48 @@ _CITATION_RE = re.compile(
 #: marker the model copied back instead of counting it as a fresh citation.
 UNSUPPORTED_CITATION_TEXT = "источник не подтверждён"
 UNSUPPORTED_CITATION = f"[{UNSUPPORTED_CITATION_TEXT}]"
+
+
+def summarise(items: Sequence[str]) -> list[str]:
+    """Collapse repeats: one line per distinct problem, with a count.
+
+    A model that repeats a sentence also repeats its citation and its quote, so
+    the raw audit reported «цитата не подтверждена» six times over and every
+    report line that printed them repeated the same non-information. What a
+    reader needs is which problems happened and how often — one line each is
+    enough to act on.
+    """
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item] = counts.get(item, 0) + 1
+    out = []
+    for item, n in counts.items():
+        out.append(item if n == 1 else f"{item} ({n}×)")
+    return out
+
+
+_REPEAT_MARKER_RE = re.compile(
+    r"(?P<marker>"
+    + re.escape(UNSUPPORTED_QUOTE)
+    + r"|"
+    + re.escape(UNSUPPORTED_CITATION)
+    + r")(?:\s+(?P=marker))*"
+)
+
+
+def collapse_repeated_markers(text: str) -> str:
+    """``[x] [x] [x]`` becomes ``[x] ×3``.
+
+    The markers exist so an unverified claim cannot read as verified, and a wall
+    of identical ones does the opposite: it pushes the reader's eye past the
+    marker entirely. The count is kept, because how many claims were unsupported
+    is part of what the answer has to disclose.
+    """
+    def run(match: re.Match[str]) -> str:
+        n = len(re.findall(re.escape(match.group("marker")), match.group(0)))
+        return match.group("marker") if n == 1 else f"{match.group('marker')} ×{n}"
+
+    return _REPEAT_MARKER_RE.sub(run, text)
 
 
 @dataclass
@@ -267,6 +345,10 @@ class QuoteAudit:
 
     kept: tuple[str, ...] = ()
     dropped: tuple[str, ...] = ()
+    #: Quotes that match the chunk exactly once spacing is ignored — the model
+    #: corrected a typo in the source. Not evidence in the strict sense, so not
+    #: in ``kept``; not a fabrication either, so not in ``dropped``.
+    approx: tuple[str, ...] = ()
     #: Quoted fragments that could not be checked because no citation claimed
     #: them. Reported rather than dropped silently: a check that quietly skips
     #: half its input is indistinguishable from a check that passes everything,
@@ -365,9 +447,15 @@ def audit_citations(
         cited = match.group(1).strip()
         if cited in skipped:
             return match.group(0)
-        if cited == UNSUPPORTED_CITATION_TEXT:
-            # A previous turn already said this; re-checking it would pile up
-            # duplicates in the audit and in the warning log.
+        if cited in (UNSUPPORTED_CITATION_TEXT, UNSUPPORTED_QUOTE_TEXT):
+            # One of this audit's own markers, copied back out of the history.
+            # It is not a fresh claim, so it must not be counted as one: a
+            # previous turn already reported it, and re-reporting would both
+            # duplicate the warning and — because the two markers mean different
+            # things — relabel a rejected quote as a rejected citation. That
+            # showed up as «RAG citations not in the retrieved block: цитата не
+            # подтверждена», which accuses the answer of citing a document it
+            # never named.
             return match.group(0)
         start = match.group(2)
         end = match.group(3) or start
@@ -381,6 +469,22 @@ def audit_citations(
             if int(cited) not in used:
                 used.append(int(cited))
             return match.group(0)
+        numbers = _cited_handles(cited)
+        if numbers is not None:
+            # A range or a list. Credit every handle that really was sent, so
+            # the chunks the model meant appear in the footer; the bracket is
+            # marked only if some of the numbers named a chunk that was not.
+            missing = [n for n in numbers if str(n) not in by_handle]
+            for n in numbers:
+                location = by_handle.get(str(n))
+                if location is not None:
+                    kept.append(location)
+                    if n not in used:
+                        used.append(n)
+            if not missing:
+                return match.group(0)
+            dropped.extend(str(n) for n in missing)
+            return UNSUPPORTED_CITATION
         matched: str | None = None
         for name, first, last in known:
             if not names_match(cited, name):
@@ -389,9 +493,9 @@ def audit_citations(
                 matched = name
                 break
         if matched is not None:
-            kept.append(cited)
             # A citation that named a file still points at one of the printed
             # chunks, so it belongs in the source list under that chunk's number.
+            kept.append(cited)
             number = handle_of_name.get(matched)
             if number is not None and number not in used:
                 used.append(number)
@@ -445,6 +549,77 @@ def strip_citations(text: str, *, ignore: Sequence[str] = ()) -> str:
 #: list has two forms and detection must hold for both — see
 #: :func:`render_sources_footer`.
 SOURCES_HEADING = "Источник"
+
+#: Two distinct reasons why an answer can carry no sources, worded differently on
+#: purpose. Both are appended by code, so the model cannot omit them and cannot
+#: produce one where it does not belong.
+#:
+#: The first is the index's verdict: retrieval was asked and sent nothing. The
+#: second is the model's: the chunks were in front of it and none was cited. One
+#: is a gap in the data, the other is a gap in the answer, and they send you to
+#: different places — folding them into a single "no sources" would hide exactly
+#: the second one, which is the signal that the model stopped using evidence.
+#:
+#: They say «документы», not «источники», on purpose. :data:`SOURCES_HEADING` is
+#: the stem every parser looks for to find where the source list begins, and a
+#: note opening with the same word would be read as the start of that list — by
+#: ``scripts/batch_ask.py`` it would become a source line made of the note.
+NO_SOURCES_NOTE = "Документы не найдены — ответ не подтверждён."
+UNUSED_SOURCES_NOTE = "Документы не использованы — ответ не подтверждён."
+
+
+def unverified_note(dropped: int, unchecked: int) -> str:
+    """One line, once, instead of a placeholder in every sentence.
+
+    Says how much of the answer could not be checked against the chunk it names,
+    which is the fact worth knowing. It goes next to the source list rather than
+    inside the prose, because inside the prose it lands mid-sentence and the
+    sentence stops meaning anything.
+    """
+    parts = []
+    if dropped:
+        parts.append(
+            f"{dropped} " + _plural(dropped, "цитата не совпала", "цитаты не совпали",
+                                    "цитат не совпало")
+        )
+    if unchecked:
+        parts.append(
+            f"{unchecked} " + _plural(unchecked, "фраза", "фразы", "фраз")
+            + " без ссылки на источник"
+        )
+    if not parts:
+        return ""
+    return "Формулировки проверены частично: " + "; ".join(parts) + \
+        " — сверьте их с источниками ниже."
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+NOTE_NOT_FOUND = "not_found"
+NOTE_UNUSED = "unused"
+
+_SOURCES_NOTES = {
+    NOTE_NOT_FOUND: NO_SOURCES_NOTE,
+    NOTE_UNUSED: UNUSED_SOURCES_NOTE,
+}
+_NOTE_BY_TEXT = {note: reason for reason, note in _SOURCES_NOTES.items()}
+
+
+def sources_note_reason(text: str) -> str | None:
+    """Which "no sources" note *text* carries, or ``None`` if it carries neither.
+
+    Reports classify with this instead of matching wording of their own, so
+    rewording a note leaves the counts intact instead of quietly zeroing them.
+    """
+    for note, reason in _NOTE_BY_TEXT.items():
+        if note in text:
+            return reason
+    return None
 
 
 def render_sources_footer(
@@ -539,6 +714,23 @@ def _norm_quote(value: str) -> str:
     return re.sub(r"\s+", " ", value).casefold()
 
 
+def _tight(value: str) -> str:
+    """``_norm_quote`` with every space removed.
+
+    Needed because a source can be missing a space where the model puts one. The
+    coffee corpus says «фундук иминдаль»; a model quoting it as «фундук и
+    миндаль» has quoted it faithfully and corrected a typo, and
+    :func:`_norm_quote` cannot see that — collapsing runs of whitespace does not
+    add a space that is not there.
+
+    This only forgives spacing. Every other character still has to be present in
+    the same order, so a paraphrase cannot pass by accident; the cost is that a
+    real rewrite which happens to differ only in spacing is called approximate,
+    which is what it is.
+    """
+    return _norm_quote(value).replace(" ", "")
+
+
 def _quotes_in(text: str) -> list[tuple[str, int, int]]:
     """Every quoted fragment as ``(body, start, end)`` spans of ``text``."""
     found: list[tuple[str, int, int]] = []
@@ -599,6 +791,7 @@ def audit_quotes(
     sources: Sequence[RagHit],
     *,
     ignore: Sequence[str] = (),
+    mark_unchecked: bool = False,
 ) -> tuple[str, QuoteAudit]:
     """Replace quoted fragments that the pointed-at chunk does not contain.
 
@@ -618,11 +811,49 @@ def audit_quotes(
 
     ``ignore`` works as in :func:`audit_citations`: brackets that are not sources
     have no chunk to be checked against, and the quotes under them are left alone.
+
+    ``mark_unchecked`` covers the gap that let fabricated wording through. A
+    quote nobody cited is normally left alone — it may be the user's own words.
+    But when some citation in the same answer *was* rejected, the uncited quotes
+    are no longer ambiguous: the model did attach them to a source, that source
+    did not survive, and leaving the phrase unmarked presents it as established.
+    Real case: a question about a paraglider came back with an explanation of how
+    a paraglider works, a claim about weekend flights and a six-month validity
+    period — none of it in the document the citation pointed at. The citation was
+    marked; the wording and its quote were not, so the reader saw invented text
+    carrying an invented quote and only a bracket beside it.
     """
     if not sources:
         return text, QuoteAudit()
     by_handle = {str(number): hit for number, hit in enumerate(sources, 1)}
     skipped = {item.strip() for item in ignore}
+
+    # Names of the documents actually in play. A model that has to disambiguate
+    # two similar certificates writes their titles — «Чудеса на виражах» or
+    # «Полёт на паралёте» — and that is a name, not a claim about wording.
+    # Auditing it produced «Уточните, какой именно документ вас интересует —
+    # [цитата не подтверждена] или [цитата не подтверждена]?», which reads as
+    # breakage rather than as a document name.
+    document_names = {
+        _norm_quote(hit.location.split(":", 1)[0])
+        for hit in sources
+        if hit.location
+    }
+    document_names.discard("")
+    for hit in sources:
+        stem = Path(hit.location.split(":", 1)[0]).stem
+        if stem:
+            document_names.add(_norm_quote(stem))
+
+    def is_document_name(body: str) -> bool:
+        needle = _norm_quote(body)
+        if not needle:
+            return False
+        return any(
+            needle == name or needle in name or name in needle
+            for name in document_names
+            if name
+        )
 
     # Citation spans first, so each quote can be attributed to the nearest one
     # on either side of it.
@@ -637,6 +868,7 @@ def audit_quotes(
     kept: list[str] = []
     dropped: list[str] = []
     unchecked: list[str] = []
+    approx: list[str] = []
     out: list[str] = []
     cursor = 0
     for body, start, end in _quotes_in(text):
@@ -649,10 +881,17 @@ def audit_quotes(
             if hit is not None
         ]
         if not candidates:
-            # No citation claims this quote, so it is not a claim about a chunk —
-            # it may be the customer's own wording. Left exactly as written, and
-            # counted, so the report can show how much went unverified.
+            # No citation claims this quote. Left exactly as written — it may be
+            # the customer's own wording — unless a citation in this answer was
+            # already rejected, in which case the model did mean to attribute it
+            # to a source and the attribution failed.
             unchecked.append(body)
+            # Deliberately nothing inserted here. An inline placeholder in the
+            # middle of a sentence replaced the model's own words and left
+            # «но [цитата не подтверждена] не значит [цитата не подтверждена]» —
+            # the sentence stopped carrying its meaning to make a point no reader
+            # could act on. The count goes next to the source list instead, where
+            # it says something and does not cut prose in half.
             continue
         needle = _norm_quote(body)
         target = next(
@@ -662,14 +901,35 @@ def audit_quotes(
         if target is not None:
             kept.append(body)
             out.append(text[start:end])
+        elif any(
+            _tight(body) in _tight(hit.text) for hit in candidates
+        ):
+            # Same characters, different spacing. The model quoted the chunk and
+            # silently fixed its typing; calling that a paraphrase would mark a
+            # faithful quotation as fabricated. Kept, and reported apart from the
+            # quotes that match exactly, so the two are never confused.
+            approx.append(body)
+            out.append(text[start:end])
         else:
-            dropped.append(body)
-            out.append(UNSUPPORTED_QUOTE)
+            if is_document_name(body):
+                # The document's own title, which the chunk does not contain
+                # because the chunk *is* that document. Naming it is not a claim
+                # about wording, so it is not marked — and it is deliberately
+                # NOT counted as evidence either. Counting it made a reply that
+                # only named a document pass as grounded: ``kept_quotes`` was
+                # satisfied by the title, so an answer citing one wrong chunk and
+                # proving nothing printed no warning at all.
+                unchecked.append(body)
+                out.append(text[start:end])
+            else:
+                dropped.append(body)
+                out.append(text[start:end])
         cursor = end
     if not out:
         return text, QuoteAudit(
             kept=tuple(kept),
             dropped=tuple(dropped),
+            approx=tuple(approx),
             unchecked=tuple(unchecked),
             uncited=not kept,
         )
@@ -1084,6 +1344,7 @@ class Retriever:
 #: is exactly what makes a grounding number meaningless.
 REFUSAL_RE = re.compile(
     r"(не наш[её]л|не нахожу|не могу найти|не смог найти|не удалось найти"
+    r"|не могу ответить"
     r"|информаци\w*[^.\n]{0,24}?нет\b|нет информации|не содержит"
     r"|не упоминается|не указан\w*|не знаю|не в базе|не в документах"
     r"|отсутствует|не встречается|за рамками (?:этой |моей )?базы)",
@@ -1093,6 +1354,10 @@ REFUSAL_RE = re.compile(
 #: What the bot says instead of a claim it cannot back. Fixed wording on
 #: purpose: it is the one sentence that must be recognisable by the same
 #: :func:`is_refusal` the benchmark uses, and free wording cannot be.
+#:
+#: The pattern below is what keeps that promise, so it is stated as a test: a
+#: refusal wording the detector misses is scored as a confident answer, which
+#: makes strict mode look worse than it is and hides the behaviour it exists for.
 NO_ANSWER_TEXT = "Не могу ответить по этому контексту. Уточните, пожалуйста, вопрос."
 
 
@@ -1225,6 +1490,146 @@ class FinalAnswer:
     grounding: GroundingVerdict
 
 
+#: The model imitates the source list when the protocol shows its shape, and a
+#: second list is the result. Both are plausible-looking, and one of them is
+#: invented: a real run answered a question about insurance with a footer naming
+#: "Релаксация в фитобочке", which retrieval had returned for some other
+#: reason. A reader cannot tell which list to believe, and the audit was reading
+#: the invented one.
+_IMITATED_FOOTER_RE = re.compile(
+    r"^[ \t]*" + re.escape(SOURCES_HEADING) + r"и?[ \t]*(?:\([^\n]*\))?[ \t]*:[ \t]*\n"
+    r"(?:[ \t]*(?:\[[^\]]*\][^\n]*|[-–—*][^\n]*|chunk [^\n]*)(?:\n|\Z))+",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: A bare copy of the block's own per-hit header, with no list around it. The
+#: block shows the model ``[4] file.pdf:17-24 — page 1 · chunk structure-011-002``
+#: above every chunk, and the model sometimes reprints one of those lines as if it
+#: were the source list. Real case: the reply carried
+#: ``[4] Чудеса на виражах.pdf:17-24`` while the real footer said the same handle
+#: was ``:1-10`` — two line ranges for one source, side by side, and the invented
+#: one read as authoritative.
+_COPIED_HIT_LINE_RE = re.compile(
+    r"^\[[^\]]{1,8}\][ \t]+[^\n:]{1,160}?:\d+(?:-\d+)?[ \t]*(?:—|–|-|·).+"
+    r"(?:\n|\Z)",
+    re.MULTILINE,
+)
+
+
+def strip_imitated_footer(text: str) -> str:
+    """Remove a source list the model wrote itself.
+
+    Repeated until nothing changes, because a model that invents a list often
+    writes two or three back to back and each one starts a line the previous
+    match ended on.
+
+    Everything from the heading down goes, because a half-trimmed list leaves
+    the reader worse off than none — an unpaired ``[4]`` above and a list without
+    it below. The list this code appends afterwards is the true one.
+    """
+    for _ in range(4):
+        cleaned = _IMITATED_FOOTER_RE.sub("", text)
+        cleaned = _COPIED_HIT_LINE_RE.sub("", cleaned)
+        # The removed list leaves the blank lines that surrounded it behind.
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).rstrip()
+        if cleaned == text.rstrip():
+            return cleaned
+        text = cleaned
+    return text
+
+
+#: A reply this degenerate is not a short answer, it is the model repeating one
+#: fragment until it runs out. Measured on a 14-turn coffee dialog: 31 identical
+#: markers per turn from turn 3 onward, and every turn after it identical too.
+#:
+#: This matters beyond the one bad turn. The audit replaces the repeated
+#: fragment with a marker, and that text goes into the history the model reads
+#: next — so a highly repetitive line becomes the most recent thing the model
+#: saw, and the pattern it is already in. Measured: 402 such markers in one
+#: report. Refusing is the honest response, and it is also the one that stops the
+#: contamination.
+_LOOP_MIN_LINES = 12
+_LOOP_MIN_RATIO = 0.8
+
+
+def looks_looped(text: str) -> bool:
+    """True when a reply is the same line over and over.
+
+    Lines, not sentences: the audit collapses a repeated *sentence* into a
+    repeated marker, so counting sentences after the fact would miss the case
+    that matters. The threshold is deliberately high — a list of similar items
+    or a table is not a loop, and a run that genuinely repeats a caveat twice
+    should not be refused for it.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < _LOOP_MIN_LINES:
+        return False
+    unique = len(set(lines))
+    return (len(lines) - unique) / len(lines) >= _LOOP_MIN_RATIO
+
+
+def _is_debris_line(line: str) -> bool:
+    """True when a line is made of markers and punctuation, with no words.
+
+    Checked by taking the line apart rather than by matching a shape: markers sit
+    next to each other separated by brackets, and a pattern for the whole line has
+    to get every separator right to notice there is nothing underneath them.
+    """
+    rest = line
+    for marker in (UNSUPPORTED_QUOTE, UNSUPPORTED_CITATION,
+                   UNSUPPORTED_QUOTE_TEXT, UNSUPPORTED_CITATION_TEXT):
+        rest = rest.replace(marker, " ")
+    rest = re.sub(r"\[[^\]]{0,8}\]", " ", rest)
+    return not re.sub(r"[\s\W_]+", "", rest, flags=re.UNICODE)
+
+
+def _strip_leading_debris(text: str) -> str:
+    """Drop opening lines that carry nothing but markers.
+
+    A reply that starts mid-thought can open with citation brackets the model was
+    still writing when it changed its mind. After the audits replace the quotes
+    inside them, what is left is ``[1] [цитата не подтверждена] [1]`` — a line
+    with no words at all, sitting above the actual answer.
+
+    Only leading lines are touched. A line containing a single word is prose and
+    stays, because that judgement is not available here and guessing it would eat
+    content the model did write.
+    """
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or _is_debris_line(lines[i])):
+        i += 1
+    return "\n".join(lines[i:]).lstrip("\n")
+
+
+def _is_evidence_only_line(line: str) -> bool:
+    """True when a line is nothing but citations, quotes and punctuation."""
+    rest = line
+    for quote in ("«[^»]*»", '"[^"]*"'):
+        rest = re.sub(quote, " ", rest)
+    rest = re.sub(r"\[[^\]]{0,200}\]", " ", rest)
+    rest = re.sub(r":[0-9]+(?:-[0-9]+)?", " ", rest)
+    return not re.sub(r"[\s\W_]+", "", rest, flags=re.UNICODE)
+
+
+def _drop_standalone_evidence(text: str) -> str:
+    """Remove lines that hold only citations and quoted fragments.
+
+    The model sometimes front-loads the evidence it checked and then writes the
+    answer — two lines of ``[1] «…» [1]`` above the prose. Every word in them is
+    already printed in the source list this code appends, so they add nothing for
+    the reader and make the reply look like it failed to start.
+
+    Guarded on something being left: a reply that is *only* evidence lines still
+    has to say something, so in that case the lines stay.
+    """
+    lines = text.splitlines()
+    kept = [l for l in lines if not _is_evidence_only_line(l)]
+    if not "".join(kept).strip():
+        return text
+    return "\n".join(kept)
+
+
 def finalize_answer(
     reply: str,
     event: RagEvent | None,
@@ -1244,15 +1649,46 @@ def finalize_answer(
     attributed to a chunk by the marker in front of it; then quotes, against the
     hits those markers resolved to; then the source list, appended rather than
     asked for so it cannot be forgotten.
+
+    An answer that ends with neither a source list nor a note is a defect. Before
+    this, "cited nothing" and "was told nothing" produced byte-identical text, so
+    a run could quietly degrade and the report would still look healthy; now one
+    of the two notes always appears, and which one says where to look.
     """
-    if event is None or not event.sources:
+    if event is None:
+        # RAG was not in play for this turn. Saying "sources not found" here
+        # would report a document search that never ran.
         return FinalAnswer(
             reply, None, None, GroundingVerdict(Grounding.UNGROUNDED, checked=False)
         )
 
+    if not event.sources:
+        # Retrieval ran and nothing survived to be sent, so the model had no
+        # evidence at all. The answer is unchecked rather than wrong — mark it,
+        # or it reads as a plain reply with nothing to doubt it by.
+        return FinalAnswer(
+            f"{reply}\n\n{NO_SOURCES_NOTE}",
+            None,
+            None,
+            GroundingVerdict(Grounding.UNGROUNDED, checked=False),
+        )
+
+    if looks_looped(reply):
+        # Refuse rather than show thirty copies of one line. Saying so also
+        # keeps the history clean: the next turn reads a short, honest sentence
+        # instead of a page of repeated markers, which is what drove the loop in
+        # the first place.
+        return FinalAnswer(
+            f"{NO_ANSWER_TEXT}\n\n{UNUSED_SOURCES_NOTE}",
+            None,
+            None,
+            GroundingVerdict(Grounding.UNGROUNDED, checked=True),
+        )
+
     if not cite:
         # Nothing to verify: without a citation and a quote there is no evidence
-        # to check, so the verdict says so rather than blaming the answer.
+        # to check, so the verdict says so rather than blaming the answer. No note
+        # either — sources were switched off on purpose, which is not a failure.
         return FinalAnswer(
             strip_citations(reply, ignore=invariant_ids),
             None,
@@ -1261,6 +1697,10 @@ def finalize_answer(
         )
 
     handles = [hit.location for hit in event.sources]
+    # Before anything is checked. An invented source list has to go first, or it
+    # gets audited as if it were the model's citations — which is how a footer
+    # naming an unrelated document could pass for evidence.
+    reply = strip_imitated_footer(reply)
     text, citations = audit_citations(
         reply,
         # The chunks that were sent, not the ones retrieval returned. A hit can
@@ -1270,12 +1710,36 @@ def finalize_answer(
         ignore=invariant_ids,
         handles=handles,
     )
-    text, quotes = audit_quotes(text, event.sources, ignore=invariant_ids)
-    text += render_sources_footer(
-        event.sources, citations.used_handles if citations else ()
-    )
-    return FinalAnswer(
+    text, quotes = audit_quotes(
         text,
+        event.sources,
+        ignore=invariant_ids,
+        # A rejected citation somewhere in the answer means the wording attached
+        # to it is unattributable, not merely uncited.
+        mark_unchecked=bool(citations.dropped),
+    )
+    used = citations.used_handles if citations else ()
+    note = unverified_note(len(quotes.dropped), len(quotes.unchecked))
+    if note:
+        text += f"\n\n{note}"
+    text += render_sources_footer(event.sources, used)
+    # Chunks were sent and none of them was cited. A refusal gets the note too:
+    # it declines in its own words, but the reader still has to know whether the
+    # bot had documents in front of it and left them alone — that is the
+    # difference between "found nothing" and "refused to answer". The note makes
+    # no claim of support, so unlike a source list it cannot contradict a
+    # refusal the way «Источник [1]» under «не нашёл» would.
+    if not used and UNUSED_SOURCES_NOTE not in text:
+        # Idempotent. A turn that reuses evidence from earlier passes its reply
+        # back through here, and the note this function appended last time is
+        # still in the text — appending again printed it twice, stacked:
+        # «Документы не использованы — ответ не подтверждён.» on the line above
+        # the identical line.
+        text += f"\n\n{UNUSED_SOURCES_NOTE}"
+    return FinalAnswer(
+        _strip_leading_debris(
+            _drop_standalone_evidence(collapse_repeated_markers(text))
+        ),
         citations,
         quotes,
         judge_grounding(reply, event, citations=citations, quotes=quotes),
