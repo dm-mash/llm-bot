@@ -42,7 +42,9 @@ from llm_bot.rag import (
     RagEvent,
     Retriever,
     finalize_answer,
+    is_refusal,
     sources_from_text,
+    summarise,
 )
 from llm_bot.stores import AgentConfig, SessionStore
 from llm_bot.task_state import (
@@ -303,6 +305,13 @@ class Session:
         # long-term layers (see ``extract_memory``).
         self._memory_auto_extract = memory_auto_extract
         self._memory_events: list[MemoryEvent] = []
+        # Ordinal of the turn facts are being taken from. It is counted here
+        # rather than read off ``_history``: that is a message list, so its
+        # length was 1 on turn 1, 3 on turn 2, 5 on turn 3 — and every stored
+        # fact pointed one turn into the future, at a turn the user could not
+        # yet have seen. It also shrinks under compression, so it is not a
+        # stable counter at all.
+        self._memory_turn = 0
         self._history = (
             list(history) if history is not None else store.load(session_id)
         )
@@ -522,7 +531,20 @@ class Session:
         for message in reversed(self._history):
             if message.get("role") != "assistant":
                 continue
-            for name in sources_from_text(str(message.get("content", "")), limit=2):
+            content = str(message.get("content", ""))
+            if is_refusal(content):
+                # A turn that declined and then listed what *other* documents
+                # say is not a statement of the subject — it is a list of
+                # alternatives, and every one of them is a legitimate citation.
+                # Reading them as the subject is how a conversation about one
+                # certificate ended up searching another one: the turn before a
+                # real miss answered «информации нет», cited four unrelated
+                # documents, and those four became the subject for the next
+                # question. The document the customer never stopped asking about
+                # was gone from the preference by then, and its answer was
+                # retrieved instead — one of them invented on the spot.
+                continue
+            for name in sources_from_text(content, limit=2):
                 if name not in names:
                     names.append(name)
             if len(names) >= limit:
@@ -1014,7 +1036,12 @@ class Session:
         # ``finalize_answer`` is the single implementation, shared with
         # ``scripts/compare_rag.py``: the benchmark has to score the behaviour the
         # bot actually has, not a second idea of what a backed answer is.
-        if rag_event is not None and rag_event.retrieved:
+        #
+        # The guard is ``rag_event is not None``, not ``rag_event.retrieved``. A
+        # turn where retrieval found nothing is precisely the one that needs the
+        # "sources not found" note, and skipping it is what left that turn
+        # indistinguishable from an answer that cited nothing on purpose.
+        if rag_event is not None:
             final = finalize_answer(
                 reply,
                 rag_event,
@@ -1040,15 +1067,21 @@ class Session:
                 # no longer be comparable.
                 self._rag_earlier.extend(rag_event.retrieved)
 
+            # Not warnings. The quoted text is a paragraph long, so one of these is a
+            # screenful printed *above* the answer it describes, and the reader
+            # gets the same fact twice: once as prose they must read past and
+            # once as a count in the answer itself («Формулировки проверены
+            # частично: 3 цитаты не совпали»). Which text failed is a diagnostic,
+            # so it lives behind -v.
             if final.citations is not None and final.citations.dropped:
-                logger.warning(
+                logger.debug(
                     "RAG citations not in the retrieved block: %s",
-                    ", ".join(final.citations.dropped),
+                    ", ".join(summarise(final.citations.dropped)),
                 )
             if final.quotes is not None and final.quotes.dropped:
-                logger.warning(
+                logger.debug(
                     "RAG quotes not in the cited chunk: %s",
-                    ", ".join(final.quotes.dropped),
+                    ", ".join(summarise(final.quotes.dropped)),
                 )
 
             if final.grounding.status is Grounding.UNGROUNDED:
@@ -1083,11 +1116,13 @@ class Session:
             and self._memory_auto_extract
         ):
             try:
+                self._memory_turn += 1
                 event = extract_memory(
                     self._memory,
                     user_msg,
                     reply,
                     self.agent.client.chat,
+                    turn=self._memory_turn,
                 )
             except Exception as exc:  # noqa: BLE001 - never let memory break the turn
                 # One concise line for the user; the full traceback goes to
