@@ -1527,6 +1527,25 @@ only add latency. And the passage handed to the cross-encoder is prefixed with
 corpus is full of near-duplicate documents, and the filename is what tells
 them apart, not the body text.
 
+### Four chunks is too few for a question about the whole catalogue
+
+`--rag-top-k` defaults to 4. On the coffee corpus the drinks menu is chunk 8 of
+17 for the question «привет, какой кофе есть?» — 0.390 against 0.457 for the
+document's own header, so the ranking barely distinguishes them. At `top_k=4` the
+menu is cut, the model gets syrups and milk rules, and answers «полного списка
+напитков нет» — which is true of the block it was handed and false of the corpus.
+`--rag-top-k 12` returns the whole menu, correctly, on the first try.
+
+The reranker does not fix this and on this class of question makes it worse: the
+menu stays 8th while syrups, milk and the allergy page rise above it. The measured
+0.647 → 0.941 gain comes from fact-shaped questions; on «что вообще есть» it
+loses. The word "напиток" appears in the syrup and milk *prose* and only as a
+table header in the menu, and the cross-encoder scores on exactly that.
+
+This is a general shape, not a tuning accident: a question about the catalogue
+matches no particular fragment well, so it sits in the middle of a vector ranking
+that is trying to rank fragments.
+
 ### Why there is no threshold
 
 There is `--rag-rerank-min-score`, and it is off by default because measuring it
@@ -1704,6 +1723,14 @@ mechanism exists for — see below.
 
 ### Asking for the phrase made the quotes appear
 
+An attempt to fix the long-dialogue case by repeating the protocol as a system
+message immediately before each question, next to the invariant reminder, is
+recorded here because it did not work: on one 14-turn dialogue the strict column
+rose from 1 to 6 while every single turn degenerated, and on the other it went
+from 0 to 2. Whether the extra system message provoked the looping is not
+established — the loop had already been observed without it, at one run per
+arm. See "the model repeats itself" below.
+
 The third check sat at **5 of 34** for a long time, which looked like a limit of
 the corpus rather than a limit of the prompt. It was the prompt. Asking for a
 phrase in the abstract produced a verbatim quote in 15 of 32 answers; the same
@@ -1796,6 +1823,230 @@ between them. Drop the flag to get sources back.
 With citations off there is nothing to verify, so the verdict says `checked=False`
 rather than blaming the answer — an unjudged answer is never counted as a good
 one, which is what keeps the two modes comparable.
+
+### Every answer shows sources, or says why there are none
+
+A list of sources on some turns and nothing on others is the worst of both: the
+reader cannot tell an answer without evidence from an answer that hid it. So a
+response always ends in one of three states:
+
+| | how it ends | when |
+|---|---|---|
+| sources used | `Источники (фрагменты из ответа):` + the cited chunks | the answer cites something |
+| none found | `Документы не найдены — ответ не подтверждён.` | retrieval ran and returned nothing |
+| none used | `Документы не использованы — ответ не подтверждён.` | chunks were sent, none of them cited |
+
+The two notes are separate states because they point at different failures:
+"found nothing" is a retrieval gap, "used nothing" is the model ignoring what it
+was handed. A single counter would hide the second one.
+
+A refusal gets the note too. It declines in its own words, but the reader still
+has to know whether documents were in front of it — that is the difference
+between "found nothing" and "refused to answer". The note claims no support, so
+unlike a source list it cannot contradict a refusal the way `Источник [1]` under
+"не нашёл" would.
+
+With `--rag-no-cite` there is nothing to audit, so no note is added: the flag
+means "do not show sources", not "show a note about not showing sources". Same
+for `--rag` absent — RAG off is not a claim about documents.
+
+### Which corpus to demonstrate this on
+
+`data/kb_emb` holds **two** documents. That is enough to show that retrieval and
+citations work, and not enough to show what they are for: there is nothing to
+confuse one document with another, so the hardest part of the mechanism cannot
+appear. It also means the block is always a mix of the same two files, and no
+amount of tuning changes that — a per-document cap on a two-document corpus has
+nothing to diversify and can only truncate. Measured: a cap of 3 kept 13 of 14
+expected answers against 14 of 14 with no cap, and the one it lost was a
+synthesis question, the same class as the catalogue question `top_k=12` exists to
+serve.
+
+`data/certs_emb` holds seven near-identical gift certificates: two of them differ
+mainly by whether there are two participants, and one document is a parachuting
+certificate whose marketing text sits next to a flight certificate. That is where
+the mechanism either earns its place or does not — and it is where the bugs were
+found. Demonstrate on certs.
+
+Two retrieval hypotheses were measured on the coffee corpus and both rejected:
+cutting at the steepest drop in the score list (it does not exist — the ranking is
+flat, and the cuts landed at 15–16 of 17), and capping chunks per document (there
+are two documents, so it only truncates).
+
+### Running a whole dialogue
+
+`scripts/eval_dialogue.py` plays a scripted conversation turn by turn against a
+local index and grades every turn. A dialogue is YAML in `dialogues/`:
+
+```yaml
+agent: researcher
+goal: "подобрать десерт без молока и орехов"
+clarified:
+  - "гость не пьёт молоко"
+terms:
+  "строго без орехов": "следы миндаля тоже не подходят"
+turns:
+  - user: "Есть веганские десерты без молока и без орехов?"
+    contains: ["молок", "орех"]     # required
+  - user: "Молоко он не пьёт."
+    any_of: ["молок"]               # at least one
+    note: "факт, который должен долежать до конца"
+check:
+  user: "Напомни, что он не пьёт и что посоветовали."
+  contains: ["молок"]               # the closing question
+```
+
+```
+.venv/bin/python scripts/eval_dialogue.py --dialogue dialogues/coffee.yaml \
+    --index data/kb_emb/index_structure.json --runs 1
+```
+
+The report separates the closing check from ordinary turns: the check is graded
+on what it recalls, with no grounding requirement, because it is a question about
+the conversation rather than about a document. Every other turn must carry
+sources or a note.
+
+It also grades three different things, because "did it work" is not one question:
+
+| measure | what it asks |
+|---|---|
+| **Отвечено по существу** | did the turn answer the question that was asked |
+| **Источники показаны** | did it show a source list, or declare that there was none |
+| Строгое опирание на источники | did every claim carry a citation *and* a verbatim quote from a chunk |
+
+The first is the headline. The third is the strict protocol above, and it is
+much the harshest: over a long dialog the model largely stops quoting after the
+first few turns, so the strict figure is low even when the run answered
+everything correctly. Counting it as *the* verdict made a dialogue that kept
+its goal, cited something on every turn and answered every question correctly
+report 1/14 — a number that contradicted the rest of its own report. Split, each
+turn says what it did and did not do, and the per-turn table marks
+`ок · строго нет` for the answers that skipped the quote protocol.
+
+Two things are checked so the headline cannot be satisfied without an answer.
+
+The source footer is **excluded** from the content checks. The footer is
+assembled by the script out of chunk paths and section titles, so a keyword can
+appear there without the model having said it — in one coffee run the answer to
+«А если он хочет взять с собой?» was 95 lines of audit markers and nothing else,
+and it passed because `самовывоз` appears in
+`delivery.md — Доставка и самовывоз > Самовывоз`. A grader that accepts its own
+output is not a grader.
+
+A reply that **repeats itself** fails. Over these dialogs the model falls into a
+loop on longer runs — in one coffee run, turns 4 through the closing question
+came back byte-identical, 2946 characters each, five unique lines between them,
+all of them audit markers. The audits are what made it invisible: they replaced
+the repeated sentence with placeholders, so the report showed a reply that
+looked damaged rather than one that had never contained an answer. Content
+checks also have to be non-empty — a turn with no `contains`/`any_of`/`absent`
+passes whatever the bot says, and both shipped fixtures had such turns,
+including the two questions that are deliberately not in the corpus.
+
+The point of the closing question is that it is the only place where forgetting
+shows up, so `clarified` and `terms` are things the dialog must have actually
+established. A test enforces this — a constraint nobody stated would make the
+check unfalsifiable, and the run would then fail for memory that was never asked
+to hold anything.
+
+### Comparing with and without memory
+
+```
+--memory on     # default: extract facts into working / long-term
+--memory off    # same dialogue, same history, no extraction
+```
+
+Both arms run the same dialogue and keep the history, so a difference in the
+closing check is attributable to memory alone rather than to a shorter prompt or
+a lost turn. The report prints which arm it was.
+
+Measured on the two shipped dialogues, one run each (`data/results/day25_*.md`):
+
+| dialogue | memory | answered | sources shown | strictly grounded | goal kept |
+|---|---|---|---|---|---|
+| coffee | off | 14/14 | 14/14 | 7/14 | yes |
+| coffee | on | 14/14 | 14/14 | 1/14 | yes |
+| certs | off | 13/14 | 14/14 | 1/14 | yes |
+| certs | on | 10/14 | 14/14 | 3/14 | no |
+
+Two of these are solid and one is not yet shown.
+
+**Solid.** Sources appear on every turn of every run — a list, or a note saying
+there were none. That is the requirement that cannot be met halfway, and it is
+met 56/56. The dialogs answer the question that was asked on 10–14 turns out of
+14.
+
+**Not yet shown.** That memory is *why* the closing question is answered. An
+earlier pair of runs looked like a clean 0/1 → 1/1 on both dialogues, and it was
+not: regenerating all four flipped `certs`, and both memory-off runs pass the
+check. A single run per arm cannot separate the effect of memory from ordinary
+variation, and this dialogue is long enough that one run tells you very little.
+Saying otherwise would be reading a coincidence as a result. To claim it, run each
+arm several times and compare rates.
+
+The strict column is the one that is genuinely poor — 1–7 of 14 — and it is the
+same on both arms, so whatever causes it is not about memory.
+
+A fact only reaches memory on the strength of words the user actually said. The
+classifier must quote them, and a quote that is not found in the user's message
+is dropped with a reason recorded in the report, rather than silently trusted:
+
+```
+[memory] факт отброшен (long_term:allergies): доказательства нет в словах пользователя
+```
+
+That check is not decoration. Before it existed, a turn as small as
+«привет, как дела?» left «аллергия на орехи» and «две недели» in the guest's
+long-term profile, because the classifier had inferred them from nothing, and
+the profile is injected into every later turn.
+
+### A handle means nothing outside the turn it was printed in
+
+Handle numbers are assigned per retrieval, so the same number names a different
+document from one turn to the next. The model was reusing numbers from earlier
+answers without re-reading the block, and that is the one observed way this
+system attributed a real fact to a real but wrong chunk:
+
+- turn 1 — `[4]` was `Чудеса на виражах.pdf`, and «участник не пилотирует» was
+  indeed from that document;
+- turn 2 — same `[4]`, now `Прыжок с парашютом.pdf`, and the answer still carried
+  the plane facts, now citing a parachuting document.
+
+The audit cannot see this. The handle resolves, so nothing is flagged, and there
+is no quote to compare against the chunk the number now points at. Detecting the
+attribution without a quote would mean matching the answer's wording to a chunk
+lexically, which is the number-proxy problem this repo already rejected once.
+
+So the protocol states the rule the model was never told: numbers belong to this
+block, change from question to question, re-read before citing. A detector was
+written off rather than built — handles legitimately remap on nearly every turn,
+so "this number meant something else last turn" is also true of correct answers,
+and a warning that fires on good turns is worse than none.
+
+
+
+On a long dialog the model sometimes stops answering and starts repeating one
+short fragment — a citation marker with a short quote — until it runs out. The
+audits make it worse: each repetition is replaced by a marker, so the reply the
+user sees is thirty copies of `[1] [источник не подтверждён]».`
+
+The part that turned a bad turn into a ruined run is what happens next. That text
+goes into the history, so the next turn opens with a page of identical lines as
+the most recent thing in context — the exact pattern the model is already in.
+One 14-turn coffee dialog held **402** such markers, and from turn 3 onward every
+reply was the same 31 markers. The model was not being stubborn; it was being
+shown its own pattern back.
+
+So a reply whose lines are 80% one repeated line, over at least twelve lines, is
+refused outright rather than displayed. Two reasons, and the second is the point:
+a page of repeated markers is not an answer, and refusing leaves a short honest
+sentence in the history instead of feeding the loop forward. The threshold is
+tight on purpose — a twenty-row table, a list of similar items and a caveat
+repeated twice all pass.
+
+This is a guard, not a fix. It stops the damage from compounding; it does not stop
+the model from looping, and it does not produce quotes. What it does buy is that
+a run stays measurable: every number afterwards comes from a reply that exists.
 
 ### Invariant ids are not citations
 
