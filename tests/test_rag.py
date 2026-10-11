@@ -504,6 +504,10 @@ def test_the_session_leaves_invariant_ids_alone(
     session = _make_session(
         tmp_path, transport, retriever=retriever(index_path, top_k=1),
         invariants=True,
+        # The shipped template, not ``data/invariants.yaml``: that file is local
+        # and untracked, so a test reading it measures the machine, not the code
+        # — it went red on a checkout where the file happened to be absent.
+        invariants_file=str(Path(__file__).resolve().parents[1] / "invariants.example.yaml"),
     )
     session.chat(QUESTIONS["hours"])
 
