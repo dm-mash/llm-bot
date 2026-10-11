@@ -230,6 +230,18 @@ models:
     model: llama3.2
 ```
 
+Besides `base_url`/`api_key`/`model`, a profile may set `context_window`
+(input budget for overflow checks) and `timeout` (per-request seconds, falling
+back to `LLM_TIMEOUT`). A local model partly offloaded to CPU needs the larger
+timeout: 30 s is fine for an API, not for a 7B.
+
+Caveat for Ollama: the OpenAI-compatible `/v1/chat/completions` endpoint only
+honours `temperature`, `max_tokens`, `top_p`, `seed`, `stop` and the penalties.
+It silently **drops** generation options such as `repeat_penalty` and `num_ctx`
+(and ignores a top-level `num_ctx`); those work only through the native
+`/api/chat` or a `Modelfile`. So `context_window` here governs *our* overflow
+check, not the server's `num_ctx` — the server keeps its own default.
+
 Example `data/agents.yaml` (two agents sharing the same model profile):
 
 ```yaml

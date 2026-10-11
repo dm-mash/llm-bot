@@ -23,6 +23,7 @@ models:
     api_key: ""                       # local providers need no auth
     model: llama3.2
     context_window: 8192              # use a smaller window for small local models
+    timeout: 300                      # seconds; a partly CPU-offloaded 7B is slow
 
   groq-on-demand:
     provider: openai
