@@ -227,6 +227,50 @@ def test_the_report_says_which_arm_it_was() -> None:
     assert "Память: включена" in ev.render_report(dlg, [[]], True, index, "x", True)
 
 
+# --------------------------------------------------------------------------- #
+# --agent: run the same fixture on a different profile
+# --------------------------------------------------------------------------- #
+
+
+def test_a_flag_agent_takes_the_dialogue_to_that_profile() -> None:
+    """Both shipped dialogues pin ``agent: researcher``, which points at a cloud
+    model. Without an override the only way to measure a local model is to edit
+    the fixture, and a fixture edited for one run is no longer the same fixture
+    the other runs used."""
+    dlg = ev.load_dialogue(ROOT / "dialogues" / "certs.yaml")
+    assert dlg.agent == "researcher"
+
+    failure = ev.override_agent(dlg, "qwen-local-gpu")
+
+    assert failure is None
+    assert dlg.agent == "qwen-local-gpu"
+    # The report reads dialogue.agent, so the label follows the override.
+    report = ev.render_report(dlg, [[]], True, index_stub(), "certs")
+    assert "- Агент: `qwen-local-gpu`" in report
+
+
+def test_no_flag_leaves_the_dialogue_agent_alone() -> None:
+    """The default must stay the fixture's own agent, or every run without the
+    flag would silently change which model it measured."""
+    dlg = ev.Dialogue(agent="researcher", turns=[ev.Turn("вопрос")], goal="цель")
+
+    assert ev.override_agent(dlg, None) is None
+    assert dlg.agent == "researcher"
+
+
+def test_an_unknown_agent_is_refused_before_the_run_starts() -> None:
+    """A typo has to cost nothing: the failure happens here, not a minute into
+    a 14-turn dialogue."""
+    dlg = ev.Dialogue(agent="researcher", turns=[ev.Turn("вопрос")], goal="цель")
+
+    failure = ev.override_agent(dlg, "нету-такого")
+
+    assert failure is not None and "нету-такого" in failure
+    # The dialogue keeps its own agent, so a refused override cannot leave a
+    # half-switched run behind.
+    assert dlg.agent == "researcher"
+
+
 def test_the_report_shows_where_each_stored_fact_came_from() -> None:
     """Counts alone cannot explain a failed closing question: "w6/l0" says a
     memory existed, not whether it held the constraint being asked about. The
@@ -310,6 +354,17 @@ def test_a_turn_that_answered_well_is_not_reported_as_a_failure() -> None:
     assert "**Источники показаны: 1/1**" in report
     assert "Строгое опирание на источники: 0/1" in report
     assert "строго нет" in report
+
+
+def test_the_report_shows_speed_and_token_cost() -> None:
+    """day29 compares knobs by quality *and* cost, so the report has to carry
+    per-turn wall-clock and token figures, not just the verdicts."""
+    dlg = ev.Dialogue(agent="researcher", turns=[ev.Turn("вопрос")], goal="цель")
+    row = _row(seconds=3.0, total_tokens=1200, reply_tokens=40)
+    report = ev.render_report(dlg, [[row]], True, index_stub(), "coffee")
+
+    assert "Скорость: медиана 3.0 c/ход" in report
+    assert "Токены: медиана 1200/ход" in report
 
 
 def test_the_strict_measure_stays_visible_instead_of_being_dropped() -> None:

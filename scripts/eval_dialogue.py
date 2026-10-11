@@ -19,8 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -237,7 +239,18 @@ def run_dialogue(
     if dialogue.check is not None:
         plan.append((dialogue.check, True))
     for number, (turn, is_check) in enumerate(plan, start=1):
+        began = time.perf_counter()
         answer = session.chat(turn.user)
+        elapsed = time.perf_counter() - began
+        # Wall-clock and token counts ride along with every row: day29 compares
+        # quality against speed, and a run that only records the verdict cannot
+        # say whether a knob was worth its cost.
+        usage = getattr(session, "last_usage", None)
+        timing = {
+            "seconds": elapsed,
+            "total_tokens": usage.total_tokens if usage else None,
+            "reply_tokens": usage.reply_tokens if usage else None,
+        }
         passed, problems = turn.judge(answer_body(answer))
         # A turn with no expectations in the YAML passes for free, which would
         # let it hide behind a degenerate reply. Both of these are about whether
@@ -269,6 +282,7 @@ def run_dialogue(
                 if session.last_grounding else None,
                 "is_check": True,
                 "note": turn.note,
+                **timing,
             })
             continue
         # Three questions, answered separately.
@@ -335,6 +349,7 @@ def run_dialogue(
                 "memory_now": _memory_view(session),
                 "is_check": False,
                 "note": turn.note,
+                **timing,
             }
         )
     return rows
@@ -397,6 +412,23 @@ def render_report(
         f"- **Источники показаны: {with_sources}/{total}** — список источников либо пометка об их отсутствии",
         f"- Строгое опирание на источники: {strict}/{total} — каждое утверждение с цитатой и дословной выдержкой из чанка",
     ]
+    seconds = [r["seconds"] for rows in rows_per_run for r in rows if "seconds" in r]
+    all_tokens = [
+        r["total_tokens"]
+        for rows in rows_per_run
+        for r in rows
+        if r.get("total_tokens") is not None
+    ]
+    if seconds:
+        lines.append(
+            f"- Скорость: медиана {statistics.median(seconds):.1f} c/ход, "
+            f"суммарно {sum(seconds):.0f} c на {len(seconds)} ответов"
+        )
+    if all_tokens:
+        lines.append(
+            f"- Токены: медиана {statistics.median(all_tokens):.0f}/ход, "
+            f"суммарно {sum(all_tokens)}"
+        )
     if total and strict < passed:
         lines += [
             "",
@@ -520,6 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="считать подтверждённым источник из прошлого хода сессии",
     )
     parser.add_argument(
+        "--agent",
+        default=None,
+        help=(
+            "переопределить агента из диалога: прогон идёт на другом профиле "
+            "(например, локальной модели), а диалог остаётся эталонным"
+        ),
+    )
+    parser.add_argument(
         "--memory",
         choices=("on", "off"),
         default="on",
@@ -534,12 +574,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def override_agent(dialogue: Dialogue, name: str | None) -> str | None:
+    """Взять агента из командной строки вместо агента диалога.
+
+    Проверка имени здесь, а не в ``make_session``: опечатка должна всплыть до
+    того, как потрачены минуты на прогон. Возвращает текст ошибки или None.
+    """
+    if not name:
+        return None
+    try:
+        YamlAgentStore().get(name)
+    except (KeyError, ValueError) as exc:
+        return str(exc)
+    dialogue.agent = name
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.index.is_file():
         print(f"индекс не найден: {args.index}", file=sys.stderr)
         return 2
     dialogue = load_dialogue(args.dialogue)
+    failure = override_agent(dialogue, args.agent)
+    if failure is not None:
+        print(f"агент не найден: {failure}", file=sys.stderr)
+        return 2
     rerank = not args.no_rerank
 
     memory_on = args.memory == "on"
@@ -571,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     total = len(real)
     with_sources = sum(1 for row in real if row.get("sources_ok"))
     strict = sum(1 for row in real if row.get("strict_passed"))
+    print(f"агент: {dialogue.agent}")
     for position, turn in enumerate(dialogue.turns):
         marks = " ".join(
             "ок  " if rows[position]["fact_passed"] else "НЕТ " for rows in rows_per_run
