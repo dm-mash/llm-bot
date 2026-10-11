@@ -6,7 +6,9 @@ import os
 
 import pytest
 
+from llm_bot.factory import llm_config_for
 from llm_bot.json_session_store import JsonSessionStore
+from llm_bot.stores import ModelConfig
 from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
 
 
@@ -67,6 +69,29 @@ def test_yaml_model_store_missing_env_resolves_empty(tmp_path):
     store = YamlModelStore(path)
     model = store.get("openai")
     assert model.api_key == ""  # OPENAI_API_KEY not set in this test
+
+
+def test_yaml_model_store_parses_timeout(tmp_path):
+    path = _write(
+        tmp_path,
+        "models.yaml",
+        """\
+models:
+  local:
+    provider: openai
+    base_url: http://localhost:11434/v1
+    model: qwen2.5:7b
+    timeout: 300
+""",
+    )
+    model = YamlModelStore(path).get("local")
+    assert model.timeout == 300
+
+
+def test_yaml_model_store_timeout_defaults_to_none(tmp_path):
+    path = _write(tmp_path, "models.yaml", MODELS_YAML)
+    model = YamlModelStore(path).get("local")
+    assert model.timeout is None
 
 
 def test_yaml_agent_store(tmp_path):
@@ -159,3 +184,22 @@ def test_json_session_store_invalid_id(tmp_path):
     store = JsonSessionStore(str(tmp_path / "sessions"))
     with pytest.raises(ValueError):
         store.save("../evil", [])
+
+
+def test_llm_config_for_carries_timeout():
+    model = ModelConfig(
+        name="local",
+        provider="openai",
+        base_url="http://localhost:11434/v1",
+        model="qwen2.5:7b",
+        timeout=300,
+    )
+    config = llm_config_for(model)
+    assert config.timeout == 300
+
+
+def test_llm_config_for_keeps_default_timeout_when_model_omits_it(monkeypatch):
+    monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+    model = ModelConfig(name="cloud", provider="openai", model="gpt-4o-mini")
+    config = llm_config_for(model)
+    assert config.timeout == 30.0

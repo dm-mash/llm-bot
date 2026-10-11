@@ -12,7 +12,7 @@ instances; the wiring here does not change.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import httpx
 
@@ -57,6 +57,12 @@ def llm_config_for(
     agent: AgentConfig | None = None,
 ) -> LLMConfig:
     """Build an :class:`LLMConfig` from a :class:`ModelConfig`, applying agent overrides."""
+    extra: dict[str, Any] = {}
+    # Only override the client's process-wide timeout when the model asks for
+    # one: passing ``None`` here would disable the timeout entirely, because the
+    # dataclass default is not applied to explicitly passed values.
+    if model.timeout is not None:
+        extra["timeout"] = model.timeout
     config = LLMConfig(
         base_url=model.base_url,
         api_key=model.api_key,
@@ -73,6 +79,7 @@ def llm_config_for(
         gigachat_client_secret=model.client_secret,
         gigachat_scope=model.scope,
         gigachat_basic_auth=model.basic_auth,
+        **extra,
     )
     return config
 

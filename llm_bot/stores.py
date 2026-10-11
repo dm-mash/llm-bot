@@ -59,6 +59,10 @@ class ModelConfig:
     # this are refused even with a full rate-limit bucket, so the agent treats it
     # as an extra budget.
     max_request_tokens: int | None = None
+    # Per-request timeout in seconds. Left unset, the client falls back to the
+    # process-wide LLM_TIMEOUT (30 s). A slow local model needs its own, larger
+    # value: 30 s is enough for an API, not for a 7B partly offloaded to CPU.
+    timeout: float | None = None
     # GigaChat OAuth2 credentials (only used when provider == "gigachat").
     client_id: str = ""
     client_secret: str = ""
@@ -76,6 +80,7 @@ class ModelConfig:
             model=str(data.get("model", "")),
             context_window=_opt_int(data.get("context_window")),
             max_request_tokens=_opt_int(data.get("max_request_tokens")),
+            timeout=_opt_float(data.get("timeout")),
             client_id=_resolve_env(str(data.get("client_id", ""))),
             client_secret=_resolve_env(str(data.get("client_secret", ""))),
             scope=str(data.get("scope", "GIGACHAT_API_PERS")),
