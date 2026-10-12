@@ -3,6 +3,10 @@ python-dotenv>=1.0.0
 PyYAML>=6.0
 prompt_toolkit>=3.0.0
 
+# Private HTTP service (llm_bot/server.py, scripts/serve_llm.py).
+fastapi>=0.110
+uvicorn>=0.29
+
 # Local document index (scripts/index_documents.py) — CPU embeddings.
 # torch is pulled in as a dependency; install a CUDA build explicitly if needed.
 sentence-transformers>=3.0

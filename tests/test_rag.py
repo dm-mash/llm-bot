@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -10,10 +12,11 @@ import httpx
 import pytest
 
 from llm_bot import rag as ragmod
-from llm_bot.factory import make_session
+from llm_bot.factory import build_retriever, make_session
 from llm_bot.json_session_store import JsonSessionStore
 from llm_bot.rag import (
     DEFAULT_MAX_CONTEXT_RATIO,
+    DEFAULT_TOP_K,
     NO_ANSWER_TEXT,
     UNSUPPORTED_QUOTE_TEXT,
     Grounding,
@@ -290,6 +293,61 @@ def test_embedder_is_loaded_lazily_and_from_the_index_itself(
     # any other. (Same rule as the indexer's --reuse path.)
     assert asked == ["fake-mini"]
     assert instance.embedder.name == "fake-mini"
+
+
+def test_the_lazy_embedder_is_loaded_once_under_threads(
+    index_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warm-up runs in a background thread while the first request may read the
+    property, so the load must stay single — two models is double the memory."""
+    instance = Retriever(index_path)
+    constructed: list[str] = []
+    barrier = threading.Barrier(4)
+
+    def slow_embedder(name: str) -> FakeEmbedder:
+        constructed.append(name)
+        time.sleep(0.05)
+        return FakeEmbedder(name)
+
+    monkeypatch.setattr(ragmod, "Embedder", slow_embedder)
+
+    seen: list[object] = []
+
+    def read() -> None:
+        barrier.wait()
+        seen.append(instance.embedder)
+
+    threads = [threading.Thread(target=read) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert constructed == ["fake-mini"]
+    assert len({id(item) for item in seen}) == 1
+
+
+def test_build_retriever_resolves_the_budget_and_k(index_path: Path) -> None:
+    """The shared Retriever is built once, so its options must be resolved here."""
+    built = build_retriever(index_path, context_window=4096, top_k=3)
+    assert built.index_path == index_path
+    assert built.top_k == 3
+    assert built.budget_tokens == rag_budget_tokens(
+        None, 4096, DEFAULT_MAX_CONTEXT_RATIO
+    )
+
+    default = build_retriever(index_path)
+    assert default.top_k == DEFAULT_TOP_K
+
+
+def test_make_session_keeps_the_injected_retriever(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """A caller that builds one Retriever shares that instance, not a copy."""
+    shared = retriever(index_path)
+    transport, _ = _capturing_transport("ok")
+    session = _make_session(tmp_path, transport, retriever=shared)
+    assert session._retriever is shared
 
 
 # --------------------------------------------------------------------------- #

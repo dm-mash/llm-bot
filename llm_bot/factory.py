@@ -191,6 +191,45 @@ def make_strategy(
     )
 
 
+def build_retriever(
+    rag_index: str | Path,
+    *,
+    context_window: int | None = None,
+    top_k: int | None = None,
+    max_context_tokens: int | None = None,
+    rerank: bool = False,
+    rerank_candidates: int | None = None,
+    rerank_min_score: float | None = None,
+    cite: bool = True,
+) -> Retriever:
+    """Build the :class:`~llm_bot.rag.Retriever` a session answers against.
+
+    Split out of :func:`make_session` so a long-lived caller (the HTTP service)
+    can build one Retriever and share it across sessions. That matters because
+    the embedding model is loaded lazily on the first query and costs tens of
+    seconds on CPU: a fresh Retriever per session would pay it on every new
+    dialog, while a shared one pays it once and can be warmed up at startup.
+
+    *context_window* is the model's, and only bounds the block's token budget
+    (see :func:`llm_bot.rag.rag_budget_tokens`) — it is not the agent config's,
+    which carries no such field. The index is read and validated here, so a
+    missing or foreign file fails at startup rather than on the user's first
+    question. *rerank* loads a second model; kept optional so the common path
+    never pays for it.
+    """
+    reranker = Reranker() if rerank else None
+    return Retriever(
+        rag_index,
+        top_k=top_k if top_k is not None else DEFAULT_RAG_TOP_K,
+        max_context_tokens=max_context_tokens,
+        context_window=context_window,
+        reranker=reranker,
+        candidate_k=rerank_candidates,
+        min_rerank_score=rerank_min_score,
+        cite=cite,
+    )
+
+
 def make_session(
     session_id: str,
     agent_name: str,
@@ -376,17 +415,14 @@ def make_session(
     # model itself is still loaded lazily on the first query.
     effective_retriever = retriever
     if effective_retriever is None and rag_index is not None:
-        # ``rag_rerank`` loads a second model; kept optional and injected here
-        # so the RAG-off path — and the common path — never pays for it.
-        reranker = Reranker() if rag_rerank else None
-        effective_retriever = Retriever(
+        effective_retriever = build_retriever(
             rag_index,
-            top_k=rag_top_k if rag_top_k is not None else DEFAULT_RAG_TOP_K,
-            max_context_tokens=rag_max_context_tokens,
             context_window=agent.context_window,
-            reranker=reranker,
-            candidate_k=rag_rerank_candidates,
-            min_rerank_score=rag_rerank_min_score,
+            top_k=rag_top_k,
+            max_context_tokens=rag_max_context_tokens,
+            rerank=rag_rerank,
+            rerank_candidates=rag_rerank_candidates,
+            rerank_min_score=rag_rerank_min_score,
             cite=rag_cite,
         )
 

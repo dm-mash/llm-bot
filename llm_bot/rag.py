@@ -37,6 +37,7 @@ hits are dropped rather than truncating the best one.
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1113,6 +1114,10 @@ class Retriever:
         self.cite = cite
         self._index = load_index(self.index_path)
         self._embedder = embedder
+        # Guards the lazy load below: one Retriever is shared across sessions and
+        # may be warmed up in a background thread while the first request reads
+        # the property, so two threads could otherwise load the model twice.
+        self._embedder_lock = threading.Lock()
         self.top_k = max(1, int(top_k))
         self.max_context_tokens = max_context_tokens
         self.budget_tokens = rag_budget_tokens(
@@ -1151,9 +1156,13 @@ class Retriever:
         indexing script, which rejects a contradicting ``--model``.
         """
         if self._embedder is None:
-            from .retrieval import DEFAULT_EMBEDDING_MODEL
+            with self._embedder_lock:
+                if self._embedder is None:
+                    from .retrieval import DEFAULT_EMBEDDING_MODEL
 
-            self._embedder = Embedder(self.embedding_model or DEFAULT_EMBEDDING_MODEL)
+                    self._embedder = Embedder(
+                        self.embedding_model or DEFAULT_EMBEDDING_MODEL
+                    )
         return self._embedder
 
     def retrieve(

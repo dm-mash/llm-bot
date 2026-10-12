@@ -45,7 +45,7 @@ questions:
     corpus: repo
     answerable: true
     expect: ["paraphrase-multilingual-MiniLM-L12-v2", "128"]
-    sources: ["README.md:1319-1325"]
+    sources: ["README.md:1332-1335"]
 
   - text: Какой дефолт у max_summary_ratio и что он ограничивает?
     corpus: repo
@@ -63,7 +63,7 @@ questions:
     corpus: repo
     answerable: true
     expect: ["8000", "TPM"]
-    sources: ["README.md:646-649"]
+    sources: ["README.md:660-664"]
 
   # --- Ловушка: число есть в репозитории, но НЕ в корпусе -------------------
   # data/models.yaml исключён из корпуса, поэтому RAG не должен доставать 8000
