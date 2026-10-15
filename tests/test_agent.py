@@ -121,6 +121,28 @@ def test_session_chat_grows_history_and_sends_full_stack(tmp_path):
     assert '"max_tokens":64' in payload
 
 
+def test_session_directive_is_sent_but_not_stored(tmp_path):
+    """A per-turn directive reaches the model without entering the history."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = request.read().decode()
+        return _ok_response()
+
+    transport = httpx.MockTransport(handler)
+    session = _make_session("s1", _agent_config(), transport, str(tmp_path / "sessions"))
+
+    session.chat("структура проекта?", directive="Это вопрос о проекте.")
+
+    payload = captured["payload"]
+    assert "Это вопрос о проекте." in payload
+    # The directive is transient: the stored history holds only the question.
+    assert session.history == [
+        {"role": "user", "content": "структура проекта?"},
+        {"role": "assistant", "content": "reply-text"},
+    ]
+
+
 def test_session_history_persists_across_instances(tmp_path):
     directory = str(tmp_path / "sessions")
 
@@ -234,5 +256,5 @@ def test_an_unverified_quote_does_not_warn_by_default(caplog):
 
     # And nothing in that block is still a warning.
     block = source[source.index("if final.quotes is not None and final.quotes.dropped"):
-                   source.index("if final.grounding.status is")]
+                   source.index("final.grounding.status is")]
     assert "logger.warning" not in block

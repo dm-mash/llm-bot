@@ -282,7 +282,7 @@ def test_embedder_is_loaded_lazily_and_from_the_index_itself(
 
     asked: list[str] = []
 
-    def fake_embedder(name: str) -> FakeEmbedder:
+    def fake_embedder(name: str, local_only: bool = False) -> FakeEmbedder:
         asked.append(name)
         return FakeEmbedder(name)
 
@@ -304,7 +304,7 @@ def test_the_lazy_embedder_is_loaded_once_under_threads(
     constructed: list[str] = []
     barrier = threading.Barrier(4)
 
-    def slow_embedder(name: str) -> FakeEmbedder:
+    def slow_embedder(name: str, local_only: bool = False) -> FakeEmbedder:
         constructed.append(name)
         time.sleep(0.05)
         return FakeEmbedder(name)
@@ -869,7 +869,13 @@ def test_the_factory_wires_the_index_path_and_top_k(
     tmp_path: Path, index_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``rag_index`` alone is enough: the session ends up with a real retriever."""
-    monkeypatch.setattr(ragmod, "Embedder", lambda name: FakeEmbedder(name))
+    seen: list[bool] = []
+
+    def fake_embedder(name: str, local_only: bool = False) -> FakeEmbedder:
+        seen.append(local_only)
+        return FakeEmbedder(name)
+
+    monkeypatch.setattr(ragmod, "Embedder", fake_embedder)
     transport, payloads = _capturing_transport("ок")
     session = _make_session(
         tmp_path, transport, rag_index=str(index_path), rag_top_k=3
@@ -878,6 +884,8 @@ def test_the_factory_wires_the_index_path_and_top_k(
     assert session._retriever.top_k == 3
     session.chat(QUESTIONS["hours"])
     assert any("Контекст из локальной базы" in b for b in _systems(payloads[0]))
+    # The runtime must prefer the cache: an offline start may not hit the Hub.
+    assert seen == [True]
 
 
 def test_a_failing_retriever_degrades_to_a_plain_answer(
@@ -1059,18 +1067,19 @@ def test_no_threshold_means_nothing_is_filtered(index_path: Path) -> None:
 
 
 def test_the_default_candidate_k_is_the_measured_one(index_path: Path) -> None:
-    """A reranker with no explicit ``candidate_k`` must still get 20 candidates.
+    """A reranker with no explicit ``candidate_k`` must get the default shortlist.
 
     Regression guard: ``DEFAULT_RERANK_CANDIDATES`` existed but was never read,
     so the shortlist silently collapsed to ``top_k`` (4) and the reranker only
     re-ordered what dense search had already picked — the arm then reported the
     identical retrieval rate to plain ``rag``, which is what made the bug
-    visible.
+    visible. The value is 50 because 20 missed a rank-32 gold chunk on the repo
+    index (see :mod:`llm_bot.rerank`).
     """
     from llm_bot.rerank import DEFAULT_RERANK_CANDIDATES
 
     instance = retriever(index_path, top_k=4, reranker=FakeReranker())
-    assert instance.candidate_k == DEFAULT_RERANK_CANDIDATES == 20
+    assert instance.candidate_k == DEFAULT_RERANK_CANDIDATES == 50
 
 
 def test_an_explicit_candidate_k_still_wins(index_path: Path) -> None:
@@ -1125,9 +1134,16 @@ def test_the_factory_injects_a_reranker_when_asked(tmp_path: Path) -> None:
     # Patched where the factory looks it up, not where it is defined.
     sentinel = FakeReranker()
     from llm_bot import factory as factorymod
+    from llm_bot.rerank import DEFAULT_RERANK_CANDIDATES
 
     original = factorymod.Reranker
-    factorymod.Reranker = lambda *a, **kw: sentinel
+    seen: list[dict] = []
+
+    def spy(*a: object, **kw: object) -> FakeReranker:
+        seen.append(kw)
+        return sentinel
+
+    factorymod.Reranker = spy
     try:
         session = _make_session(
             tmp_path, _capturing_transport()[0],
@@ -1136,7 +1152,9 @@ def test_the_factory_injects_a_reranker_when_asked(tmp_path: Path) -> None:
     finally:
         factorymod.Reranker = original
     assert session._retriever.reranker is sentinel
-    assert session._retriever.candidate_k == 20
+    assert session._retriever.candidate_k == DEFAULT_RERANK_CANDIDATES
+    # Offline by default: the same reason as the embedder below.
+    assert seen == [{"local_only": True}]
 
 
 def test_two_preferred_documents_both_keep_their_slot() -> None:
@@ -1414,6 +1432,52 @@ def test_strict_mode_withdraws_an_answer_nothing_backs(
     # as support for it.
     assert "Источники:" not in reply
     assert session.last_grounding.status is Grounding.UNGROUNDED
+
+
+def test_strict_mode_keeps_a_tool_answered_reply(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """A tool-answered turn is not withdrawn by --rag-strict.
+
+    ``/help покажи diff`` is grounded in the tool result, not in the retrieved
+    block, so its missing citation is not a claim about the block. Judging it by
+    the RAG verdict would make strict mode throw away the tool's own answer.
+    """
+    from llm_bot.mcp_tools import MCPEvent
+
+    class _Directive:
+        name = "notes__add_note"
+        arguments = {"text": "x"}
+
+    class ToolThenQuiet:
+        """Enough of MCPRouter: one call on the directive, then nothing."""
+
+        max_rounds = 2
+
+        def render_tools_block(self) -> str:
+            return "ДОСТУПНЫЕ ИНСТРУМЕНТЫ: пример"
+
+        def parse_directives(self, reply: str) -> list:
+            return [_Directive()] if '"call_tool"' in reply else []
+
+        def call_tool(self, name, arguments):
+            return MCPEvent(tool=name, server="notes", ok=True, result="ok")
+
+    replies = iter([json.dumps({"call_tool": {"name": "notes__add_note"}}), "Готово."])
+    transport, _ = _capturing_transport(lambda _payload: next(replies))
+    session = _make_session(
+        tmp_path,
+        transport,
+        retriever=retriever(index_path, top_k=1),
+        rag_strict=True,
+        mcp_router=ToolThenQuiet(),
+    )
+
+    reply = session.chat(QUESTIONS["hours"])
+
+    assert session.last_turn_used_tools is True
+    assert reply == "Готово."
+    assert reply != NO_ANSWER_TEXT
 
 
 def test_strict_mode_leaves_a_grounded_answer_alone(

@@ -10,9 +10,17 @@ best few.
 
 Two defaults are set by measurement on that corpus, not by taste:
 
-``DEFAULT_RERANK_CANDIDATES = 20``
-    Recall@20 was 34/34 against 22/34 at rank 4, so a 20-chunk shortlist loses
-    no answerable question before the re-scoring starts.
+``DEFAULT_RERANK_CANDIDATES = 50``
+    The 13-file corpus that motivated the stage has only 17 chunks, so a
+    20-chunk shortlist already held all of them (recall@20 was 34/34 against
+    22/34 at rank 4). The width only binds on a larger corpus, and there it was
+    too small: on the 742-chunk repository index the scheduler question's gold
+    chunk sat at dense rank 32, outside a 20-chunk shortlist, so the reranker
+    never saw it and the answer came from unrelated task-planning pages. At 50
+    the same question is re-scored to rank 1 (4/5 repo questions retrieved vs
+    2/5), while the 17-chunk corpus is unchanged — the shortlist is capped by
+    the corpus, so there is no recall loss and no latency cost where 20 already
+    covered everything.
 
 the ``source — section`` header in :func:`passage`
     Feeding the filename to the cross-encoder moved rank-4 recall from 29/34 to
@@ -44,8 +52,10 @@ from typing import Any
 DEFAULT_RERANK_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 
 #: How many chunks dense retrieval hands to the cross-encoder. Wider than
-#: ``top_k`` on purpose: this is the recall ceiling for the whole stage.
-DEFAULT_RERANK_CANDIDATES = 20
+#: ``top_k`` on purpose: this is the recall ceiling for the whole stage. See the
+#: module docstring for why 50: 20 already covered the small corpus the stage
+#: was built on, but missed a rank-32 gold chunk on the 742-chunk repo index.
+DEFAULT_RERANK_CANDIDATES = 50
 
 
 def passage(chunk: dict[str, Any]) -> str:

@@ -300,6 +300,11 @@ class Session:
             )
         self._mcp_max_rounds = max(1, int(mcp_max_rounds))
         self._mcp_events: list[MCPEvent] = []
+        # Whether the most recent turn actually ran an MCP tool. A tool-grounded
+        # answer is backed by the tool result, not by the retrieved block, so the
+        # RAG grounding verdict does not apply to it and must not be reported as
+        # "the answer cites no sources".
+        self._last_turn_used_tools = False
         # When enabled, after each turn the reply is classified via a small LLM
         # call and the extracted facts are written explicitly into the working /
         # long-term layers (see ``extract_memory``).
@@ -461,6 +466,11 @@ class Session:
         return self._mcp
 
     @property
+    def retriever(self) -> Retriever | None:
+        """The session's RAG retriever over a local index, or ``None``."""
+        return self._retriever
+
+    @property
     def mcp_events(self) -> list[MCPEvent]:
         """Every MCP tool round-trip recorded in this session."""
         return list(self._mcp_events)
@@ -469,6 +479,16 @@ class Session:
     def last_mcp_event(self) -> MCPEvent | None:
         """The most recent MCP tool event, or ``None``."""
         return self._mcp_events[-1] if self._mcp_events else None
+
+    @property
+    def last_turn_used_tools(self) -> bool:
+        """Whether the most recent turn ran at least one MCP tool.
+
+        When it did, the answer is grounded in the tool result rather than in
+        the retrieved block, so the RAG grounding verdict is not a verdict about
+        this answer and the CLI must not print it.
+        """
+        return self._last_turn_used_tools
 
     @property
     def rag_events(self) -> list[RagEvent]:
@@ -711,18 +731,31 @@ class Session:
         reply = self.agent.client.chat([{"role": "user", "content": prompt}])
         return _sanitize_text(reply.strip())
 
-    def chat(self, user_message: str, *, service_turn: bool = False) -> str:
+    def chat(
+        self,
+        user_message: str,
+        *,
+        service_turn: bool = False,
+        directive: str | None = None,
+    ) -> str:
         """Send a user message and return only the assistant's reply text.
 
         Equivalent to :meth:`chat_with_details`, but returns just the reply
         string for callers that do not care about token accounting. Token stats
-        remain available on :attr:`last_usage`. *service_turn* is forwarded —
-        machine-generated turns skip the task auto-detector.
+        remain available on :attr:`last_usage`. *service_turn* and *directive*
+        are forwarded — machine-generated turns skip the task auto-detector and
+        a directive adds a transient per-turn instruction.
         """
-        return self.chat_with_details(user_message, service_turn=service_turn).reply
+        return self.chat_with_details(
+            user_message, service_turn=service_turn, directive=directive
+        ).reply
 
     def chat_with_details(
-        self, user_message: str, *, service_turn: bool = False
+        self,
+        user_message: str,
+        *,
+        service_turn: bool = False,
+        directive: str | None = None,
     ) -> ChatResult:
         """Send a user message and return a :class:`ChatResult` with token usage.
 
@@ -747,6 +780,11 @@ class Session:
         would read the machine's own stage report («проверка пройдена,
         дефектов нет») and could autonomously advance the pipeline
         (``validation → done``) without any user decision.
+
+        *directive* is a transient, per-turn system instruction (e.g. the CLI's
+        ``/help`` marks the question as being about the project). It is injected
+        as a system message for THIS request only and is never written to the
+        history, so it steers the answer without polluting the dialog.
         """
         user_message = _sanitize_text(user_message.strip())
         if not user_message:
@@ -826,6 +864,13 @@ class Session:
             if block:
                 mcp_prefix = [{"role": "system", "content": block}]
 
+        # Transient per-turn instruction (e.g. the CLI's /help directive).
+        # Injected last before the request, ahead of the role prompt, and never
+        # stored — it belongs to this question, not to the dialog.
+        directive_prefix = (
+            [{"role": "system", "content": directive}] if directive else []
+        )
+
         # RAG: the top chunks of the local index for THIS question. Placed
         # after the tools block and before the role prompt: the model already
         # knows what it can call, and the evidence sits immediately ahead of the
@@ -860,6 +905,7 @@ class Session:
                 *task_prefix,
                 *mcp_prefix,
                 *rag_prefix,
+                *directive_prefix,
                 *prepared.prefix,
             ]
             messages = self.agent.build_messages(
@@ -886,6 +932,7 @@ class Session:
                     *task_prefix,
                     *mcp_prefix,
                     *rag_prefix,
+                    *directive_prefix,
                 ]
                 or None,
             )
@@ -965,6 +1012,7 @@ class Session:
         # the final answer. Bounded by mcp_max_rounds (rounds = model replies)
         # so a misbehaving model cannot loop forever; several calls in ONE
         # reply do not consume extra rounds.
+        tools_before = len(self._mcp_events)
         if self._mcp is not None:
             for round_index in range(self._mcp_max_rounds):
                 directives = self._mcp.parse_directives(reply)
@@ -1026,6 +1074,7 @@ class Session:
                 # Token accounting must reflect what was actually sent across
                 # the whole turn, including tool round-trips.
                 context_tokens = count_messages_tokens(messages)
+        self._last_turn_used_tools = len(self._mcp_events) > tools_before
 
         # Every citation in the answer has to be backed by the block that was
         # actually sent, and every quote has to be verbatim in the chunk it was
@@ -1041,10 +1090,16 @@ class Session:
         # turn where retrieval found nothing is precisely the one that needs the
         # "sources not found" note, and skipping it is what left that turn
         # indistinguishable from an answer that cited nothing on purpose.
+        #
+        # A tool-answered turn is the exception: the answer is grounded in the
+        # tool result, not in the block, so the block is not evidence for it. It
+        # is judged as an un-RAG'd turn (``event=None``), which suppresses the
+        # "documents not used" note and the citation audit that would misread the
+        # tool's own text as citations to chunks the model never leaned on.
         if rag_event is not None:
             final = finalize_answer(
                 reply,
-                rag_event,
+                None if self._last_turn_used_tools else rag_event,
                 cite=self._rag_cite,
                 invariant_ids=self._invariant_ids(),
             )
@@ -1084,7 +1139,13 @@ class Session:
                     ", ".join(summarise(final.quotes.dropped)),
                 )
 
-            if final.grounding.status is Grounding.UNGROUNDED:
+            if (
+                final.grounding.status is Grounding.UNGROUNDED
+                and not self._last_turn_used_tools
+            ):
+                # A tool-answered turn is grounded in the tool result, not the
+                # block: its missing citation is not a failure, so --rag-strict
+                # must not withdraw an answer the tool just produced.
                 if self._rag_strict:
                     # Drop the answer and say the useful thing instead. The
                     # source list goes with it: naming chunks for a claim that

@@ -372,6 +372,12 @@ def _print_grounding(session: Session) -> None:
     through, and that is the whole question this mechanism exists to answer. Only
     printed when something was wrong, so a clean dialog stays quiet.
     """
+    # A turn answered through an MCP tool is grounded in the tool result, not in
+    # the retrieved block, so "the answer cites no sources" is not a verdict
+    # about it. Without this, every /help question about the working tree (diff,
+    # branch, files) ended with a spurious "[rag] ответ не опирается на источники".
+    if session.last_turn_used_tools:
+        return
     verdict = session.last_grounding
     if verdict is None or verdict.status is Grounding.GROUNDED:
         return
@@ -736,8 +742,36 @@ _TASK_COMMANDS = {
 }
 _INVARIANT_COMMANDS = {"/invariants", "/invariant", "/инварианты"}
 
+# Slash-commands that ask the assistant about the project itself. Unlike an
+# ordinary message, `/help` refuses to answer without an attached project
+# context (RAG index or MCP git) and marks the turn with the directive below —
+# that is what makes it a project mode rather than a synonym for any question.
+_HELP_COMMANDS = {"/help", "/помощь"}
+
+# Transient system instruction sent with each /help turn (never stored).
+# It deliberately does not name the git tools: naming them made the model reach
+# for `diff` on documentation questions that the retrieval block already
+# answers. Tools are for repository *state*, not for facts in the docs.
+_HELP_DIRECTIVE = (
+    "Пользователь задаёт вопрос о самом проекте разработки (этот репозиторий), "
+    "а не о внешних данных. Сначала ищи ответ в предоставленном контексте "
+    "документации проекта и отвечай по нему, цитируя источники. Инструменты "
+    "состояния репозитория (какая ветка, какие файлы, что изменено) применяй "
+    "только тогда, когда вопрос именно о текущем состоянии репозитория; для "
+    "вопросов по документации они не нужны. Опирайся только на реальные "
+    "источники; ничего не выдумывай."
+)
+
+# Launch command shown when /help is used without project context.
+_HELP_LAUNCH_HINT = (
+    "python -m llm_bot --agent researcher --rag --rag-rerank "
+    "--rag-index data/emb/index_structure.json --mcp git"
+)
+
 # Words offered by tab-completion in the interactive prompt.
 _COMMAND_WORDS = [
+    "/help",
+    "/помощь",
     "/history",
     "/история",
     "/branch",
@@ -1124,6 +1158,89 @@ def _task_paused_gate(session: Session, raw: str) -> bool:
     return True
 
 
+def _chat_turn(
+    session: Session,
+    text: str,
+    *,
+    directive: str | None = None,
+    service_turn: bool = False,
+) -> None:
+    """Send one user turn and print the reply plus the usual diagnostics.
+
+    Shared by the interactive loop and the ``/help`` command so both get the
+    same invariant handling, error reporting and stderr diagnostics. *directive*
+    is a transient per-turn system instruction (see ``/help``); *service_turn*
+    keeps a machine-marked turn out of the task auto-detector. Errors never
+    propagate: a refused or failed turn is reported and the caller keeps
+    running.
+    """
+    kwargs: dict[str, Any] = {"service_turn": service_turn}
+    if directive is not None:
+        kwargs["directive"] = directive
+    try:
+        print(session.chat(text, **kwargs))
+    except InvariantViolationError as exc:
+        print(exc.refusal)
+        if exc.matched_pattern:
+            # Code gate: the request never reached the model.
+            print("[invariants] запрос отклонён инвариантом (не отправлен "
+                  "модели).", file=sys.stderr)
+        else:
+            # Audit gate: the reply was refused after review.
+            print("[invariants] ответ отклонён аудитом инвариантов "
+                  "(история откачена).", file=sys.stderr)
+        return
+    except LLMError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return
+    _print_grounding(session)
+    _print_usage(session)
+    _print_compression(session)
+    _print_memory(session)
+    _print_invariant_warnings(session)
+    _print_task_rejection(session)
+    # G8: the reply may have moved the stage (auto-detection). Let the model act
+    # on the new stage NOW, like a manual /task next does, instead of lagging
+    # one user turn behind.
+    _auto_turn_after_detection(session)
+
+
+def _handle_help_command(session: Session, raw: str) -> bool:
+    """Handle ``/help [вопрос]`` — the project Q&A command.
+
+    Returns True when the input was the command. With no question it prints a
+    usage hint. With one it *requires* an attached project context (a RAG
+    retriever or the git MCP): without it the command refuses instead of asking
+    the model from memory, so a ``/help`` answer always came from the project.
+    The question is sent as a machine turn with a transient directive marking it
+    as being about the project. While the task is paused the turn is refused for
+    the same reason ordinary messages are — the pause hard-gate holds for
+    ``/help`` too.
+    """
+    cmd = raw.split(None, 1)
+    if cmd[0].lower() not in _HELP_COMMANDS:
+        return False
+    question = cmd[1].strip() if len(cmd) > 1 else ""
+    if not question:
+        print("[help] /help <вопрос о проекте> — например, "
+              "/help как устроен проект и какая сейчас ветка?",
+              file=sys.stderr)
+        return True
+    task = getattr(session, "task", None)
+    if task is not None and getattr(task.state, "is_paused", False):
+        print("[help] задача на паузе — отправка в модель заблокирована. "
+              "/task resume, затем повторите /help.", file=sys.stderr)
+        return True
+    if getattr(session, "retriever", None) is None \
+            and getattr(session, "mcp", None) is None:
+        print("[help] проектный контекст не подключён — отвечать по памяти "
+              "проекта я не буду. Запустите:\n         " + _HELP_LAUNCH_HINT,
+              file=sys.stderr)
+        return True
+    _chat_turn(session, question, directive=_HELP_DIRECTIVE, service_turn=True)
+    return True
+
+
 def _interactive_loop(session: Session) -> int:
     """Run an interactive REPL-style chat against a session."""
     print(f"Starting chat with agent '{session.agent.name}' "
@@ -1151,6 +1268,8 @@ def _interactive_loop(session: Session) -> int:
             if user in _HISTORY_COMMANDS:
                 _print_history(session)
                 continue
+            if _handle_help_command(session, raw):
+                continue
             if _handle_branch_command(session, raw):
                 continue
             if _handle_task_command(session, raw):
@@ -1161,32 +1280,7 @@ def _interactive_loop(session: Session) -> int:
             # NOT sent to the model until the user resumes explicitly.
             if _task_paused_gate(session, raw):
                 continue
-            try:
-                print(session.chat(raw))
-                _print_grounding(session)
-            except InvariantViolationError as exc:
-                print(exc.refusal)
-                if exc.matched_pattern:
-                    # Code gate: the request never reached the model.
-                    print("[invariants] запрос отклонён инвариантом (не отправлен "
-                          "модели).", file=sys.stderr)
-                else:
-                    # Audit gate: the reply was refused after review.
-                    print("[invariants] ответ отклонён аудитом инвариантов "
-                          "(история откачена).", file=sys.stderr)
-                continue
-            except LLMError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                continue
-            _print_usage(session)
-            _print_compression(session)
-            _print_memory(session)
-            _print_invariant_warnings(session)
-            _print_task_rejection(session)
-            # G8: the reply may have moved the stage (auto-detection). Let the
-            # model act on the new stage NOW, like a manual /task next does,
-            # instead of lagging one user turn behind.
-            _auto_turn_after_detection(session)
+            _chat_turn(session, raw)
     except KeyboardInterrupt:
         pass
     return 0

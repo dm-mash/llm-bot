@@ -1160,8 +1160,14 @@ class Retriever:
                 if self._embedder is None:
                     from .retrieval import DEFAULT_EMBEDDING_MODEL
 
+                    # Prefer the cached model: asking the Hub whether a newer
+                    # revision exists turns every offline start into a minute of
+                    # connect timeouts (the self-hosted bot is often offline).
+                    # ``local_only`` still downloads on the very first run, when
+                    # the cache is cold.
                     self._embedder = Embedder(
-                        self.embedding_model or DEFAULT_EMBEDDING_MODEL
+                        self.embedding_model or DEFAULT_EMBEDDING_MODEL,
+                        local_only=True,
                     )
         return self._embedder
 

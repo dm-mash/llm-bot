@@ -165,6 +165,10 @@ def test_agent_calls_mcp_tool_and_uses_result(tmp_path):
     assert session.history[-1] == {"role": "assistant", "content": result.reply}
     assert any("запиши заметку" in m["content"] for m in session.history)
 
+    # The turn is flagged as tool-answered, so the CLI does not report the RAG
+    # grounding verdict about a block the answer never used.
+    assert session.last_turn_used_tools is True
+
 
 def test_agent_normal_reply_without_tool(tmp_path):
     llm = _ScriptedLLM(["Просто ответ без инструментов."])
@@ -175,6 +179,7 @@ def test_agent_normal_reply_without_tool(tmp_path):
     assert result.reply == "Просто ответ без инструментов."
     assert session.mcp_events == []
     assert len(llm.payloads) == 1  # single request, no follow-up
+    assert session.last_turn_used_tools is False
 
 
 def test_agent_executes_batch_of_tool_calls_in_one_round(tmp_path):

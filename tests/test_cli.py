@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from llm_bot.cli import (
     _auto_turn_after_detection,
+    _handle_help_command,
     _handle_task_command,
     _interactive_loop,
     _print_history,
@@ -29,9 +30,19 @@ class _FakeSession:
         self.agent = _FakeAgent(agent_name)
         self.history = list(history)
         self.chat_calls: list[str] = []
+        self.directives: list[str | None] = []
+        self.service_turns: list[bool] = []
 
-    def chat(self, text: str, *, service_turn: bool = False) -> str:
+    def chat(
+        self,
+        text: str,
+        *,
+        service_turn: bool = False,
+        directive: str | None = None,
+    ) -> str:
         self.chat_calls.append(text)
+        self.directives.append(directive)
+        self.service_turns.append(service_turn)
         self.history.append({"role": "user", "content": text})
         self.history.append({"role": "assistant", "content": "reply-ok"})
         return "reply-ok"
@@ -42,6 +53,12 @@ class _FakeSession:
         # ``_print_grounding``. Nothing is retrieved in this fake, so there is
         # no verdict to report.
         return None
+
+    @property
+    def last_turn_used_tools(self) -> bool:
+        # Mirrors ``Session.last_turn_used_tools`` (llm_bot/agent.py), read by
+        # ``_print_grounding`` to skip the RAG verdict on tool-answered turns.
+        return False
 
 
 class _TaskSession(_FakeSession):
@@ -104,6 +121,73 @@ def test_interactive_loop_history_empty_message(capsys, monkeypatch):
 
     err = capsys.readouterr().err
     assert "history is empty" in err
+    assert session.chat_calls == []
+
+
+def test_help_command_forwards_project_question_to_chat(capsys):
+    """/help <вопрос> sends the question as a marked project turn."""
+    session = _FakeSession("s1", "assistant", [])
+    session.retriever = object()  # a project context is attached
+
+    assert _handle_help_command(session, "/help как устроен проект?") is True
+
+    assert session.chat_calls == ["как устроен проект?"]
+    # The question is sent with a transient project directive, as a machine
+    # turn (so it is not read as a task instruction).
+    assert session.directives[0] is not None
+    assert "проект" in session.directives[0].lower()
+    assert session.service_turns == [True]
+
+
+def test_help_command_without_question_prints_usage(capsys):
+    """A bare /help only prints a hint and never calls the model."""
+    session = _FakeSession("s1", "assistant", [])
+
+    assert _handle_help_command(session, "/help") is True
+
+    assert session.chat_calls == []
+    assert "/help <вопрос о проекте>" in capsys.readouterr().err
+
+
+def test_help_command_russian_alias(capsys):
+    """The /помощь alias behaves exactly like /help."""
+    session = _FakeSession("s1", "assistant", [])
+    session.mcp = object()
+
+    assert _handle_help_command(session, "/помощь структура проекта") is True
+
+    assert session.chat_calls == ["структура проекта"]
+
+
+def test_help_command_refuses_without_project_context(capsys):
+    """Without RAG or MCP, /help refuses rather than answering from memory."""
+    session = _FakeSession("s1", "assistant", [])
+
+    assert _handle_help_command(session, "/help покажи новые файлы") is True
+
+    assert session.chat_calls == []
+    err = capsys.readouterr().err
+    assert "проектный контекст не подключён" in err
+    assert "--mcp git" in err
+
+
+def test_help_command_blocked_while_task_paused(capsys):
+    """/help obeys the task pause gate, just like ordinary messages."""
+    session = _TaskSession()
+    session.retriever = object()
+    session.task.pause()
+
+    assert _handle_help_command(session, "/help структура проекта") is True
+
+    assert session.chat_calls == []
+    assert "паузе" in capsys.readouterr().err
+
+
+def test_help_command_ignores_ordinary_text():
+    """A normal message is not mistaken for the /help command."""
+    session = _FakeSession("s1", "assistant", [])
+
+    assert _handle_help_command(session, "расскажи о проекте") is False
     assert session.chat_calls == []
 
 
@@ -597,6 +681,7 @@ def test_an_answer_that_cited_nothing_gets_one_line_not_two(capsys):
     from llm_bot.cli import _print_grounding
 
     class _S:
+        last_turn_used_tools = False
         last_grounding = GroundingVerdict(
             status=Grounding.UNGROUNDED,
             supported=(),
@@ -614,10 +699,37 @@ def test_an_answer_that_cited_nothing_gets_one_line_not_two(capsys):
     assert "процитировал источники, но" not in err
 
 
+def test_a_tool_answered_turn_has_no_rag_verdict(capsys):
+    """A reply produced from a tool result is not judged against the RAG block.
+
+    Real run: ``/help покажи diff`` called ``git__diff`` and answered from it,
+    yet the turn still ended with "[rag] ответ не опирается на источники" — a
+    verdict about the retrieved block, which the answer never used.
+    """
+    from llm_bot.cli import _print_grounding
+
+    class _S:
+        last_turn_used_tools = True
+        last_grounding = GroundingVerdict(
+            status=Grounding.UNGROUNDED,
+            supported=(),
+            unsupported=(),
+            quotes=(),
+            bad_quotes=(),
+            uncited=True,
+            unquoted=True,
+        )
+
+    _print_grounding(_S())
+
+    assert capsys.readouterr().err == ""
+
+
 def test_cited_but_unquoted_still_says_so(capsys):
     from llm_bot.cli import _print_grounding
 
     class _S:
+        last_turn_used_tools = False
         last_grounding = GroundingVerdict(
             status=Grounding.UNGROUNDED,
             supported=("kb/a.pdf:1-5",),

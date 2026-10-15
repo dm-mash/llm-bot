@@ -190,7 +190,9 @@ def test_defaults_are_the_measured_ones() -> None:
     assert DEFAULT_RERANK_MODEL == "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     # mMARCO is multilingual; an English-only reranker scores ~0 on Cyrillic.
     assert "mmarco" in DEFAULT_RERANK_MODEL
-    assert DEFAULT_RERANK_CANDIDATES == 20
+    # 50, not 20: the 13-file corpus is short enough that 20 already held all
+    # its chunks, but the 742-chunk repo index has gold chunks beyond rank 20.
+    assert DEFAULT_RERANK_CANDIDATES == 50
 
 
 def test_the_window_prefers_the_undeprecated_attribute() -> None:

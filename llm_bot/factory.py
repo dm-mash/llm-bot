@@ -217,7 +217,9 @@ def build_retriever(
     question. *rerank* loads a second model; kept optional so the common path
     never pays for it.
     """
-    reranker = Reranker() if rerank else None
+    # ``local_only`` for the same reason as the embedder: a self-hosted bot is
+    # often offline, and revalidating against the Hub stalls every start.
+    reranker = Reranker(local_only=True) if rerank else None
     return Retriever(
         rag_index,
         top_k=top_k if top_k is not None else DEFAULT_RAG_TOP_K,
@@ -312,7 +314,7 @@ def make_session(
     instead to skip construction (tests, custom retrieval).
 
     *rag_rerank* adds a second stage: dense retrieval returns
-    *rag_rerank_candidates* chunks (default 20) and a cross-encoder re-scores
+    *rag_rerank_candidates* chunks (default 50) and a cross-encoder re-scores
     them down to *rag_top_k*. It costs one extra model load and no prompt
     tokens, and is off unless asked for. *rag_rerank_min_score* is an optional
     threshold on that score — left unset, because on a near-duplicate corpus it
