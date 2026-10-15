@@ -51,6 +51,15 @@ servers:
       CURRENCY_SERIES_DIR: data/currency_series
       # CURRENCY_FIXTURE: data/cbr_fixture.json
 
+  # Own git server (llm_bot/mcp_servers/git.py): read-only project context —
+  # current_branch / list_files / diff. GIT_REPO defaults to the working dir
+  # the client spawns the server in (the project root).
+  git:
+    command: python
+    args: [-m, llm_bot.mcp_servers.git]
+    env:
+      GIT_REPO: .
+
   # Examples of adding more servers later — just new entries:
   #
   # time:                        # reference server from requirements.txt
