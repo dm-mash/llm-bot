@@ -13,23 +13,23 @@
 
 queries:
   - text: как подключить GigaChat
-    source: README.md
+    source: docs/configuration.md
     section: "Configuration > Example: GigaChat (Sber)"
 
   - text: как посмотреть детали запроса и ответа в CLI
-    source: README.md
+    source: docs/usage.md
     section: Usage > Inspecting request/response details
 
   - text: как сжать историю диалога и задать лимит summary
-    source: README.md
+    source: docs/context.md
     section: Token accounting and context limits > Context compression (rolling summary)
 
   - text: как задать жёсткие ограничения инвариантов
-    source: README.md
+    source: docs/context.md
     section: Token accounting and context limits > Invariants (hard constraints)
 
   - text: как запустить фоновые задачи 24/7
-    source: README.md
+    source: docs/scheduler.md
     section: "Scheduler: background tasks 24/7"
 
   - text: что нужно изменить в llm_bot для состояния задачи

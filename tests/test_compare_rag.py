@@ -526,7 +526,7 @@ def test_every_declared_source_span_actually_contains_its_facts() -> None:
                     f"#{index}: факт {fact!r} не лежит в {source}"
                 )
             checked += 1
-    assert checked == 8
+    assert checked == 9
 
 
 def test_citation_check_ignores_the_line_range_in_sources() -> None:

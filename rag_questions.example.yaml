@@ -45,7 +45,7 @@ questions:
     corpus: repo
     answerable: true
     expect: ["paraphrase-multilingual-MiniLM-L12-v2", "128"]
-    sources: ["README.md:1332-1335"]
+    sources: ["docs/retrieval.md:6-9"]
 
   - text: Какой дефолт у max_summary_ratio и что он ограничивает?
     corpus: repo
@@ -63,7 +63,17 @@ questions:
     corpus: repo
     answerable: true
     expect: ["8000", "TPM"]
-    sources: ["README.md:660-664"]
+    sources: ["docs/currency.md:38-40"]
+
+  # Регрессия: «планировщик задач» семантически сталкивается с документами о
+  # состоянии задачи (planning/task_state), и gold-чанк оказывался на dense-ранге
+  # 32 — вне шортлиста reranker'а при candidates=20. С широким шортлистом
+  # (default 50) этот же вопрос поднимается на 1-е место.
+  - text: Как устроен планировщик задач в проекте?
+    corpus: repo
+    answerable: true
+    expect: ["планировщик", "24/7"]
+    sources: ["plans/scheduler.md:1-9"]
 
   # --- Ловушка: число есть в репозитории, но НЕ в корпусе -------------------
   # data/models.yaml исключён из корпуса, поэтому RAG не должен доставать 8000
