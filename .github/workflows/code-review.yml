@@ -1,0 +1,94 @@
+name: code-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.pull_request.draft }}
+    steps:
+      - name: Checkout (full history for base...head)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache HuggingFace model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Cache review index
+        uses: actions/cache@v4
+        with:
+          path: data/rev_emb
+          key: revemb-${{ runner.os }}-${{ hashFiles('**/*.md', '**/*.py', 'requirements.txt') }}
+          restore-keys: |
+            revemb-${{ runner.os }}-
+
+      - name: Prepare runtime config
+        run: |
+          mkdir -p data
+          cp models.example.yaml data/models.yaml
+          cp agents.example.yaml data/agents.yaml
+
+      - name: Build review index (if missing)
+        run: |
+          if [ ! -f data/rev_emb/index_structure.json ]; then
+            python scripts/index_documents.py \
+              --input_dir . \
+              --extensions .md,.py \
+              --strategy structure \
+              --index_dir data/rev_emb \
+              --out ""
+          fi
+
+      - name: Review pull request
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        env:
+          REVIEW_API_KEY: ${{ secrets.REVIEW_API_KEY }}
+          REVIEW_BASE_URL: ${{ secrets.REVIEW_BASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/code_review.py \
+            --agent reviewer \
+            --rag-index data/rev_emb/index_structure.json \
+            --out data/review/pr-${{ github.event.pull_request.number }}.md
+
+      - name: Notice for fork pull requests
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          {
+            echo "## AI code review skipped"
+            echo
+            echo "This PR comes from a fork, so repository secrets are not"
+            echo "available and the review model cannot be called. Run the"
+            echo "reviewer locally or from a branch in this repository."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-review-report
+          path: data/review/
+          if-no-files-found: ignore

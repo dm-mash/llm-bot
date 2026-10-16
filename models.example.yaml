@@ -40,3 +40,13 @@ models:
     client_id: ${GIGACHAT_CLIENT_ID}
     client_secret: ${GIGACHAT_CLIENT_SECRET}
     scope: GIGACHAT_API_PERS
+  # Model used by .github/workflows/code-review.yml. The workflow copies this
+  # file to data/models.yaml automatically. Only the key and base URL resolve
+  # environment variables; the model name is literal.
+  reviewer:
+    provider: openai
+    base_url: ${REVIEW_BASE_URL}    # e.g. https://api.groq.com/openai/v1
+    api_key: ${REVIEW_API_KEY}
+    model: openai/gpt-oss-120b      # swap for the cloud model you chose
+    context_window: 131072
+    max_request_tokens: 8000        # account tier cap
