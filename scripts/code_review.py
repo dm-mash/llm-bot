@@ -319,7 +319,7 @@ def post_comment(ctx: PRContext, body: str, token: str, *, use_gh: bool = False)
                 try:
                     subprocess.run(["gh", "pr", "comment", str(ctx.number), "--body-file", p], check=False)
                 finally:
-                    Path(p).unlink(missing=True)
+                    Path(p).unlink(missing_ok=True)
                 return api
         except Exception:
             pass
