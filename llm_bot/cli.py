@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Context-management strategy for this session: sliding window / "
         "sticky facts / branching. Takes precedence over the agent's configured "
         "context_strategy.",
-    )
+    ),
     parser.add_argument(
         "--window-messages",
         type=int,
