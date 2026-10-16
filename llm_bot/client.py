@@ -34,6 +34,7 @@ _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 # Chat-completions endpoint path appended to the configured base URL.
 _CHAT_ENDPOINT = "/chat/completions"
 
+_CHAT_ENDPOINT = "/chat/api"
 
 class LLMError(Exception):
     """Base exception for all LLM client errors."""
@@ -77,7 +78,7 @@ class ContextOverflowError(LLMError):
         context_window: int,
     ) -> None:
         super().__init__(message)
-        self.context_tokens = context_tokens
+        self.context_tokens = context_token
         self.context_window = context_window
 
 
