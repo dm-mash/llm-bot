@@ -81,3 +81,77 @@ def test_an_unknown_agent_is_reported(tmp_path):
     problem = mod.check_model_config("nope", agent_store=agents, model_store=models)
     assert problem is not None
     assert "nope" in problem
+
+
+def test_a_base_url_without_a_scheme_is_named(tmp_path):
+    agents, models = _stores(
+        tmp_path,
+        MODELS_OK.replace("${REVIEW_BASE_URL}", "api.groq.com/openai/v1"),
+        AGENTS_YAML,
+    )
+    problem = mod.check_model_config("reviewer", agent_store=agents, model_store=models)
+    assert problem is not None
+    assert "http://" in problem
+
+
+def test_a_base_url_that_already_has_the_endpoint_is_refused(tmp_path):
+    # The client appends /chat/completions itself, so a full endpoint pasted into
+    # the variable is doubled and the provider answers 404 "Unknown request URL".
+    agents, models = _stores(
+        tmp_path,
+        MODELS_OK.replace(
+            "${REVIEW_BASE_URL}", "https://api.groq.com/openai/v1/chat/completions"
+        ),
+        AGENTS_YAML,
+    )
+    problem = mod.check_model_config("reviewer", agent_store=agents, model_store=models)
+    assert problem is not None
+    assert "/chat/completions" in problem
+
+
+def test_credentials_in_a_url_are_not_echoed(tmp_path):
+    agents, models = _stores(
+        tmp_path,
+        MODELS_OK.replace(
+            "${REVIEW_BASE_URL}",
+            "https://user:secret@host.invalid/chat/completions",
+        ),
+        AGENTS_YAML,
+    )
+    problem = mod.check_model_config("reviewer", agent_store=agents, model_store=models)
+    assert problem is not None
+    assert "secret" not in problem
+    assert "***@" in problem
+
+
+def test_a_query_string_in_a_base_url_is_refused(tmp_path):
+    # Everything past "?" leaves the path, so the endpoint the client appends
+    # vanishes into the query string and the provider reports an unrelated path.
+    agents, models = _stores(
+        tmp_path,
+        MODELS_OK.replace(
+            "${REVIEW_BASE_URL}", "https://api.groq.com/openai/v1/chat/api?x=1"
+        ),
+        AGENTS_YAML,
+    )
+    problem = mod.check_model_config("reviewer", agent_store=agents, model_store=models)
+    assert problem is not None
+    assert "query string" in problem
+
+
+def test_whitespace_from_the_variable_is_refused(tmp_path, monkeypatch):
+    # The YAML scalar is stripped by the parser, so junk can only enter through
+    # the substituted ${REVIEW_BASE_URL} — a copy-paste that kept a newline.
+    monkeypatch.setenv("REVIEW_BASE_URL", "https://api.groq.com/openai/v1\n")
+    agents, models = _stores(tmp_path, MODELS_OK, AGENTS_YAML)
+    problem = mod.check_model_config("reviewer", agent_store=agents, model_store=models)
+    assert problem is not None
+    assert "пробелы" in problem
+
+
+def test_describe_model_shows_the_endpoint_in_use(tmp_path, monkeypatch):
+    monkeypatch.setenv("REVIEW_BASE_URL", "https://api.groq.com/openai/v1")
+    agents, models = _stores(tmp_path, MODELS_OK, AGENTS_YAML)
+    line = mod.describe_model("reviewer", agent_store=agents, model_store=models)
+    assert "https://api.groq.com/openai/v1" in line
+    assert "openai/gpt-oss-120b" in line

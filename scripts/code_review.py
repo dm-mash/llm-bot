@@ -186,6 +186,33 @@ def build_prompt(changed: ChangedFile, budget: int) -> str:
     )
 
 
+def _safe_url(url: str) -> str:
+    """Return *url* with any embedded credentials replaced, for error messages."""
+    start = url.find("://")
+    if start == -1:
+        return url
+    at = url.find("@", start + 3)
+    if at == -1:
+        return url
+    return url[: start + 3] + "***@" + url[at + 1 :]
+
+
+def _review_model(agent: str, agent_store=None, model_store=None):
+    """Return ``(name, ModelConfig)`` for *agent*, raising ValueError if absent."""
+    from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
+
+    agent_store = agent_store if agent_store is not None else YamlAgentStore()
+    model_store = model_store if model_store is not None else YamlModelStore()
+    try:
+        name = agent_store.get(agent).model
+    except Exception as exc:
+        raise ValueError(f"агент {agent!r} не найден в data/agents.yaml ({exc})")
+    try:
+        return name, model_store.get(name)
+    except Exception as exc:
+        raise ValueError(f"модель {name!r} не найдена в data/models.yaml ({exc})")
+
+
 def check_model_config(agent: str, *, agent_store=None, model_store=None) -> str | None:
     """Return what is wrong with the reviewer's model config, or ``None``.
 
@@ -194,27 +221,66 @@ def check_model_config(agent: str, *, agent_store=None, model_store=None) -> str
     'https://' protocol" — which never mentions the missing variable. Checking
     the pair up front names the piece that is actually missing.
     """
-    from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
-
-    agent_store = agent_store if agent_store is not None else YamlAgentStore()
-    model_store = model_store if model_store is not None else YamlModelStore()
     try:
-        name = agent_store.get(agent).model
-    except Exception as exc:
-        return f"агент {agent!r} не найден в data/agents.yaml ({exc})"
-    try:
-        model = model_store.get(name)
-    except Exception as exc:
-        return f"модель {name!r} не найдена в data/models.yaml ({exc})"
-    if not model.base_url:
+        name, model = _review_model(agent, agent_store, model_store)
+    except ValueError as exc:
+        return str(exc)
+    raw = model.base_url or ""
+    base = raw.strip()
+    if not base:
         return (
             f"у модели {name!r} пустой base_url. Задайте REVIEW_BASE_URL "
             f"(Secrets или Variables в настройках репозитория) либо укажите "
             f"адрес прямо в models.yaml."
         )
+    # Everything past "?" or "#" leaves the path, so the endpoint the client
+    # appends disappears into the query string and the provider reports a path
+    # that looks unrelated — e.g. Groq answering "Unknown request URL: POST
+    # /openai/v1/chat/api" for a base_url that carried a stray "?".
+    for sep, label in (("?", "query string"), ("#", "fragment")):
+        if sep in base:
+            return (
+                f"base_url модели {name!r} содержит {sep!r} ({_safe_url(base)!r}), "
+                f"то есть {label}: адрес должен быть только провайдером и путём, "
+                f"без ? и #. Ожидается https://api.groq.com/openai/v1."
+            )
+    if base != raw:
+        return (
+            f"base_url модели {name!r} содержит пробелы или перевод строки по "
+            f"краям ({_safe_url(raw.strip())!r}) — это ломает собранный URL. "
+            f"Уберите лишние пробелы."
+        )
+    if not base.startswith(("http://", "https://")):
+        return (
+            f"base_url модели {name!r} — {_safe_url(base)!r}: он должен "
+            f"начинаться с http:// или https://, иначе клиент не знает, куда "
+            f"идти. Ожидается адрес провайдера до /chat/completions, например "
+            f"https://api.groq.com/openai/v1."
+        )
+    # The client appends the endpoint itself, so a full endpoint pasted into the
+    # variable doubles it and the provider answers 404 "Unknown request URL".
+    if "/chat/completions" in base:
+        return (
+            f"base_url модели {name!r} уже содержит /chat/completions "
+            f"({_safe_url(base)!r}), а клиент дописывает его сам. Укажите "
+            f"адрес без него: https://api.groq.com/openai/v1."
+        )
     if not model.model:
         return f"у модели {name!r} не задано имя модели (поле model)."
     return None
+
+
+def describe_model(agent: str, *, agent_store=None, model_store=None) -> str:
+    """Return a one-line description of the endpoint the review will call.
+
+    Printed before the first model call so a wrong ``base_url`` is visible in
+    the workflow log instead of only as a provider error further down.
+    """
+    try:
+        name, model = _review_model(agent, agent_store, model_store)
+    except ValueError as exc:
+        return str(exc)
+    return f"{name!r} → {_safe_url(model.base_url or '')} (model {model.model!r})"
 
 
 def run_reviews(ctx: PRContext, files: list[ChangedFile], args: argparse.Namespace) -> list[FileReview]:
@@ -457,6 +523,9 @@ def main(argv: list[str] | None = None) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return 2
+    # Echo the endpoint actually in use: in CI it is the only place a wrong
+    # REVIEW_BASE_URL shows up before the provider rejects it.
+    print(f"[review] model {describe_model(args.agent)}", file=sys.stderr)
 
     reviews = run_reviews(ctx, reviewable, args)
     report = render_report(ctx, reviews, skipped)
