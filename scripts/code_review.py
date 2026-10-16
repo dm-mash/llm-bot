@@ -24,8 +24,13 @@ DEFAULT_DIFF_TOKENS = 3000
 DEFAULT_RAG_TOKENS = 1500
 DEFAULT_CONTEXT_LINES = 0
 
+# A finding line is a bullet whose prefix names the rubric. The emphasis is
+# optional on purpose: models happily answer "- **БАГ:** ..." instead of
+# "- БАГ: ...", and a parser that only accepts the bare form silently empties
+# the whole report while the findings sit unread in the appendix.
 BULLET_RE = re.compile(
-    r"^\s*[-*]\s*(?P<kind>БАГ|АРХИТЕКТУРА|РЕКОМЕНДАЦИЯ)\s*[:—-]\s*(?P<text>.+)$"
+    r"^\s*[-*]\s*\**\s*(?P<kind>БАГ|АРХИТЕКТУРА|РЕКОМЕНДАЦИЯ)"
+    r"\s*\**\s*[:—-]\s*(?P<text>.+)$"
 )
 
 RENAME_RE = re.compile(r"^R[0-9]+\t(.*)\t(.*)$")
@@ -283,6 +288,22 @@ def describe_model(agent: str, *, agent_store=None, model_store=None) -> str:
     return f"{name!r} → {_safe_url(model.base_url or '')} (model {model.model!r})"
 
 
+class _RequestPrinter:
+    """Detail listener that logs every request URL and response status.
+
+    The configured ``base_url`` is not proof of the URL actually requested: the
+    client appends the endpoint itself, and only the request the provider
+    received tells the truth. In CI that line in the log is the difference
+    between "the setting is wrong" and "something between them rewrote it".
+    """
+
+    def on_request(self, details) -> None:
+        print(f"[review] POST {details.url} (model {details.model})", file=sys.stderr)
+
+    def on_response(self, details) -> None:
+        print(f"[review] ← {details.status_code}", file=sys.stderr)
+
+
 def run_reviews(ctx: PRContext, files: list[ChangedFile], args: argparse.Namespace) -> list[FileReview]:
     from llm_bot.factory import make_session
     from llm_bot.rag import Retriever
@@ -290,6 +311,7 @@ def run_reviews(ctx: PRContext, files: list[ChangedFile], args: argparse.Namespa
 
     model_store = YamlModelStore()
     agent_store = YamlAgentStore()
+    printer = _RequestPrinter()
 
     retriever = None
     if args.rag_index:
@@ -319,6 +341,7 @@ def run_reviews(ctx: PRContext, files: list[ChangedFile], args: argparse.Namespa
                 agent_store=agent_store,
                 session_store=store,
                 retriever=retriever,
+                detail_listener=printer,
                 rag_cite=False,
                 rag_strict=False,
                 rag_max_context_tokens=args.rag_tokens,
@@ -336,8 +359,15 @@ def classify(answer: str) -> dict[str, list[str]]:
     for line in answer.splitlines():
         m = BULLET_RE.match(line)
         if m:
-            buckets[m["kind"]].append(m["text"].strip())
+            # The emphasis that wrapped the prefix usually wraps the finding too.
+            buckets[m["kind"]].append(m["text"].strip().strip("*").strip())
     return buckets
+
+
+def _says_nothing(answer: str) -> bool:
+    """Whether the reply is the model's "nothing to comment" answer."""
+    text = answer.strip().strip('"').strip("*").strip()
+    return not text or "нечего комментировать" in text.lower()
 
 
 def render_report(ctx: PRContext, reviews: list[FileReview], skipped: list[str]) -> str:
@@ -351,17 +381,24 @@ def render_report(ctx: PRContext, reviews: list[FileReview], skipped: list[str])
     lines.append("")
 
     buckets: dict[str, list[str]] = {"БАГ": [], "АРХИТЕКТУРА": [], "РЕКОМЕНДАЦИЯ": []}
+    unparsed: list[str] = []
     for r in reviews:
         if r.error:
             buckets.setdefault("РЕКОМЕНДАЦИЯ", []).append(f"**{r.file.path}** — ошибка при ревью: {r.error}")
             continue
         c = classify(r.answer)
+        found = sum(len(v) for v in c.values())
         for k in buckets:
             for t in c.get(k, []):
                 if ":" in t or "(" in t:
                     buckets[k].append(t)
                 else:
                     buckets[k].append(f"**{r.file.path}** — {t}")
+        # A model that ignored the prefixes still has something to say. Filing it
+        # under its own heading beats an empty report that claims there is
+        # nothing to comment on.
+        if not found and not _says_nothing(r.answer):
+            unparsed.append(f"**{r.file.path}**\n\n" + r.answer.strip())
 
     for title in ["БАГ", "АРХИТЕКТУРА", "РЕКОМЕНДАЦИЯ"]:
         lines.append(f"### {title}")
@@ -371,6 +408,13 @@ def render_report(ctx: PRContext, reviews: list[FileReview], skipped: list[str])
             for t in buckets[title]:
                 lines.append(f"- {t}")
         lines.append("")
+
+    if unparsed:
+        lines.append("### Прочее (ответ без разбора по рубрикам)")
+        lines.append("")
+        for t in unparsed:
+            lines.append(t)
+            lines.append("")
 
     lines.append("<details><summary>Полные ответы по файлам</summary>")
     lines.append("")

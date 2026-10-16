@@ -155,3 +155,36 @@ def test_describe_model_shows_the_endpoint_in_use(tmp_path, monkeypatch):
     line = mod.describe_model("reviewer", agent_store=agents, model_store=models)
     assert "https://api.groq.com/openai/v1" in line
     assert "openai/gpt-oss-120b" in line
+
+
+def test_emphasised_rubric_prefixes_are_parsed():
+    # A live run answered "- **БАГ:** ..." and the bare-form parser emptied all
+    # three sections while the findings sat unread in the appendix.
+    ans = (
+        "- **БАГ:** `x.py:10` — падение при пустом ответе\n"
+        "- **АРХИТЕКТУРА:** модуль отвечает за две задачи\n"
+        "- **РЕКОМЕНДАЦИЯ:** разнести по двум модулям\n"
+    )
+    c = mod.classify(ans)
+    assert c["БАГ"] == ["`x.py:10` — падение при пустом ответе"]
+    assert c["АРХИТЕКТУРА"] == ["модуль отвечает за две задачи"]
+    assert c["РЕКОМЕНДАЦИЯ"] == ["разнести по двум модулям"]
+
+
+def test_an_unparsed_answer_is_kept_in_its_own_section(tmp_path):
+    from scripts.code_review import ChangedFile, FileReview, PRContext, render_report
+
+    ctx = PRContext(1, "a", "b", "main", "feat", "o/r", False)
+    reviews = [FileReview(ChangedFile("M", "x.py"), answer="Просто текст без рубрик.")]
+    rpt = render_report(ctx, reviews, [])
+    assert "Прочее" in rpt
+    assert "Просто текст без рубрик." in rpt
+
+
+def test_a_nothing_to_say_reply_does_not_create_a_leftover():
+    from scripts.code_review import ChangedFile, FileReview, PRContext, render_report
+
+    ctx = PRContext(1, "a", "b", "main", "feat", "o/r", False)
+    reviews = [FileReview(ChangedFile("M", "x.py"), answer="Нечего комментировать")]
+    rpt = render_report(ctx, reviews, [])
+    assert "Прочее" not in rpt
