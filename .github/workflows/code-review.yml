@@ -65,8 +65,11 @@ jobs:
       - name: Review pull request
         if: ${{ !github.event.pull_request.head.repo.fork }}
         env:
-          REVIEW_API_KEY: ${{ secrets.REVIEW_API_KEY }}
-          REVIEW_BASE_URL: ${{ secrets.REVIEW_BASE_URL }}
+          # Secrets and Variables live in separate namespaces: secrets.* only
+          # sees Secrets, vars.* only sees Variables. Either one works here,
+          # so accept both and let the caller store the key as it prefers.
+          REVIEW_API_KEY: ${{ secrets.REVIEW_API_KEY || vars.REVIEW_API_KEY }}
+          REVIEW_BASE_URL: ${{ secrets.REVIEW_BASE_URL || vars.REVIEW_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python scripts/code_review.py \

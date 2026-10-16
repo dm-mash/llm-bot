@@ -186,6 +186,37 @@ def build_prompt(changed: ChangedFile, budget: int) -> str:
     )
 
 
+def check_model_config(agent: str, *, agent_store=None, model_store=None) -> str | None:
+    """Return what is wrong with the reviewer's model config, or ``None``.
+
+    An unset ``${REVIEW_BASE_URL}`` resolves to an empty string, and the client
+    then fails deep inside httpx with "Request URL is missing an 'http://' or
+    'https://' protocol" — which never mentions the missing variable. Checking
+    the pair up front names the piece that is actually missing.
+    """
+    from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore
+
+    agent_store = agent_store if agent_store is not None else YamlAgentStore()
+    model_store = model_store if model_store is not None else YamlModelStore()
+    try:
+        name = agent_store.get(agent).model
+    except Exception as exc:
+        return f"агент {agent!r} не найден в data/agents.yaml ({exc})"
+    try:
+        model = model_store.get(name)
+    except Exception as exc:
+        return f"модель {name!r} не найдена в data/models.yaml ({exc})"
+    if not model.base_url:
+        return (
+            f"у модели {name!r} пустой base_url. Задайте REVIEW_BASE_URL "
+            f"(Secrets или Variables в настройках репозитория) либо укажите "
+            f"адрес прямо в models.yaml."
+        )
+    if not model.model:
+        return f"у модели {name!r} не задано имя модели (поле model)."
+    return None
+
+
 def run_reviews(ctx: PRContext, files: list[ChangedFile], args: argparse.Namespace) -> list[FileReview]:
     from llm_bot.factory import make_session
     from llm_bot.rag import Retriever
@@ -421,6 +452,11 @@ def main(argv: list[str] | None = None) -> int:
         body = "\n".join(build_prompt(ch, args.diff_tokens) for ch in reviewable)
         out.write_text(body, encoding="utf-8")
         return 0
+
+    problem = check_model_config(args.agent)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
 
     reviews = run_reviews(ctx, reviewable, args)
     report = render_report(ctx, reviews, skipped)
