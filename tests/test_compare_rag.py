@@ -421,7 +421,7 @@ def test_run_records_a_retrieval_failure_instead_of_crashing(
     corpora, questions = cmp_rag.load_questions(questions_file)
 
     class Broken:
-        def render(self, question):
+        def render(self, question, *, citations=True):
             raise RuntimeError("index unreadable")
 
     captured: list[dict] = []
@@ -526,7 +526,7 @@ def test_every_declared_source_span_actually_contains_its_facts() -> None:
                     f"#{index}: факт {fact!r} не лежит в {source}"
                 )
             checked += 1
-    assert checked == 9
+    assert checked == 12
 
 
 def test_citation_check_ignores_the_line_range_in_sources() -> None:

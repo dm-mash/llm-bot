@@ -103,8 +103,12 @@ DEFAULT_EXCLUDES = frozenset({
     ".idea", ".vscode", "dist", "build", "data", "results",
     # The second RAG corpus (the demo knowledge base) is indexed on its own;
     # keeping it out of the repository corpus stops it from polluting the
-    # day-21 benchmark, whose numbers must stay reproducible.
+    # day-21 benchmark, whose numbers must stay reproducible. The product FAQ is
+    # a third corpus for the same reason, and one more: retrieval for the support
+    # desk must not offer a chunk about coffee beans to a question about a
+    # password reset.
     "knowledge_base",
+    "faq",
 })
 
 PDF_EXT = ".pdf"
