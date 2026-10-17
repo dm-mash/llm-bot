@@ -234,3 +234,19 @@ def test_router_from_config_dead_server_fails_loudly(tmp_path):
     )
     with pytest.raises(ValueError, match="не отдают ни одного инструмента"):
         router_from_config(["broken"], path=config)
+
+
+def test_the_config_path_accepts_a_string(tmp_path, monkeypatch):
+    """Command-line flags hand over strings; passing one on as-is used to fail
+    much later with an AttributeError instead of reading the file."""
+    monkeypatch.delenv("MCP_CONFIG", raising=False)
+    config = tmp_path / "mcp.yaml"
+    config.write_text("servers:\n  demo:\n    command: python\n", encoding="utf-8")
+
+    assert "demo" in load_mcp_config(str(config))
+    assert "demo" in load_mcp_config(config)
+
+
+def test_a_missing_config_reads_as_no_servers(tmp_path, monkeypatch):
+    monkeypatch.delenv("MCP_CONFIG", raising=False)
+    assert load_mcp_config(str(tmp_path / "absent.yaml")) == {}

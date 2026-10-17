@@ -47,8 +47,14 @@ def _config_path(path: Path | None = None) -> Path:
     the scheduler MCP server validating ``mcp_call`` targets, and the
     daemon's bridge factory — point at ONE config (tests and demos use it
     to stay self-contained without touching ``data/``).
+
+    A ``str`` is accepted and converted: command-line flags arrive as strings,
+    and passing one straight through would fail much later with an
+    ``AttributeError`` on a ``str`` instead of a missing-file result.
     """
-    return path or Path(os.environ.get("MCP_CONFIG") or DEFAULT_MCP_CONFIG)
+    if path is not None:
+        return Path(path)
+    return Path(os.environ.get("MCP_CONFIG") or DEFAULT_MCP_CONFIG)
 
 
 class MCPToolError(RuntimeError):
