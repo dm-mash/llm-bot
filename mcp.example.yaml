@@ -51,6 +51,16 @@ servers:
       CURRENCY_SERIES_DIR: data/currency_series
       # CURRENCY_FIXTURE: data/cbr_fixture.json
 
+  # Own support desk server (llm_bot/mcp_servers/support.py): read-only view of
+  # customers and their tickets — get_ticket / get_user / list_tickets /
+  # search_tickets. Used by the POST /support endpoint (see docs/support.md).
+  # SUPPORT_DB points at the desk file; copy support.example.json there first.
+  support:
+    command: python
+    args: [-m, llm_bot.mcp_servers.support]
+    env:
+      SUPPORT_DB: data/support.json
+
   # Own git server (llm_bot/mcp_servers/git.py): read-only project context —
   # current_branch / list_files / diff. GIT_REPO defaults to the working dir
   # the client spawns the server in (the project root).
