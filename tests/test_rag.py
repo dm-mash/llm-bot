@@ -799,7 +799,7 @@ def test_session_keeps_the_dialog_on_the_document_it_already_cited(
         def __init__(self) -> None:
             self.seen: list[tuple[str, list[str]]] = []
 
-        def render(self, question, *, prefer_sources=()):
+        def render(self, question, *, prefer_sources=(), citations=True):
             self.seen.append((question, list(prefer_sources)))
             return "", RagEvent(question=question)
 
@@ -896,7 +896,7 @@ def test_a_failing_retriever_degrades_to_a_plain_answer(
     class BrokenRetriever:
         top_k = 3
 
-        def render(self, question: str):
+        def render(self, question: str, *, citations: bool = True):
             raise RuntimeError("index unreadable")
 
     transport, payloads = _capturing_transport("ответ без RAG")
@@ -2465,3 +2465,180 @@ def test_finalize_answer_can_be_applied_twice() -> None:
 
     assert once.count(ragmod.UNUSED_SOURCES_NOTE) == 1
     assert twice.count(ragmod.UNUSED_SOURCES_NOTE) == 1
+
+
+def test_a_turn_can_ask_for_the_no_citations_protocol(index_path: Path) -> None:
+    """A tool-evidence turn must not be handed chunk numbers to misuse."""
+    r = retriever(index_path, cite=True)
+    numbered, _ = r.render(QUESTIONS["hours"], citations=True)
+    bare, _ = r.render(QUESTIONS["hours"], citations=False)
+
+    assert "помечен номером в квадратных скобках" in numbered
+    assert "Не указывай источники" in bare
+    # The chunk bodies are the same; only the demand for a marker changes.
+    assert "Часы работы: с 8:00 до 22:00." in bare
+
+
+def test_switching_citations_off_is_per_turn_not_sticky(tmp_path: Path) -> None:
+    """The next turn without the flag gets its numbers back."""
+    index = make_index(tmp_path, [("kb/hours.md", "Часы работы: с 8:00 до 22:00.", "Часы")])
+    r = retriever(index)
+    r.render("часы", citations=False)
+    again, _ = r.render("часы", citations=True)
+    assert "помечен номером в квадратных скобках" in again
+
+
+def test_a_tool_turn_asked_for_no_citations_loses_a_marker_it_wrote(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """A tool-evidence turn is not audited, so a leftover marker is removed.
+
+    Asked about a ticket, the model answered with a chunk number attached to a
+    fact that came from the ticket — a number naming a passage that never
+    mentioned it. The turn asked for no citations and skips the audit that would
+    have caught it, so the marker is stripped here rather than trusted not to
+    appear.
+    """
+    from llm_bot.mcp_tools import MCPEvent
+
+    class _Directive:
+        name = "support__get_ticket"
+        arguments = {"ticket_id": "T-5001"}
+
+    class _OneToolThenQuiet:
+        max_rounds = 2
+
+        def render_tools_block(self) -> str:
+            return "ДОСТУПНЫЕ ИНСТРУМЕНТЫ: пример"
+
+        def parse_directives(self, reply: str) -> list:
+            return [_Directive()] if '"call_tool"' in reply else []
+
+        def call_tool(self, name, arguments):
+            return MCPEvent(tool=name, server="support", ok=True, result="Тикет T-5001")
+
+    replies = iter([
+        json.dumps({"call_tool": {"name": "support__get_ticket"}}),
+        "У клиента тариф pro [1].",
+    ])
+    transport, _ = _capturing_transport(lambda _payload: next(replies))
+    session = _make_session(
+        tmp_path,
+        transport,
+        retriever=retriever(index_path, top_k=1),
+        mcp_router=_OneToolThenQuiet(),
+    )
+
+    reply = session.chat_with_details(
+        "какой у меня тариф?", citations=False
+    ).reply
+
+    assert session.last_turn_used_tools is True
+    assert "[1]" not in reply
+    assert "тариф pro" in reply
+
+
+def test_a_tool_turn_that_wants_citations_keeps_them(
+    tmp_path: Path, index_path: Path
+) -> None:
+    """The stripping above is scoped to the turn that asked for no citations."""
+    from llm_bot.mcp_tools import MCPEvent
+
+    class _Directive:
+        name = "support__get_ticket"
+        arguments = {"ticket_id": "T-5001"}
+
+    class _OneToolThenQuiet:
+        max_rounds = 2
+
+        def render_tools_block(self) -> str:
+            return "ДОСТУПНЫЕ ИНСТРУМЕНТЫ: пример"
+
+        def parse_directives(self, reply: str) -> list:
+            return [_Directive()] if '"call_tool"' in reply else []
+
+        def call_tool(self, name, arguments):
+            return MCPEvent(tool=name, server="support", ok=True, result="Тикет T-5001")
+
+    replies = iter([
+        json.dumps({"call_tool": {"name": "support__get_ticket"}}),
+        "У клиента тариф pro [1].",
+    ])
+    transport, _ = _capturing_transport(lambda _payload: next(replies))
+    session = _make_session(
+        tmp_path,
+        transport,
+        retriever=retriever(index_path, top_k=1),
+        mcp_router=_OneToolThenQuiet(),
+    )
+
+    reply = session.chat_with_details("какой у меня тариф?").reply
+
+    assert "[1]" in reply
+
+
+# --------------------------------------------------------------------------- #
+# A source list the model wrote for itself
+# --------------------------------------------------------------------------- #
+
+
+def test_a_handleless_source_list_is_stripped_too():
+    """Told to cite nothing, the model dropped the handle and printed a list anyway.
+
+    Measured on a ticket question: the reply ended with
+    ``Источники:`` and two ``faq.md:36-37 — ...`` lines that no stripper caught,
+    because every stripper required either a ``[N]`` handle or a list marker. A
+    reader would have taken that for provenance.
+    """
+    from llm_bot.rag import strip_imitated_footer
+
+    reply = (
+        "На бесплатном тарифе выгрузка за прошлый месяц недоступна.\n\n"
+        "Источники:\n"
+        " faq.md:36-37 — Учёт — база знаний поддержки > Тарифы и оплата\n"
+        " faq.md:38-45 — Учёт — база знаний поддержки > Тарифы и оплата\n"
+    )
+    # handle_less=True is what a citations-off turn uses; the plain form must keep
+    # its handle-less lines so an audited turn can still mark them fabricated.
+    cleaned = strip_imitated_footer(reply, handle_less=True)
+    assert "Источники" not in cleaned
+    assert "faq.md" not in cleaned
+    assert "бесплатном тарифе" in cleaned
+
+
+def test_prose_with_a_number_range_is_not_stripped():
+    # The guard on the new pattern: it matches `name.md:12-18`, never a bare
+    # number range, so ordinary text about hours or line counts survives.
+    from llm_bot.rag import strip_imitated_footer
+
+    reply = "Часы работы: с 8:00 до 22:00, см. строка 42-45 — итог.\n"
+    assert strip_imitated_footer(reply, handle_less=True).strip() == reply.strip()
+
+
+def test_a_turn_without_citations_keeps_no_written_source_list():
+    from llm_bot.rag import RagEvent, RagHit, finalize_answer
+
+    hit = RagHit(source="faq.md", start_line=36, end_line=37, section="Тарифы",
+                 text="Выгрузка за текущий месяц.", score=1.0, chunk_id="c1")
+    event = RagEvent(question="q", retrieved=("faq.md:36-37",), candidates=1,
+                     sources=(hit,))
+    reply = (
+        "На бесплатном тарифе выгрузка недоступна.\n\n"
+        "Источники:\n faq.md:36-37 — Тарифы и оплата\n"
+    )
+    final = finalize_answer(reply, event, cite=False)
+    assert "Источники" not in final.text
+    assert "недоступна" in final.text
+
+
+def test_an_audited_turn_still_marks_a_fabricated_citation_instead_of_dropping_it():
+    """The regression guard for ``handle_less``.
+
+    A citation with no handle — ``[kb/menu.md:1-3]`` — is not a source list, it
+    is a fabricated reference. Deleting the line would hide it from the reader;
+    the audit has to replace it with the unsupported marker.
+    """
+    from llm_bot.rag import strip_imitated_footer
+
+    reply = "20 минут [kb/menu.md:1-3] и цена."
+    assert strip_imitated_footer(reply).strip() == reply.strip()

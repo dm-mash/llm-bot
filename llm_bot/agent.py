@@ -44,6 +44,8 @@ from llm_bot.rag import (
     finalize_answer,
     is_refusal,
     sources_from_text,
+    strip_citations,
+    strip_imitated_footer,
     summarise,
 )
 from llm_bot.stores import AgentConfig, SessionStore
@@ -737,17 +739,22 @@ class Session:
         *,
         service_turn: bool = False,
         directive: str | None = None,
+        citations: bool = True,
     ) -> str:
         """Send a user message and return only the assistant's reply text.
 
         Equivalent to :meth:`chat_with_details`, but returns just the reply
         string for callers that do not care about token accounting. Token stats
-        remain available on :attr:`last_usage`. *service_turn* and *directive*
-        are forwarded — machine-generated turns skip the task auto-detector and
-        a directive adds a transient per-turn instruction.
+        remain available on :attr:`last_usage`. *service_turn*, *directive* and
+        *citations* are forwarded — machine-generated turns skip the task
+        auto-detector, a directive adds a transient per-turn instruction, and
+        *citations=False* runs the turn without numbered sources.
         """
         return self.chat_with_details(
-            user_message, service_turn=service_turn, directive=directive
+            user_message,
+            service_turn=service_turn,
+            directive=directive,
+            citations=citations,
         ).reply
 
     def chat_with_details(
@@ -756,6 +763,7 @@ class Session:
         *,
         service_turn: bool = False,
         directive: str | None = None,
+        citations: bool = True,
     ) -> ChatResult:
         """Send a user message and return a :class:`ChatResult` with token usage.
 
@@ -785,6 +793,13 @@ class Session:
         ``/help`` marks the question as being about the project). It is injected
         as a system message for THIS request only and is never written to the
         history, so it steers the answer without polluting the dialog.
+
+        *citations* controls the numbered sources for THIS turn. Pass ``False``
+        when the evidence is a tool rather than the corpus (the support desk
+        answering about a ticket): the model would otherwise tag a ticket fact
+        with a chunk number that names a passage which never mentioned it, and a
+        tool turn skips the citation audit, so the invented marker would reach
+        the reader unchecked.
         """
         user_message = _sanitize_text(user_message.strip())
         if not user_message:
@@ -882,7 +897,9 @@ class Session:
         if self._retriever is not None:
             try:
                 rag_block, rag_event = self._retriever.render(
-                    user_message, prefer_sources=self._rag_subject()
+                    user_message,
+                    prefer_sources=self._rag_subject(),
+                    citations=citations and self._rag_cite,
                 )
             except Exception as exc:  # noqa: BLE001 - retrieval must never
                 # take the turn down: the bot answers without grounding rather
@@ -1097,10 +1114,19 @@ class Session:
         # "documents not used" note and the citation audit that would misread the
         # tool's own text as citations to chunks the model never leaned on.
         if rag_event is not None:
+            if self._last_turn_used_tools and not citations:
+                # This turn asked for no numbered sources and is not audited
+                # (see above), so a marker the model wrote anyway would reach
+                # the reader with nothing behind it. Remove it here rather than
+                # trust the instruction to have been followed.
+                reply = strip_citations(
+                    strip_imitated_footer(reply, handle_less=True),
+                    ignore=self._invariant_ids(),
+                )
             final = finalize_answer(
                 reply,
                 None if self._last_turn_used_tools else rag_event,
-                cite=self._rag_cite,
+                cite=citations and self._rag_cite,
                 invariant_ids=self._invariant_ids(),
             )
             reply = final.text

@@ -1244,7 +1244,11 @@ class Retriever:
     # -- rendering ---------------------------------------------------------
 
     def render(
-        self, question: str, *, prefer_sources: Sequence[str] = ()
+        self,
+        question: str,
+        *,
+        prefer_sources: Sequence[str] = (),
+        citations: bool = True,
     ) -> tuple[str, RagEvent]:
         """Build the prompt block for ``question`` ("" when nothing was found).
 
@@ -1255,11 +1259,19 @@ class Retriever:
         to the remaining space so the model still sees the strongest evidence.
 
         ``prefer_sources`` passes through to :meth:`retrieve`.
+
+        ``citations=False`` switches the block to the protocol that names no
+        sources, for one turn. It exists for the turn whose evidence is a TOOL,
+        not the corpus: asked to tag a ticket fact with a chunk number, the model
+        produced ``[1]`` next to a line the chunk never contained, and a turn
+        answered through a tool skips the citation audit, so the invented marker
+        reached the reader unchallenged. The marker cannot be audited away on
+        such a turn, so the number is not offered in the first place.
         """
         hits, event = self.retrieve(question, prefer_sources=prefer_sources)
         if not hits:
             return "", event
-        block, dropped = self._fit(hits)
+        block, dropped = self._fit(hits, citations=citations)
         kept = hits[: len(hits) - dropped] if block else []
         return block, replace(
             event,
@@ -1271,11 +1283,11 @@ class Retriever:
             sources=tuple(kept),
         )
 
-    def _fit(self, hits: list[RagHit]) -> tuple[str, int]:
+    def _fit(self, hits: list[RagHit], *, citations: bool = True) -> tuple[str, int]:
         """Render as many top hits as the budget allows; return (block, dropped)."""
         budget = self.budget_tokens
         if budget is None:
-            return self._block(hits), 0
+            return self._block(hits, citations=citations), 0
 
         kept: list[str] = []
         dropped = 0
@@ -1293,7 +1305,7 @@ class Retriever:
         # budget is exactly the kind of silent overflow the cap exists to stop.
         source = _hit_source_line(hits[0], 1)
         full = hits[0].text.strip()
-        room = budget * CHARS_PER_TOKEN - len(self._head()) - len(source) - 2
+        room = budget * CHARS_PER_TOKEN - len(self._head(citations)) - len(source) - 2
         while room > 0:
             body = _fit_words(full, room)
             if not body:
@@ -1310,8 +1322,9 @@ class Retriever:
 
     # -- block formatting --------------------------------------------------
 
-    def _head(self) -> str:
-        protocol = _RAG_PROTOCOL if self.cite else _RAG_PROTOCOL_NO_CITATIONS
+    def _head(self, citations: bool = True) -> str:
+        want = citations and self.cite
+        protocol = _RAG_PROTOCOL if want else _RAG_PROTOCOL_NO_CITATIONS
         return f"{_RAG_HEADER}\n{protocol}\n{_RAG_NO_BLENDING}\n"
 
     def _hit_text(self, hit: RagHit, handle: int) -> str:
@@ -1335,11 +1348,11 @@ class Retriever:
         """
         return [self._hit_text(hit, handle) for handle, hit in enumerate(hits, 1)]
 
-    def _block(self, hits: list[RagHit]) -> str:
-        return self._block_from_texts(self._texts(hits))
+    def _block(self, hits: list[RagHit], *, citations: bool = True) -> str:
+        return self._block_from_texts(self._texts(hits), citations=citations)
 
-    def _block_from_texts(self, texts: list[str]) -> str:
-        lines = [self._head()]
+    def _block_from_texts(self, texts: list[str], *, citations: bool = True) -> str:
+        lines = [self._head(citations)]
         for text in texts:
             lines.append("")
             lines.append(text)
@@ -1517,6 +1530,18 @@ _IMITATED_FOOTER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+#: The same list written WITHOUT handles — ``Источники:`` followed by bare
+#: ``faq.md:36-37 — Тарифы`` lines. Kept separate from :data:`_IMITATED_FOOTER_RE`
+#: because removing it is only safe where citations are switched off: in an
+#: audited turn a fabricated citation is not to be deleted but replaced by the
+#: unsupported marker, and the reader has to see that it was fabricated.
+_BARE_HIT_LIST_ITEM = r"[^\n:]*\.[A-Za-z]{1,8}:\d+(?:-\d+)?[^\n]*"
+_IMITATED_FOOTER_NO_HANDLE_RE = re.compile(
+    r"^[ \t]*" + re.escape(SOURCES_HEADING) + r"и?[ \t]*(?:\([^\n]*\))?[ \t]*:[ \t]*\n"
+    r"(?:[ \t]*(?:" + _BARE_HIT_LIST_ITEM + r")(?:\n|\Z))+",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 #: A bare copy of the block's own per-hit header, with no list around it. The
 #: block shows the model ``[4] file.pdf:17-24 — page 1 · chunk structure-011-002``
 #: above every chunk, and the model sometimes reprints one of those lines as if it
@@ -1530,8 +1555,18 @@ _COPIED_HIT_LINE_RE = re.compile(
     re.MULTILINE,
 )
 
+#: The same line copied WITHOUT its handle, which is how it appears on a turn
+#: where citations were switched off: ``faq.md:36-37 — Тарифы`` with nothing in
+#: front. Only the filename form matches, so ordinary prose carrying a number
+#: range ("строка 42-45 — итог", "с 8:00 до 22:00") is left alone.
+_COPIED_HIT_LINE_NO_HANDLE_RE = re.compile(
+    r"^[ \t]*[^\n:]{1,160}\.[A-Za-z]{1,8}:\d+(?:-\d+)?[ \t]*(?:—|–|-|·).+"
+    r"(?:\n|\Z)",
+    re.MULTILINE,
+)
 
-def strip_imitated_footer(text: str) -> str:
+
+def strip_imitated_footer(text: str, *, handle_less: bool = False) -> str:
     """Remove a source list the model wrote itself.
 
     Repeated until nothing changes, because a model that invents a list often
@@ -1545,6 +1580,11 @@ def strip_imitated_footer(text: str) -> str:
     for _ in range(4):
         cleaned = _IMITATED_FOOTER_RE.sub("", text)
         cleaned = _COPIED_HIT_LINE_RE.sub("", cleaned)
+        if handle_less:
+            # Only for a turn that forbade citations: elsewhere a handle-less
+            # citation is a fabrication to be MARKED, not a line to vanish.
+            cleaned = _IMITATED_FOOTER_NO_HANDLE_RE.sub("", cleaned)
+            cleaned = _COPIED_HIT_LINE_NO_HANDLE_RE.sub("", cleaned)
         # The removed list leaves the blank lines that surrounded it behind.
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).rstrip()
         if cleaned == text.rstrip():
@@ -1704,8 +1744,16 @@ def finalize_answer(
         # Nothing to verify: without a citation and a quote there is no evidence
         # to check, so the verdict says so rather than blaming the answer. No note
         # either — sources were switched off on purpose, which is not a failure.
+        #
+        # The imitated footer goes first. Told to name no sources, the model
+        # answers with a bare ``Источники:`` list anyway, and a reader takes that
+        # for provenance — so a turn that forbade citations must also not keep
+        # citations the model wrote for itself.
         return FinalAnswer(
-            strip_citations(reply, ignore=invariant_ids),
+            strip_citations(
+                strip_imitated_footer(reply, handle_less=True),
+                ignore=invariant_ids,
+            ),
             None,
             None,
             GroundingVerdict(Grounding.UNGROUNDED, checked=False),
