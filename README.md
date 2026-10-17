@@ -179,6 +179,7 @@ The README stays an overview; the detailed docs live in [`docs/`](docs/).
 - [Self-hosted HTTP service](docs/server.md) — serving an agent over HTTP.
 
 - [Code review](docs/code-review.md)
+- [Support assistant](docs/support.md) — product questions from the FAQ plus the customer's ticket.
 
 ## Tests
 

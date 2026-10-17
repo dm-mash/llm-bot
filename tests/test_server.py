@@ -33,6 +33,11 @@ class _Engine:
         self.sleep = sleep
         self.truncated = truncated
         self.calls: list[tuple[str, str]] = []
+        #: (session_id, directive) per turn — the chat route injects a ticket
+        #: context as a transient directive.
+        self.directives: list[tuple[str, str | None]] = []
+        #: the citations flag per turn — a ticket turn must run without them
+        self.citations: list[bool] = []
         self.concurrent = 0
         self.max_concurrent = 0
         self._lock = threading.Lock()
@@ -67,8 +72,15 @@ class _StubSession:
         self.session_id = session_id
 
     def chat_with_details(
-        self, user_message: str, *, service_turn: bool = False
+        self,
+        user_message: str,
+        *,
+        service_turn: bool = False,
+        directive: str | None = None,
+        citations: bool = True,
     ) -> ChatResult:
+        self.engine.directives.append((self.session_id, directive))
+        self.engine.citations.append(citations)
         return self.engine.handle(self.session_id, user_message)
 
 
@@ -264,3 +276,147 @@ def test_real_session_is_served_and_persisted(tmp_path):
         {"role": "user", "content": "привет"},
         {"role": "assistant", "content": "готово"},
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Ticket context from the chat page's dropdown
+# --------------------------------------------------------------------------- #
+
+
+def test_a_ticket_header_becomes_a_per_turn_directive():
+    engine = _Engine()
+    client = TestClient(_app(engine))
+    client.post(
+        "/v1/chat/completions",
+        json=_payload("Почему не работает авторизация?"),
+        headers={"X-Ticket-Id": "T-5001"},
+    )
+    assert engine.directives[-1][1] is not None
+    assert "T-5001" in engine.directives[-1][1]
+
+
+def test_without_the_header_there_is_no_directive():
+    engine = _Engine()
+    client = TestClient(_app(engine))
+    client.post("/v1/chat/completions", json=_payload("привет"))
+    assert engine.directives[-1][1] is None
+
+
+def test_a_blank_ticket_header_means_no_context():
+    # The dropdown always sends the header once a case is picked, and the page's
+    # default is an empty value: a blank header must not become "тикет ''".
+    engine = _Engine()
+    client = TestClient(_app(engine))
+    client.post(
+        "/v1/chat/completions",
+        json=_payload("привет"),
+        headers={"X-Ticket-Id": "   "},
+    )
+    assert engine.directives[-1][1] is None
+
+
+def test_the_ticket_never_enters_the_history():
+    # The context travels as a directive, so switching tickets leaves the dialog
+    # holding the questions only.
+    engine = _Engine()
+    client = TestClient(_app(engine))
+    client.post(
+        "/v1/chat/completions",
+        json=_payload("вопрос"),
+        headers={"X-Ticket-Id": "T-5001"},
+    )
+    assert all("T-5001" not in text for _, text in engine.calls)
+
+
+def test_two_tickets_in_one_session_do_not_bleed_into_each_other():
+    engine = _Engine()
+    client = TestClient(_app(engine))
+    client.post(
+        "/v1/chat/completions",
+        json=_payload("первый", session_id="s1"),
+        headers={"X-Ticket-Id": "T-5001"},
+    )
+    client.post(
+        "/v1/chat/completions",
+        json=_payload("второй", session_id="s1"),
+        headers={"X-Ticket-Id": "T-5002"},
+    )
+    first, second = [directive for _, directive in engine.directives]
+    assert "T-5001" in first and "T-5002" not in first
+    assert "T-5002" in second and "T-5001" not in second
+
+
+def test_a_ticket_turn_runs_without_numbered_citations():
+    # The evidence for a ticket question is the ticket; a chunk number would
+    # name a passage that never mentioned this customer's case, and a tool turn
+    # skips the citation audit that would have caught it.
+    engine = _Engine()
+    client = TestClient(_app(engine))
+    client.post(
+        "/v1/chat/completions",
+        json=_payload("какой у меня тариф?"),
+        headers={"X-Ticket-Id": "T-5003"},
+    )
+    assert engine.citations == [False]
+
+
+def test_a_plain_question_keeps_its_numbered_sources():
+    engine = _Engine()
+    client = TestClient(_app(engine))
+    client.post("/v1/chat/completions", json=_payload("документация по тарифам"))
+    assert engine.citations == [True]
+
+
+# --------------------------------------------------------------------------- #
+# The chat page
+# --------------------------------------------------------------------------- #
+
+
+def _page(**kwargs) -> str:
+    engine = _Engine()
+    return TestClient(_app(engine, **kwargs)).get("/").text
+
+
+def test_the_page_is_titled_with_what_is_actually_served():
+    # It used to greet every deployment with «Локальная LLM», which stopped being
+    # true once the service could be a support desk.
+    page = _page(title="Поддержка: support")
+    assert "<title>Поддержка: support</title>" in page
+    assert "<h1>Поддержка: support</h1>" in page
+    assert "Локальная LLM" not in page
+
+
+def test_the_default_page_still_renders():
+    page = _page()
+    assert "<title>llm-bot</title>" in page
+    assert "{{TITLE}}" not in page and "{{HEADING}}" not in page
+
+
+def test_the_page_keeps_the_password_manager_out_of_the_form():
+    # One password field next to a text field looks like a login form, and the
+    # browser offered to save the bearer token when the question field was
+    # focused. Both the form and the fields must opt out.
+    page = _page()
+    assert 'id="f" autocomplete="off"' in page
+    assert 'name="api_token"' in page
+    assert 'id="t" name="api_token" placeholder="token"\n         title="Bearer token" autocomplete="off"' in page
+    # The question field must not invite autofill either.
+    assert 'id="q" name="question" placeholder="Ваш вопрос…"\n         autocomplete="off"' in page
+
+
+def test_the_token_stays_masked_without_a_password_field():
+    # Masking moved to CSS so the form contains no password field at all.
+    # Firefox ignores autocomplete="off" on password inputs (bug 1410723) and
+    # kept treating the form as a login form, offering to save the bearer token
+    # when the question field was focused — there was nothing to suggest to
+    # Firefox except removing what it keys on.
+    page = _page()
+    assert 'type="password"' not in page
+    assert "-webkit-text-security: disc" in page
+    assert "-moz-text-security: disc" in page
+
+
+def test_the_token_field_keeps_its_autocomplete_opt_out():
+    page = _page()
+    assert 'name="api_token"' in page
+    assert 'autocomplete="off"' in page

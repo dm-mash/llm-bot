@@ -33,10 +33,12 @@ import uvicorn  # noqa: E402
 
 from llm_bot.factory import build_retriever, make_session  # noqa: E402
 from llm_bot.json_session_store import JsonSessionStore  # noqa: E402
+from llm_bot.mcp_tools import load_mcp_config, router_from_config  # noqa: E402
 from llm_bot.memory_store import JsonMemoryStore  # noqa: E402
 from llm_bot.rag import Retriever  # noqa: E402
 from llm_bot.server import create_app  # noqa: E402
 from llm_bot.stores import ModelConfig  # noqa: E402
+from llm_bot.support import DEFAULT_MCP_SERVERS, SupportAssistant  # noqa: E402
 from llm_bot.yaml_stores import YamlAgentStore, YamlModelStore  # noqa: E402
 
 
@@ -81,7 +83,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rag-index",
         default=os.environ.get("SERVE_RAG_INDEX"),
-        help="Path to a JSON index for RAG (e.g. data/kb_emb).",
+        help="Path to a JSON index for RAG: data/faq_emb for the product FAQ, "
+        "data/kb_emb for the coffee-shop corpus.",
     )
     parser.add_argument(
         "--rag-top-k",
@@ -93,7 +96,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable the cross-encoder rerank stage (CPU-heavy; off by default).",
     )
+    parser.add_argument(
+        "--mcp-config",
+        default=os.environ.get("MCP_CONFIG", "data/mcp.yaml"),
+        help="MCP server config; also $MCP_CONFIG.",
+    )
     parser.add_argument("--log-level", default=os.environ.get("SERVE_LOG_LEVEL", "info"))
+
+    group = parser.add_argument_group(
+        "support",
+        "Turn the service into a support desk: answers from the FAQ (RAG) plus "
+        "the customer's own tickets, read over MCP. It registers POST "
+        "/support and GET /support/tickets, and puts the support tools and the "
+        "ticket dropdown in front of the chat page. There is no second agent: "
+        "the endpoint answers with --agent, so point that at an agent written "
+        "for support (see agents.example.yaml).",
+    )
+    group.add_argument(
+        "--support",
+        action="store_true",
+        default=os.environ.get("SERVE_SUPPORT", "") not in ("", "0", "false", "no"),
+        help="Enable the support desk. The RAG settings are shared with the "
+        "chat endpoint (--rag-index, --rag-top-k, --rag-rerank); --mcp-config "
+        "supplies the MCP servers.",
+    )
     return parser
 
 
@@ -176,6 +202,29 @@ def main(argv: list[str] | None = None) -> int:
             rerank=args.rag_rerank,
         )
 
+    # The desk is reached through the same MCP config as everything else, but
+    # only if the server is actually registered: an explicit name that the config
+    # does not define is a startup error by design, and the chat endpoint must
+    # not be taken down by a missing support desk. So the name is probed first,
+    # and its absence is reported, not fatal.
+    support_servers: list[str] = []
+    support_router = None
+    if args.support:
+        servers = load_mcp_config(Path(args.mcp_config))
+        support_servers = [s for s in DEFAULT_MCP_SERVERS if s in servers]
+        for name in DEFAULT_MCP_SERVERS:
+            if name not in servers:
+                print(
+                    f"[warn] MCP server {name!r} is not in {args.mcp_config}: "
+                    f"/support will answer from the FAQ without the ticket.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if support_servers:
+            support_router = router_from_config(
+                support_servers, Path(args.mcp_config)
+            )
+
     def session_factory(session_id: str):
         return make_session(
             session_id,
@@ -185,17 +234,58 @@ def main(argv: list[str] | None = None) -> int:
             session_store=session_store,
             memory_store=memory_store,
             retriever=retriever,
+            # The chat page lets you pick a ticket, and picking it is pointless
+            # unless the assistant can open it: the support tools go to the chat
+            # endpoint too, and only when a support desk is configured.
+            mcp_router=support_router,
         )
+
+    support_factory = None
+    if args.support:
+        support_assistant = SupportAssistant(
+            # The same agent the chat endpoint uses: a server started for the
+            # support desk must not answer with two different personalities.
+            agent=args.agent,
+            # The same corpus and therefore the same Retriever: a second one for
+            # the same index would load the embedding model a second time and
+            # hold it in memory for nothing. When chat has no RAG, /support has
+            # none either — rag_index=None, not a default path nobody chose.
+            retriever=retriever,
+            rag_index=args.rag_index,
+            top_k=args.rag_top_k,
+            rerank=args.rag_rerank,
+            context_window=model.context_window,
+            # An empty list means MCP off; passing None instead would fall back to
+            # the default server list and fail on a config that lacks it.
+            mcp_servers=support_servers,
+            mcp_config=args.mcp_config if support_servers else None,
+            model_store=model_store,
+            agent_store=agent_store,
+        )
+
+        def support_factory(conversation_id: str):
+            return support_assistant
+
+    # The page used to greet every deployment with «Локальная LLM», which stopped
+    # being true the moment the service could be a support desk with a ticket
+    # dropdown. The heading now says what is actually being served.
+    heading = (
+        f"Поддержка: {args.agent}"
+        if args.support
+        else f"Ассистент: {args.agent}"
+    )
 
     app = create_app(
         session_factory=session_factory,
         agent_name=args.agent,
+        title=heading,
         auth_token=args.token,
         parallel=args.parallel,
         rate_limit=args.rate_limit or None,
         queue_timeout=args.queue_timeout,
         request_timeout=args.request_timeout,
         health_probe=make_ollama_probe(model),
+        support_factory=support_factory,
     )
 
     auth = "token required" if args.token else "NO AUTH (set SERVE_TOKEN)"
@@ -203,6 +293,15 @@ def main(argv: list[str] | None = None) -> int:
         f"Serving agent '{args.agent}' -> {model.base_url} ({model.model})",
         flush=True,
     )
+    if args.support:
+        # Said out loud because the difference matters: with the flag on, this
+        # agent also answers support questions, so it should be an agent written
+        # for support rather than the general-purpose default.
+        print(
+            f"Support desk ON: /support, /support/tickets, the ticket dropdown "
+            f"and the support MCP tools, all on the same agent. Page: {heading}",
+            flush=True,
+        )
     print(
         f"Listen http://{args.host}:{args.port}  parallel={args.parallel}  {auth}",
         flush=True,
